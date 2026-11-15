@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Quyền tối thiểu cho cửa sổ chính. Dialog/FS chỉ được gọi từ Rust, webview không có quyền ghi file trực tiếp.",
+  "windows": ["main"],
+  "permissions": ["core:default", "log:default"]
+}

@@ -1,0 +1,248 @@
+//! Persist config + lịch sử phiên họp dưới dạng JSON file.
+//!
+//! Vị trí (qua `dirs::config_dir()`):
+//! - Linux:   `~/.config/plancouncil/`
+//! - Windows: `%APPDATA%\plancouncil\`
+//!
+//! Mọi hàm ở đây là **blocking** — caller (lib.rs) gọi qua `spawn_blocking`.
+//! Ghi file theo kiểu atomic (tmp + fsync + rename) để crash giữa chừng không làm hỏng JSON.
+
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use uuid::Uuid;
+
+use crate::config::AppConfig;
+use crate::models::{SessionRecord, SessionSummary};
+
+const APP_DIR: &str = "plancouncil";
+const CONFIG_FILE: &str = "config.json";
+const SESSIONS_DIR: &str = "sessions";
+
+#[derive(Debug, thiserror::Error)]
+pub enum StorageError {
+    #[error("không xác định được thư mục cấu hình của hệ điều hành")]
+    NoConfigDir,
+    #[error("lỗi I/O: {0}")]
+    Io(#[from] io::Error),
+    #[error("lỗi JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("không tìm thấy phiên họp {0}")]
+    NotFound(Uuid),
+}
+
+#[derive(Debug, Clone)]
+pub struct Storage {
+    root: PathBuf,
+}
+
+impl Storage {
+    pub fn new() -> Result<Self, StorageError> {
+        let base = dirs::config_dir().ok_or(StorageError::NoConfigDir)?;
+        Self::with_root(base.join(APP_DIR))
+    }
+
+    pub fn with_root(root: PathBuf) -> Result<Self, StorageError> {
+        fs::create_dir_all(root.join(SESSIONS_DIR))?;
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn config_path(&self) -> PathBuf {
+        self.root.join(CONFIG_FILE)
+    }
+
+    fn session_path(&self, id: Uuid) -> PathBuf {
+        // `id` là Uuid đã parse → không thể path traversal.
+        self.root.join(SESSIONS_DIR).join(format!("{id}.json"))
+    }
+
+    /// Không bao giờ fail: file thiếu → default; file hỏng → backup rồi default;
+    /// file schema cũ → backup `config.pre-migration-backup.json` rồi ghi lại dạng mới.
+    pub fn load_config(&self) -> AppConfig {
+        let path = self.config_path();
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return AppConfig::default(),
+            Err(e) => {
+                log::error!("không đọc được {}: {e}", path.display());
+                return AppConfig::default();
+            }
+        };
+        match AppConfig::from_json(&bytes) {
+            Ok((c, false)) => c,
+            Ok((c, true)) => {
+                let backup = path.with_extension("pre-migration-backup.json");
+                log::info!(
+                    "migrate config lên schema v{} ({} provider, {} role); bản cũ lưu ở {}",
+                    c.schema_version,
+                    c.providers.len(),
+                    c.roles.len(),
+                    backup.display()
+                );
+                if let Err(e) = write_atomic(&backup, &bytes, true) {
+                    log::warn!("không backup được config cũ: {e}");
+                } else if let Err(e) = self.save_config(&c) {
+                    log::warn!("không ghi được config mới: {e}");
+                }
+                c
+            }
+            Err(e) => {
+                let backup = path.with_extension(format!(
+                    "corrupt-{}.json",
+                    chrono::Utc::now().format("%Y%m%d%H%M%S")
+                ));
+                log::error!("config.json hỏng ({e}); backup sang {}", backup.display());
+                let _ = fs::rename(&path, &backup);
+                AppConfig::default()
+            }
+        }
+    }
+
+    pub fn save_config(&self, cfg: &AppConfig) -> Result<(), StorageError> {
+        let bytes = serde_json::to_vec_pretty(cfg)?;
+        write_atomic(&self.config_path(), &bytes, true)?;
+        Ok(())
+    }
+
+    pub fn save_session(&self, rec: &SessionRecord) -> Result<(), StorageError> {
+        let bytes = serde_json::to_vec_pretty(rec)?;
+        write_atomic(&self.session_path(rec.id), &bytes, false)?;
+        Ok(())
+    }
+
+    pub fn load_session(&self, id: Uuid) -> Result<SessionRecord, StorageError> {
+        match fs::read(self.session_path(id)) {
+            Ok(b) => Ok(serde_json::from_slice(&b)?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(StorageError::NotFound(id)),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn delete_session(&self, id: Uuid) -> Result<bool, StorageError> {
+        match fs::remove_file(self.session_path(id)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// O(n) file đọc mỗi lần list — chấp nhận được tới vài trăm phiên.
+    /// Long-term: index file hoặc SQLite (xem trade-off trong README).
+    pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, StorageError> {
+        let dir = self.root.join(SESSIONS_DIR);
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            match fs::read(&path)
+                .map_err(StorageError::from)
+                .and_then(|b| serde_json::from_slice::<SessionRecord>(&b).map_err(Into::into))
+            {
+                Ok(rec) => out.push(rec.summary()),
+                Err(e) => log::warn!("bỏ qua session hỏng {}: {e}", path.display()),
+            }
+        }
+        out.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+        out.truncate(limit);
+        Ok(out)
+    }
+}
+
+/// tmp (cùng thư mục) → fsync → rename. `rename` thay thế file đích atomically trên
+/// cả ext4/NTFS (Rust dùng `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` trên Windows).
+pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> io::Result<()> {
+    let tmp = path.with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if secret {
+                opts.mode(0o600); // chỉ owner đọc được file chứa API key
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = secret; // Windows: %APPDATA% đã có ACL per-user
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::SessionStatus;
+
+    fn tmp_storage() -> Storage {
+        let dir = std::env::temp_dir().join(format!("plancouncil-test-{}", Uuid::new_v4()));
+        Storage::with_root(dir).unwrap()
+    }
+
+    #[test]
+    fn config_roundtrip_and_corruption_recovery() {
+        let s = tmp_storage();
+        let c = AppConfig {
+            max_rounds: 5,
+            ..Default::default()
+        };
+        s.save_config(&c).unwrap();
+        assert_eq!(s.load_config().max_rounds, 5);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(s.config_path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // v1 → được migrate, backup và ghi lại thành v3
+        fs::write(
+            s.config_path(),
+            br#"{"default_endpoint":{"api_key":"sk-old-12345678","model":"m1"},"max_rounds":4}"#,
+        )
+        .unwrap();
+        let migrated = s.load_config();
+        assert_eq!(migrated.max_rounds, 4);
+        assert_eq!(migrated.providers[0].api_key.as_deref(), Some("sk-old-12345678"));
+        assert!(s.config_path().with_extension("pre-migration-backup.json").exists());
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(s.config_path()).unwrap()).unwrap();
+        assert_eq!(on_disk["schema_version"], 3);
+
+        fs::write(s.config_path(), b"{not json").unwrap();
+        assert_eq!(s.load_config().max_rounds, 3); // default
+        assert!(!s.config_path().exists()); // đã bị move sang .corrupt-*
+        fs::remove_dir_all(s.root()).ok();
+    }
+
+    #[test]
+    fn session_crud() {
+        let s = tmp_storage();
+        let mut r = SessionRecord::new(Uuid::new_v4(), "Design a chat system".into(), 3);
+        r.status = SessionStatus::Converged;
+        s.save_session(&r).unwrap();
+        assert_eq!(s.list_sessions(10).unwrap().len(), 1);
+        assert_eq!(s.load_session(r.id).unwrap().prompt, r.prompt);
+        assert!(s.delete_session(r.id).unwrap());
+        assert!(matches!(
+            s.load_session(r.id),
+            Err(StorageError::NotFound(_))
+        ));
+        fs::remove_dir_all(s.root()).ok();
+    }
+}

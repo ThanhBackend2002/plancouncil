@@ -1,0 +1,276 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Noto Sans", Ubuntu, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, "Ubuntu Mono", ui-monospace, monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  overflow: hidden;
+  font-family: var(--font-sans);
+  font-size: 14px;
+}
+
+::selection {
+  background: rgb(139 92 246 / 0.35);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #3f3f46 transparent;
+}
+
+:focus-visible {
+  outline: 2px solid rgb(167 139 250 / 0.7);
+  outline-offset: 2px;
+}
+
+@keyframes caret-blink {
+  50% {
+    opacity: 0;
+  }
+}
+.stream-caret::after {
+  content: "▍";
+  margin-left: 2px;
+  color: #a78bfa;
+  animation: caret-blink 1s steps(1) infinite;
+}
+
+/* ───────────── Pixel office ───────────── */
+@keyframes px-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-1px);
+  }
+}
+@keyframes px-talk {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes px-blink {
+  0%,
+  94% {
+    opacity: 0;
+  }
+  95%,
+  100% {
+    opacity: 1;
+  }
+}
+@keyframes px-dot {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+/* Chỉ dùng opacity/scale: vị trí do `translate` của Tailwind đảm nhiệm (cộng dồn với transform). */
+@keyframes px-pop {
+  from {
+    scale: 0.85;
+    opacity: 0;
+  }
+  to {
+    scale: 1;
+    opacity: 1;
+  }
+}
+.px-bob {
+  animation: px-bob 1.6s steps(1) infinite;
+}
+.px-bob-fast {
+  animation: px-bob 0.5s steps(1) infinite;
+}
+.px-talk {
+  animation: px-talk 0.28s steps(1) infinite;
+}
+.px-blink {
+  animation: px-blink 3.8s steps(1) infinite;
+}
+.px-dot {
+  animation: px-dot 0.9s steps(2) infinite;
+}
+.px-scene {
+  image-rendering: pixelated;
+}
+.px-font {
+  font-family: "Cascadia Mono", Consolas, "DejaVu Sans Mono", "Ubuntu Mono", ui-monospace, monospace;
+  letter-spacing: 0.02em;
+}
+/* Viền pixel (bậc thang) cho bong bóng thoại / nhãn tên. */
+.px-box {
+  --px-border: #0b0b12;
+  box-shadow:
+    0 -2px 0 0 var(--px-border),
+    0 2px 0 0 var(--px-border),
+    -2px 0 0 0 var(--px-border),
+    2px 0 0 0 var(--px-border),
+    0 4px 0 0 rgb(0 0 0 / 0.35);
+}
+.px-bubble {
+  transform-origin: 50% 100%;
+  animation: px-pop 0.18s steps(3) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  /* Không để nhân vật kẹt ở khung "nhắm mắt" khi tắt animation. */
+  .px-blink {
+    animation: none !important;
+    opacity: 0;
+  }
+  .px-talk,
+  .px-dot {
+    animation: none !important;
+    opacity: 1;
+  }
+}
+
+/* ───────────── Markdown của plan ───────────── */
+.plan-md {
+  line-height: 1.7;
+  color: #d4d4d8;
+  overflow-wrap: anywhere;
+}
+.plan-md > * + * {
+  margin-top: 0.85em;
+}
+.plan-md h1 {
+  font-size: 1.6rem;
+  font-weight: 650;
+  color: #fafafa;
+  letter-spacing: -0.01em;
+}
+.plan-md h2 {
+  margin-top: 2em;
+  padding-bottom: 0.35em;
+  font-size: 1.25rem;
+  font-weight: 620;
+  color: #fafafa;
+  border-bottom: 1px solid #27272a;
+}
+.plan-md h2:first-child {
+  margin-top: 0;
+}
+.plan-md h3 {
+  margin-top: 1.5em;
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #e4e4e7;
+}
+.plan-md h4 {
+  margin-top: 1.2em;
+  font-weight: 600;
+  color: #e4e4e7;
+}
+.plan-md strong {
+  color: #fafafa;
+  font-weight: 600;
+}
+.plan-md a {
+  color: #a78bfa;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.plan-md ul,
+.plan-md ol {
+  padding-left: 1.4em;
+}
+.plan-md ul {
+  list-style: disc;
+}
+.plan-md ol {
+  list-style: decimal;
+}
+.plan-md li + li {
+  margin-top: 0.25em;
+}
+.plan-md li > ul,
+.plan-md li > ol {
+  margin-top: 0.25em;
+}
+.plan-md li::marker {
+  color: #71717a;
+}
+.plan-md blockquote {
+  border-left: 3px solid #3f3f46;
+  padding-left: 1em;
+  color: #a1a1aa;
+}
+.plan-md hr {
+  border: 0;
+  border-top: 1px solid #27272a;
+  margin: 2em 0;
+}
+.plan-md :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  background: #27272a;
+  color: #e9d5ff;
+}
+.plan-md pre {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.6;
+  padding: 0.9em 1em;
+  border-radius: 8px;
+  background: #0f0f12;
+  border: 1px solid #27272a;
+  overflow-x: auto;
+}
+.plan-md table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.9em;
+}
+.plan-md th,
+.plan-md td {
+  border: 1px solid #27272a;
+  padding: 0.45em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+.plan-md th {
+  background: #18181b;
+  color: #fafafa;
+  font-weight: 600;
+}
+.plan-md tr:nth-child(even) td {
+  background: rgb(24 24 27 / 0.5);
+}
+.plan-md input[type="checkbox"] {
+  margin-right: 0.4em;
+}

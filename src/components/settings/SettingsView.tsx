@@ -1,0 +1,326 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { LoaderCircle, RotateCcw, Save } from "lucide-react";
+import type { AppConfig, Provider } from "../../lib/contracts";
+import { ipc, isCommandError } from "../../lib/ipc";
+import { isLocalUrl, useConfig } from "../../store/config";
+import { toast, toastError } from "../../store/toast";
+import { Button, Panel, cx } from "../ui";
+import { ContextToolsTab } from "./ContextToolsTab";
+import { DepartmentsTab } from "./DepartmentsTab";
+import { Field, INPUT, NumberInput, SectionTitle, Toggle, type Errors } from "./fields";
+import { MeetingTab } from "./MeetingTab";
+import { ProvidersTab, apiRoot, type FetchState } from "./ProvidersTab";
+import { RolesTab } from "./RolesTab";
+
+type TabId = "providers" | "roles" | "departments" | "meeting" | "context" | "general";
+
+const TABS: { id: TabId; label: string; match: (k: string) => boolean }[] = [
+  { id: "roles", label: "Vai trò", match: (k) => k.startsWith("role.") },
+  { id: "departments", label: "Phòng ban", match: (k) => k.startsWith("dept.") },
+  { id: "meeting", label: "Cuộc họp", match: (k) => k.startsWith("meeting.") || k === "general.max_rounds" },
+  { id: "context", label: "Bối cảnh & Công cụ", match: (k) => k.startsWith("context.") },
+  { id: "general", label: "Chung", match: (k) => k.startsWith("general.") && k !== "general.max_rounds" },
+  { id: "providers", label: "Provider", match: (k) => k.startsWith("provider") },
+];
+
+function isUrl(s: string): boolean {
+  try {
+    return ["http:", "https:"].includes(new URL(s.trim()).protocol);
+  } catch {
+    return false;
+  }
+}
+
+/** Validate phía client khớp với `AppConfig::validate` trong config.rs. */
+function validate(c: AppConfig): Errors {
+  const e: Errors = {};
+  const bad = (v: number, lo: number, hi: number) => !Number.isFinite(v) || v < lo || v > hi;
+  const range = (key: string, v: number, lo: number, hi: number) => {
+    if (bad(v, lo, hi)) e[key] = `Trong khoảng ${lo}–${hi}`;
+  };
+  range("general.max_rounds", c.max_rounds, 1, 10);
+  range("general.request_timeout_secs", c.request_timeout_secs, 10, 1800);
+  range("general.stream_idle_timeout_secs", c.stream_idle_timeout_secs, 10, 600);
+  range("general.max_retries", c.max_retries, 0, 6);
+  range("general.max_parallel_calls", c.max_parallel_calls, 1, 16);
+  if (c.max_tokens != null && (c.max_tokens < 1 || !Number.isInteger(c.max_tokens))) e["general.max_tokens"] = "Số nguyên ≥ 1 hoặc để trống";
+
+
+  for (const p of c.providers) {
+    if (!p.name.trim()) e[`provider.${p.id}.name`] = "Không được để trống";
+    if (!isUrl(p.base_url)) e[`provider.${p.id}.base_url`] = "URL http(s) không hợp lệ";
+  }
+
+  const roleIds = new Set(c.roles.map((r) => r.id));
+  for (const r of c.roles) {
+    if (!r.name.trim()) e[`role.${r.id}.name`] = "Không được để trống";
+    // Role chưa gán provider/model vẫn lưu được; chỉ bắt buộc khi role tham gia họp (backend kiểm tra lúc Start).
+    if (r.provider_id && !c.providers.some((p) => p.id === r.provider_id)) e[`role.${r.id}.provider`] = "Provider không tồn tại";
+    range(`role.${r.id}.temperature`, r.temperature, 0, 2);
+  }
+
+  for (const d of c.departments) {
+    if (!d.name.trim()) e[`dept.${d.id}.name`] = "Không được để trống";
+    if (!roleIds.has(d.lead_id)) e[`dept.${d.id}.lead`] = "Chọn trưởng phòng";
+    if (d.member_ids.some((m) => !roleIds.has(m))) e[`dept.${d.id}.members`] = "Có thành viên không tồn tại";
+    else if (d.member_ids.includes(d.lead_id)) e[`dept.${d.id}.members`] = "Trưởng phòng không được là thành viên";
+    else if (d.member_ids.length > 12) e[`dept.${d.id}.members`] = "Tối đa 12 thành viên";
+    range(`dept.${d.id}.max_rounds`, d.max_rounds, 1, 5);
+  }
+
+  range("context.max_tool_steps", c.max_tool_steps, 1, 12);
+  range("context.max_results", c.web_search.max_results, 1, 10);
+  if (c.company_context.text.length > 20_000) e["context.text"] = "Tối đa 20.000 ký tự";
+  if (c.web_search.provider === "searxng" && c.web_search.base_url.trim() && !isUrl(c.web_search.base_url)) {
+    e["context.searxng"] = "URL http(s) không hợp lệ";
+  }
+  for (const w of c.workspaces) {
+    if (!w.name.trim() || !w.path.trim()) e[`context.ws.${w.id}`] = "Cần tên và đường dẫn";
+  }
+
+  const m = c.meeting;
+  range("meeting.max_auto_reviewers", m.max_auto_reviewers, 1, 12);
+  range("meeting.max_auto_departments", m.max_auto_departments, 0, 8);
+  range("meeting.max_invites", m.max_invites, 0, 6);
+  if (m.required_role_ids.some((r) => !roleIds.has(r))) e["meeting.required"] = "Có role không tồn tại";
+  if (!roleIds.has(m.chair_id)) e["meeting.chair"] = "Chọn chủ trì";
+  if (m.reviewer_ids.length === 0) e["meeting.reviewers"] = "Cần ít nhất 1 reviewer";
+  else if (m.reviewer_ids.length > 12) e["meeting.reviewers"] = "Tối đa 12 reviewer";
+  else if (m.reviewer_ids.some((r) => !roleIds.has(r))) e["meeting.reviewers"] = "Có reviewer không tồn tại";
+  else if (m.reviewer_ids.includes(m.chair_id)) e["meeting.reviewers"] = "Chủ trì không được đồng thời là reviewer";
+  return e;
+}
+
+function normalize(c: AppConfig): AppConfig {
+  return {
+    ...c,
+    providers: c.providers.map((p) => ({ ...p, name: p.name.trim(), base_url: p.base_url.trim() })),
+    roles: c.roles.map((r) => ({ ...r, name: r.name.trim(), title: r.title.trim(), model: r.model.trim() })),
+    departments: c.departments.map((d) => ({ ...d, name: d.name.trim(), mission: d.mission.trim() })),
+  };
+}
+
+const hasKey = (k: string | null) => !!k && k.trim() !== "";
+
+export function SettingsView() {
+  const { config, revision, load, save, saving, loading, patchModels } = useConfig();
+  const [draft, setDraft] = useState<AppConfig | null>(null);
+  const [tab, setTab] = useState<TabId>("roles");
+  // Lần đầu có config: chưa có provider nào → mở thẳng tab Provider (cần thêm API key trước).
+  const tabInit = useRef(false);
+  useEffect(() => {
+    if (!config || tabInit.current) return;
+    tabInit.current = true;
+    if (config.providers.length === 0) setTab("providers");
+  }, [config]);
+  const [serverErrors, setServerErrors] = useState<string[]>([]);
+  const [fetches, setFetches] = useState<Record<string, FetchState>>({});
+  const lastFetched = useRef(new Map<string, string>());
+
+  // Chỉ reset bản nháp khi load/save, không phải khi backend ghi cache model.
+  useEffect(() => {
+    const c = useConfig.getState().config;
+    if (c) setDraft(structuredClone(c));
+  }, [revision]);
+
+  const update = useCallback((f: (c: AppConfig) => AppConfig) => setDraft((d) => (d ? f(d) : d)), []);
+
+  const fetchModels = useCallback(
+    async (p: Provider, opts: { silent?: boolean } = {}) => {
+      if (!isUrl(p.base_url)) return;
+      lastFetched.current.set(p.id, `${apiRoot(p.base_url)}|${p.api_key ?? ""}`);
+      setFetches((f) => ({ ...f, [p.id]: { loading: true, error: null } }));
+      try {
+        const r = await ipc.listModels(p.id, p.base_url, p.api_key);
+        update((d) => ({
+          ...d,
+          providers: d.providers.map((x) => (x.id === p.id ? { ...x, models: r.models, models_fetched_at: r.fetched_at } : x)),
+        }));
+        if (r.cached) patchModels(p.id, r.models, r.fetched_at);
+        setFetches((f) => ({ ...f, [p.id]: { loading: false, error: null } }));
+        if (!opts.silent) toast("success", `${p.name || "Provider"}: ${r.models.length} model`);
+      } catch (e) {
+        setFetches((f) => ({ ...f, [p.id]: { loading: false, error: isCommandError(e) ? e.message : String(e) } }));
+      }
+    },
+    [patchModels, update],
+  );
+
+  // Lần đầu mở Settings: tự kéo model cho provider đã có key (hoặc local) mà chưa có cache.
+  const autoDone = useRef(false);
+  useEffect(() => {
+    if (!draft || autoDone.current) return;
+    autoDone.current = true;
+    for (const p of draft.providers) {
+      if (p.models.length === 0 && (hasKey(p.api_key) || isLocalUrl(p.base_url))) void fetchModels(p, { silent: true });
+    }
+  }, [draft, fetchModels]);
+
+  const maybeFetch = (id: string) => {
+    const p = draft?.providers.find((x) => x.id === id);
+    if (!p || !isUrl(p.base_url)) return;
+    if (!hasKey(p.api_key) && !isLocalUrl(p.base_url)) return;
+    if (lastFetched.current.get(id) === `${apiRoot(p.base_url)}|${p.api_key ?? ""}`) return;
+    void fetchModels(p, { silent: true });
+  };
+
+  const errors = useMemo(() => (draft ? validate(draft) : {}), [draft]);
+  const dirty = !!draft && !!config && JSON.stringify(draft) !== JSON.stringify(config);
+  const errorKeys = Object.keys(errors);
+
+  if (!draft || !config) {
+    return (
+      <div className="flex h-full items-center justify-center gap-3 text-sm text-neutral-500">
+        {loading ? <LoaderCircle className="size-4 animate-spin" /> : null}
+        {loading ? "Đang tải cấu hình…" : "Chưa tải được cấu hình."}
+        {!loading && (
+          <Button size="sm" onClick={() => void load()}>
+            Thử lại
+          </Button>
+        )}
+      </div>
+    );
+  }
+
+  const onSave = async () => {
+    setServerErrors([]);
+    try {
+      await save(normalize(draft));
+      toast("success", "Đã lưu cấu hình");
+    } catch (e) {
+      if (isCommandError(e) && e.kind === "invalid") setServerErrors(e.message.split("; "));
+      else toastError(e, "Không lưu được cấu hình");
+    }
+  };
+
+  return (
+    <div className="h-full overflow-y-auto">
+      <div className="sticky top-0 z-20 border-b border-neutral-900 bg-neutral-950/95 backdrop-blur">
+        <div className="mx-auto flex max-w-5xl items-center gap-3 px-6 pt-3">
+          <h1 className="text-lg font-semibold">Cài đặt</h1>
+          {dirty && <span className="text-xs text-amber-300">Có thay đổi chưa lưu</span>}
+          {errorKeys.length > 0 && dirty && <span className="text-xs text-red-400">Còn {errorKeys.length} lỗi</span>}
+          <div className="ml-auto flex gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<RotateCcw className="size-3.5" />}
+              disabled={!dirty || saving}
+              onClick={() => {
+                setDraft(structuredClone(config));
+                setServerErrors([]);
+              }}
+            >
+              Hoàn tác
+            </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              icon={<Save className="size-3.5" />}
+              loading={saving}
+              disabled={!dirty || errorKeys.length > 0}
+              onClick={() => void onSave()}
+            >
+              Lưu
+            </Button>
+          </div>
+        </div>
+        <nav className="mx-auto flex max-w-5xl gap-1 px-6 pt-2" aria-label="Mục cài đặt">
+          {TABS.map((t) => {
+            const n = errorKeys.filter(t.match).length;
+            return (
+              <button
+                key={t.id}
+                type="button"
+                onClick={() => setTab(t.id)}
+                aria-current={tab === t.id ? "page" : undefined}
+                className={cx(
+                  "-mb-px inline-flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm",
+                  tab === t.id ? "border-violet-500 text-neutral-50" : "border-transparent text-neutral-400 hover:text-neutral-200",
+                )}
+              >
+                {t.label}
+                {t.id === "roles" && <span className="text-[11px] text-neutral-500">{draft.roles.length}</span>}
+                {t.id === "departments" && <span className="text-[11px] text-neutral-500">{draft.departments.length}</span>}
+                {n > 0 && <span className="rounded-full bg-red-500/20 px-1.5 text-[10px] text-red-300">{n}</span>}
+              </button>
+            );
+          })}
+        </nav>
+      </div>
+
+      <div className="mx-auto max-w-5xl space-y-4 p-6 pb-24">
+        {serverErrors.length > 0 && (
+          <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-200" role="alert">
+            <div className="mb-1 font-medium">Backend từ chối cấu hình:</div>
+            <ul className="list-disc space-y-0.5 pl-5 text-xs">
+              {serverErrors.map((m, i) => (
+                <li key={i}>{m}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {tab === "providers" && (
+          <ProvidersTab
+            draft={draft}
+            saved={config}
+            errors={errors}
+            update={update}
+            fetches={fetches}
+            onFetch={(p) => void fetchModels(p)}
+            onCommit={maybeFetch}
+          />
+        )}
+        {tab === "roles" && <RolesTab draft={draft} errors={errors} dirty={dirty} update={update} />}
+        {tab === "departments" && <DepartmentsTab draft={draft} errors={errors} update={update} />}
+        {tab === "meeting" && <MeetingTab draft={draft} errors={errors} update={update} />}
+        {tab === "context" && <ContextToolsTab draft={draft} saved={config} errors={errors} dirty={dirty} update={update} />}
+        {tab === "general" && <GeneralTab draft={draft} errors={errors} update={update} />}
+      </div>
+    </div>
+  );
+}
+
+function GeneralTab({
+  draft,
+  errors,
+  update,
+}: {
+  draft: AppConfig;
+  errors: Errors;
+  update: (f: (c: AppConfig) => AppConfig) => void;
+}) {
+  const set = (patch: Partial<AppConfig>) => update((c) => ({ ...c, ...patch }));
+  return (
+    <Panel className="p-4">
+      <SectionTitle title="Mạng và giới hạn" />
+      <div className="grid grid-cols-3 gap-4">
+        <Field label="Số request song song" error={errors["general.max_parallel_calls"]} hint="1–16 · giảm nếu provider báo 429">
+          <NumberInput value={draft.max_parallel_calls} onChange={(v) => set({ max_parallel_calls: v ?? Number.NaN })} />
+        </Field>
+        <Field label="Số lần retry" error={errors["general.max_retries"]} hint="0–6">
+          <NumberInput value={draft.max_retries} onChange={(v) => set({ max_retries: v ?? Number.NaN })} />
+        </Field>
+        <Field label="Max tokens" error={errors["general.max_tokens"]} hint="Trống = mặc định của model">
+          <NumberInput value={draft.max_tokens} nullable onChange={(v) => set({ max_tokens: v })} />
+        </Field>
+        <Field label="Timeout request (giây)" error={errors["general.request_timeout_secs"]} hint="10–1800">
+          <NumberInput value={draft.request_timeout_secs} onChange={(v) => set({ request_timeout_secs: v ?? Number.NaN })} />
+        </Field>
+        <Field label="Idle timeout khi stream (giây)" error={errors["general.stream_idle_timeout_secs"]} hint="10–600">
+          <NumberInput value={draft.stream_idle_timeout_secs} onChange={(v) => set({ stream_idle_timeout_secs: v ?? Number.NaN })} />
+        </Field>
+        <Field label="JSON mode" hint="Tự fallback nếu provider không hỗ trợ">
+          <select value={draft.json_mode} onChange={(e) => set({ json_mode: e.target.value as AppConfig["json_mode"] })} className={INPUT}>
+            <option value="json_object">json_object</option>
+            <option value="off">off (chỉ dựa vào prompt)</option>
+          </select>
+        </Field>
+        <Field label="Stream plan" hint="Hiện plan theo thời gian thực">
+          <Toggle checked={draft.stream_plans} onChange={(v) => set({ stream_plans: v })} label="Bật" />
+        </Field>
+      </div>
+    </Panel>
+  );
+}

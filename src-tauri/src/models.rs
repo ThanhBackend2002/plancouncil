@@ -1,0 +1,702 @@
+//! Domain models + IPC contract (Rust ⇄ React).
+//!
+//! Mọi struct ở đây là "source of truth" cho `src/lib/contracts.ts` phía frontend.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Deserializer, Serialize};
+use uuid::Uuid;
+
+pub const SUMMARY_BUBBLE_MAX_WORDS: usize = 15;
+/// Giới hạn để feedback không làm phình context của người viết plan qua từng vòng.
+pub const MAX_LIST_ITEMS: usize = 10;
+pub const MAX_ITEM_CHARS: usize = 600;
+
+/// Scope của cuộc họp chính; các phòng ban dùng id của phòng ban làm scope.
+pub const MAIN_SCOPE: &str = "main";
+
+/// Id của role (do người dùng quản lý trong config).
+pub type RoleId = String;
+
+// ───────────────────────────── Review ─────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Verdict {
+    Approve,
+    Reject,
+    /// Reviewer tự nhận plan không thuộc chuyên môn → rời cuộc họp, không tính vào hội tụ.
+    Abstain,
+}
+
+/// Deserialize "khoan dung": LLM hay trả `approve`, `APPROVED`, ` Reject `, `abstain`...
+impl<'de> Deserialize<'de> for Verdict {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        let norm = raw.trim().to_ascii_uppercase();
+        if norm.starts_with("APPROV") {
+            Ok(Verdict::Approve)
+        } else if norm.starts_with("REJECT") {
+            Ok(Verdict::Reject)
+        } else if norm.starts_with("ABSTAIN") || norm.starts_with("NOT_RELEVANT") || norm == "SKIP" {
+            Ok(Verdict::Abstain)
+        } else {
+            Err(serde::de::Error::custom(format!(
+                "invalid verdict {raw:?}, expected \"APPROVE\" | \"REJECT\" | \"ABSTAIN\""
+            )))
+        }
+    }
+}
+
+/// Đề nghị mời thêm 1 chuyên gia vào cuộc họp (từ danh sách `available_experts`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InviteRequest {
+    pub role_id: RoleId,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Chấp nhận `["dba"]`, `[{"role_id":"dba","reason":"…"}]`, `null`.
+fn flexible_invites<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<InviteRequest>, D::Error> {
+    use serde_json::Value;
+    let v = Option::<Value>::deserialize(d)?;
+    let items = match v {
+        Some(Value::Array(a)) => a,
+        Some(Value::Null) | None => vec![],
+        Some(other) => vec![other],
+    };
+    Ok(items
+        .into_iter()
+        .filter_map(|it| match it {
+            Value::String(s) => Some(InviteRequest { role_id: s.trim().to_owned(), reason: String::new() }),
+            Value::Object(m) => Some(InviteRequest {
+                role_id: m.get("role_id").or_else(|| m.get("id")).and_then(Value::as_str)?.trim().to_owned(),
+                reason: m.get("reason").and_then(Value::as_str).unwrap_or("").trim().to_owned(),
+            }),
+            _ => None,
+        })
+        .filter(|i| !i.role_id.is_empty())
+        .take(3)
+        .collect())
+}
+
+/// Đúng schema LLM được yêu cầu trả về. Mọi field trừ `verdict` đều optional.
+#[derive(Debug, Deserialize)]
+pub struct RawReview {
+    /// Nhận để khớp schema nhưng không dùng — role do server gán.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub role: Option<String>,
+    pub verdict: Verdict,
+    #[serde(default)]
+    pub summary_bubble: Option<String>,
+    #[serde(default, deserialize_with = "flexible_string_list")]
+    pub critical_issues: Vec<String>,
+    #[serde(default, deserialize_with = "flexible_string_list")]
+    pub suggestions: Vec<String>,
+    #[serde(default, deserialize_with = "flexible_string_list")]
+    pub out_of_scope: Vec<String>,
+    #[serde(default, deserialize_with = "flexible_invites")]
+    pub invite: Vec<InviteRequest>,
+}
+
+/// Chấp nhận `null`, `"a string"`, `["a", {"issue": "b"}]`.
+pub fn flexible_string_list<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    use serde_json::Value;
+    let v = Option::<Value>::deserialize(d)?;
+    let items = match v {
+        None | Some(Value::Null) => vec![],
+        Some(Value::String(s)) => vec![Value::String(s)],
+        Some(Value::Array(a)) => a,
+        Some(other) => vec![other],
+    };
+    Ok(items
+        .into_iter()
+        .filter_map(|it| match it {
+            Value::String(s) => Some(s),
+            Value::Null => None,
+            Value::Object(map) => {
+                let parts: Vec<String> = map
+                    .values()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
+                (!parts.is_empty()).then(|| parts.join(" — "))
+            }
+            other => Some(other.to_string()),
+        })
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Review đã được validate/sanitize — thứ duy nhất đi ra Frontend và vào lịch sử.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Review {
+    /// Id của role đã review.
+    pub agent: RoleId,
+    /// Tên hiển thị của role tại thời điểm review.
+    pub role: String,
+    pub verdict: Verdict,
+    pub summary_bubble: String,
+    pub critical_issues: Vec<String>,
+    pub suggestions: Vec<String>,
+    /// Ý tưởng vượt phạm vi yêu cầu — ghi nhận nhưng không phải lý do REJECT.
+    #[serde(default)]
+    pub out_of_scope: Vec<String>,
+    /// Chuyên gia reviewer đề nghị mời thêm.
+    #[serde(default)]
+    pub invites: Vec<InviteRequest>,
+    /// true = không gọi model: phần reviewer phụ trách không đổi nên giữ nguyên APPROVE vòng trước.
+    #[serde(default)]
+    pub carried_over: bool,
+    /// Khác `None` khi server-side policy đã can thiệp (vd: ép REJECT ở Round 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_override: Option<String>,
+}
+
+impl Review {
+    pub fn from_raw(agent: &str, display_name: &str, raw: RawReview) -> Self {
+        let clamp = |v: Vec<String>| -> Vec<String> {
+            v.into_iter()
+                .take(MAX_LIST_ITEMS)
+                .map(|s| truncate_chars(&s, MAX_ITEM_CHARS))
+                .collect()
+        };
+        let critical_issues = clamp(raw.critical_issues);
+        let suggestions = clamp(raw.suggestions);
+        let out_of_scope = clamp(raw.out_of_scope);
+
+        let bubble_src = raw
+            .summary_bubble
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| critical_issues.first().cloned())
+            .unwrap_or_else(|| match raw.verdict {
+                Verdict::Approve => "Plan ổn, không còn vấn đề nghiêm trọng.".into(),
+                Verdict::Reject => "Còn vấn đề cần xử lý.".into(),
+                Verdict::Abstain => "Nội dung không thuộc chuyên môn của tôi, xin phép rút.".into(),
+            });
+
+        Review {
+            agent: agent.to_owned(),
+            // Không tin `role` do LLM tự khai — dùng tên server biết chắc.
+            role: display_name.to_owned(),
+            verdict: raw.verdict,
+            summary_bubble: truncate_words(&bubble_src, SUMMARY_BUBBLE_MAX_WORDS),
+            critical_issues,
+            suggestions,
+            out_of_scope,
+            invites: raw.invite,
+            carried_over: false,
+            policy_override: None,
+        }
+    }
+
+    /// Round 1 (chế độ nghiêm): cấm APPROVE và bắt buộc ≥ 1 critical issue cụ thể. ABSTAIN được phép.
+    pub fn violates_round_one_policy(&self) -> bool {
+        match self.verdict {
+            Verdict::Approve => true,
+            Verdict::Reject => self.critical_issues.is_empty(),
+            Verdict::Abstain => false,
+        }
+    }
+
+    /// Fallback cuối cùng sau khi đã yêu cầu LLM tự sửa mà vẫn vi phạm. Không bịa issue.
+    pub fn enforce_round_one_policy(&mut self) {
+        if self.violates_round_one_policy() {
+            self.verdict = Verdict::Reject;
+            self.policy_override = Some(format!(
+                "Round-1 policy: verdict bị ép thành REJECT (reviewer trả về {} critical issue, yêu cầu ≥ 1).",
+                self.critical_issues.len()
+            ));
+        }
+    }
+}
+
+// ───────────────────────────── Session ─────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanVersion {
+    pub version: u32,
+    pub markdown: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewSlot {
+    pub agent: RoleId,
+    pub review: Option<Review>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundRecord {
+    pub round: u32,
+    pub plan_version: u32,
+    pub slots: Vec<ReviewSlot>,
+    pub approvals: u32,
+    pub converged: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Running,
+    /// Mọi reviewer APPROVE.
+    Converged,
+    /// Hết vòng mà vẫn còn REJECT → Final kèm "Open Issues".
+    MaxRoundsReached,
+    /// Reviewer còn lại đều APPROVE nhưng ≥1 reviewer lỗi API.
+    PartiallyApproved,
+    Cancelled,
+    Failed,
+}
+
+/// Ảnh chụp role tại thời điểm họp — lịch sử vẫn hiển thị đúng khi role bị sửa/xoá sau này.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CastMember {
+    pub id: RoleId,
+    pub name: String,
+    pub title: String,
+    pub color: String,
+    pub icon: String,
+    pub model: String,
+    #[serde(default)]
+    pub level: crate::config::RoleLevel,
+    #[serde(default)]
+    pub appearance: crate::config::Appearance,
+}
+
+/// Thông tin phòng ban gửi lên UI khi bắt đầu phiên.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepartmentBrief {
+    pub id: String,
+    pub name: String,
+    pub lead_id: RoleId,
+    pub member_ids: Vec<RoleId>,
+    pub max_rounds: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Assignment {
+    pub department_id: String,
+    pub task: String,
+}
+
+/// Kết quả họp nội bộ của 1 phòng ban.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepartmentRecord {
+    pub id: String,
+    pub name: String,
+    pub task: String,
+    pub lead_id: RoleId,
+    pub member_ids: Vec<RoleId>,
+    pub max_rounds: u32,
+    pub status: SessionStatus,
+    pub plans: Vec<PlanVersion>,
+    pub rounds: Vec<RoundRecord>,
+    pub final_markdown: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Token tiêu thụ cộng dồn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub calls: u32,
+    /// Số lần gọi mà provider không trả `usage` → token được ước lượng theo độ dài văn bản.
+    pub estimated_calls: u32,
+}
+
+impl TokenUsage {
+    pub fn add(&mut self, prompt: u64, completion: u64, estimated: bool) {
+        self.prompt_tokens += prompt;
+        self.completion_tokens += completion;
+        self.calls += 1;
+        if estimated {
+            self.estimated_calls += 1;
+        }
+    }
+    pub fn total(&self) -> u64 {
+        self.prompt_tokens + self.completion_tokens
+    }
+}
+
+/// Báo cáo token của 1 phiên: tổng + theo role + theo nơi họp + theo loại việc.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UsageReport {
+    pub total: TokenUsage,
+    pub by_role: std::collections::BTreeMap<RoleId, TokenUsage>,
+    pub by_scope: std::collections::BTreeMap<String, TokenUsage>,
+    /// "assign" | "research" | "plan" | "review" | "staffing"
+    pub by_kind: std::collections::BTreeMap<String, TokenUsage>,
+    /// Token ước lượng tiết kiệm được nhờ review theo section + giữ nguyên APPROVE.
+    pub saved_tokens: u64,
+    /// Số lượt review không cần gọi model (phần phụ trách không đổi).
+    pub carried_reviews: u32,
+}
+
+/// Thay đổi thành viên trong lúc họp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipChange {
+    pub scope: String,
+    pub agent: RoleId,
+    /// "invited" | "dismissed" | "abstained"
+    pub action: String,
+    /// "user" | id role đề nghị | "self"
+    pub by: String,
+    pub reason: String,
+    pub round: u32,
+}
+
+/// Thành phần họp do AI đề xuất / tự chọn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StaffingInfo {
+    pub chair_id: RoleId,
+    pub reviewer_ids: Vec<RoleId>,
+    pub department_ids: Vec<String>,
+    /// id role / phòng ban → lý do được chọn
+    pub reasons: std::collections::BTreeMap<String, String>,
+    /// true = model lỗi, dùng thành phần mặc định
+    pub fallback: bool,
+    pub note: String,
+}
+
+/// 1 lần role dùng công cụ (đọc file / tìm web) — hiển thị trong hội thoại.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolActivity {
+    pub scope: String,
+    pub agent: RoleId,
+    /// "author" (trước khi viết plan version `step`) | "review" (trước khi review round `step`)
+    pub phase: String,
+    pub step: u32,
+    pub tool: String,
+    pub summary: String,
+    pub ok: bool,
+}
+
+/// Tuỳ chọn đã dùng cho phiên (lưu vào lịch sử).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionInfo {
+    pub workspace: Option<String>,
+    pub web_search: bool,
+    pub company_context: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRecord {
+    pub id: Uuid,
+    pub prompt: String,
+    pub created_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status: SessionStatus,
+    pub max_rounds: u32,
+    /// Chủ trì cuộc họp chính (phiên cũ: "architect").
+    #[serde(default = "default_chair")]
+    pub chair_id: RoleId,
+    #[serde(default)]
+    pub reviewer_ids: Vec<RoleId>,
+    #[serde(default)]
+    pub cast: Vec<CastMember>,
+    #[serde(default)]
+    pub departments: Vec<DepartmentRecord>,
+    #[serde(default)]
+    pub usage: UsageReport,
+    #[serde(default)]
+    pub activities: Vec<ToolActivity>,
+    #[serde(default)]
+    pub options: SessionInfo,
+    #[serde(default)]
+    pub membership: Vec<MembershipChange>,
+    #[serde(default)]
+    pub staffing: Option<StaffingInfo>,
+    /// Plan + round của cuộc họp chính.
+    pub plans: Vec<PlanVersion>,
+    pub rounds: Vec<RoundRecord>,
+    pub final_markdown: Option<String>,
+    pub error: Option<String>,
+}
+
+fn default_chair() -> RoleId {
+    "architect".into()
+}
+
+impl SessionRecord {
+    pub fn new(id: Uuid, prompt: String, max_rounds: u32) -> Self {
+        Self {
+            id,
+            prompt,
+            created_at: Utc::now(),
+            finished_at: None,
+            status: SessionStatus::Running,
+            max_rounds,
+            chair_id: default_chair(),
+            reviewer_ids: vec![],
+            cast: vec![],
+            departments: vec![],
+            usage: UsageReport::default(),
+            activities: vec![],
+            options: SessionInfo::default(),
+            membership: vec![],
+            staffing: None,
+            plans: vec![],
+            rounds: vec![],
+            final_markdown: None,
+            error: None,
+        }
+    }
+
+    pub fn summary(&self) -> SessionSummary {
+        SessionSummary {
+            id: self.id,
+            prompt_preview: truncate_chars(&self.prompt, 140),
+            created_at: self.created_at,
+            status: self.status,
+            versions: self.plans.len() as u32,
+            rounds: self.rounds.len() as u32,
+            departments: self.departments.len() as u32,
+            total_tokens: self.usage.total.total(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: Uuid,
+    pub prompt_preview: String,
+    pub created_at: DateTime<Utc>,
+    pub status: SessionStatus,
+    pub versions: u32,
+    pub rounds: u32,
+    #[serde(default)]
+    pub departments: u32,
+    #[serde(default)]
+    pub total_tokens: u64,
+}
+
+// ───────────────────────────── Events ─────────────────────────────
+
+pub const COUNCIL_EVENT: &str = "council-event";
+
+/// Payload của `app.emit("council-event", ...)`. Tagged union → TS discriminated union.
+/// `scope` = "main" (cuộc họp chính) hoặc id phòng ban.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CouncilEvent {
+    SessionStarted {
+        prompt: String,
+        max_rounds: u32,
+        chair_id: RoleId,
+        reviewer_ids: Vec<RoleId>,
+        cast: Vec<CastMember>,
+        departments: Vec<DepartmentBrief>,
+        options: SessionInfo,
+    },
+    /// Sau mỗi lần gọi LLM: token của lần gọi + tổng cộng dồn của phiên.
+    UsageUpdated {
+        scope: String,
+        agent: RoleId,
+        kind: String,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        estimated: bool,
+        total: TokenUsage,
+    },
+    /// Role vừa dùng công cụ (đọc file / tìm web).
+    ToolUsed {
+        activity: ToolActivity,
+    },
+    /// AI đã chọn thành phần họp (chế độ tự động).
+    StaffingDecided {
+        staffing: StaffingInfo,
+    },
+    /// Thành viên vào / ra cuộc họp giữa chừng. `member` có khi được mời (để UI hiển thị).
+    MembershipChanged {
+        change: MembershipChange,
+        member: Option<CastMember>,
+    },
+    /// Token tiết kiệm được (review theo section / giữ nguyên APPROVE).
+    TokensSaved {
+        scope: String,
+        agent: RoleId,
+        tokens: u64,
+        carried: bool,
+        total_saved: u64,
+    },
+    /// Chủ trì đã giao việc cho các phòng ban.
+    DepartmentsAssigned {
+        assignments: Vec<Assignment>,
+    },
+    AgentThinking {
+        scope: String,
+        agent: RoleId,
+        round: u32,
+        plan_version: u32,
+    },
+    PlanStreamReset {
+        scope: String,
+        version: u32,
+    },
+    PlanDelta {
+        scope: String,
+        version: u32,
+        delta: String,
+    },
+    PlanReady {
+        scope: String,
+        version: u32,
+        markdown: String,
+    },
+    ReviewReady {
+        scope: String,
+        round: u32,
+        review: Review,
+    },
+    ReviewFailed {
+        scope: String,
+        round: u32,
+        agent: RoleId,
+        error: String,
+    },
+    RoundCompleted {
+        scope: String,
+        round: u32,
+        plan_version: u32,
+        approvals: u32,
+        total: u32,
+        converged: bool,
+    },
+    DepartmentFinished {
+        department_id: String,
+        status: SessionStatus,
+        final_markdown: Option<String>,
+        error: Option<String>,
+    },
+    Finished {
+        status: SessionStatus,
+        final_version: u32,
+        final_markdown: String,
+    },
+    Cancelled {
+        round: u32,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EventEnvelope {
+    pub session_id: Uuid,
+    /// Tăng đơn điệu trong 1 session → Frontend có thể detect mất/đảo event.
+    pub seq: u64,
+    pub ts: DateTime<Utc>,
+    #[serde(flatten)]
+    pub event: CouncilEvent,
+}
+
+// ───────────────────────────── Helpers ─────────────────────────────
+
+pub fn truncate_words(s: &str, max_words: usize) -> String {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    if words.len() <= max_words {
+        words.join(" ")
+    } else {
+        format!("{}…", words[..max_words].join(" "))
+    }
+}
+
+/// Cắt theo char (không theo byte) để an toàn với tiếng Việt có dấu / emoji.
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        None => s.to_owned(),
+        Some((idx, _)) => format!("{}…", &s[..idx]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verdict_is_lenient() {
+        for (s, v) in [
+            ("\"APPROVE\"", Verdict::Approve),
+            ("\"approved\"", Verdict::Approve),
+            ("\" Reject \"", Verdict::Reject),
+            ("\"REJECTED\"", Verdict::Reject),
+        ] {
+            assert_eq!(serde_json::from_str::<Verdict>(s).unwrap(), v);
+        }
+        assert!(serde_json::from_str::<Verdict>("\"MAYBE\"").is_err());
+    }
+
+    #[test]
+    fn raw_review_tolerates_schema_drift() {
+        let raw: RawReview = serde_json::from_str(
+            r#"{"verdict":"reject","critical_issues":["a",{"issue":"b"},null,""],"suggestions":"only one"}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.critical_issues, vec!["a", "b"]);
+        assert_eq!(raw.suggestions, vec!["only one"]);
+        let r = Review::from_raw("chaos_reviewer", "Security Engineer", raw);
+        assert_eq!(r.role, "Security Engineer");
+        assert_eq!(r.agent, "chaos_reviewer");
+        assert_eq!(r.summary_bubble, "a"); // fallback từ issue đầu tiên
+    }
+
+    #[test]
+    fn round_one_policy() {
+        let raw: RawReview =
+            serde_json::from_str(r#"{"verdict":"APPROVE","critical_issues":["x"]}"#).unwrap();
+        let mut r = Review::from_raw("scale_reviewer", "Perf", raw);
+        assert!(r.violates_round_one_policy());
+        r.enforce_round_one_policy();
+        assert_eq!(r.verdict, Verdict::Reject);
+        assert!(r.policy_override.is_some());
+    }
+
+    #[test]
+    fn truncation_is_unicode_safe() {
+        assert_eq!(truncate_chars("Kiến trúc", 4), "Kiến…");
+        let long = "một hai ba bốn năm sáu bảy tám chín mười mười-một mười-hai mười-ba mười-bốn mười-lăm mười-sáu";
+        let t = truncate_words(long, SUMMARY_BUBBLE_MAX_WORDS);
+        assert!(t.ends_with('…'));
+        assert_eq!(t.trim_end_matches('…').split_whitespace().count(), 15);
+    }
+
+    #[test]
+    fn event_envelope_shape() {
+        let env = EventEnvelope {
+            session_id: Uuid::nil(),
+            seq: 7,
+            ts: Utc::now(),
+            event: CouncilEvent::PlanDelta {
+                scope: MAIN_SCOPE.into(),
+                version: 2,
+                delta: "x".into(),
+            },
+        };
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["type"], "plan_delta");
+        assert_eq!(v["seq"], 7);
+        assert_eq!(v["version"], 2);
+        assert_eq!(v["scope"], "main");
+    }
+
+    #[test]
+    fn old_session_files_still_load() {
+        // Phiên lưu trước khi có role động / phòng ban.
+        let old = r#"{"id":"00000000-0000-0000-0000-000000000000","prompt":"p","created_at":"2026-01-01T00:00:00Z",
+            "finished_at":null,"status":"converged","max_rounds":3,"plans":[],"rounds":[{"round":1,"plan_version":1,
+            "slots":[{"agent":"scale_reviewer","review":null,"error":"x"}],"approvals":0,"converged":false}],
+            "final_markdown":null,"error":null}"#;
+        let r: SessionRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.chair_id, "architect");
+        assert!(r.departments.is_empty() && r.cast.is_empty());
+        assert_eq!(r.rounds[0].slots[0].agent, "scale_reviewer");
+    }
+}
