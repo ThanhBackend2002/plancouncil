@@ -136,6 +136,60 @@ impl HistoryIndex {
     }
 }
 
+#[derive(Default)]
+struct WriterGate {
+    /// Đã ghi bản ghi cuối → mọi checkpoint đến muộn bị bỏ.
+    closed: bool,
+    /// Số thứ tự checkpoint mới nhất đã ghi (checkpoint cũ hơn đến sau bị bỏ).
+    last_seq: u64,
+}
+
+/// Ghi file phiên của 1 phiên đang chạy theo đúng thứ tự: checkpoint (`running`) rồi bản ghi cuối.
+/// Checkpoint ghi ở `spawn_blocking` nên có thể đến lệch thứ tự → lọc bằng `seq` + cờ `closed`.
+pub struct SessionWriter {
+    storage: Storage,
+    history: HistoryIndex,
+    gate: std::sync::Mutex<WriterGate>,
+}
+
+impl SessionWriter {
+    pub fn new(storage: Storage, history: HistoryIndex) -> Self {
+        Self { storage, history, gate: std::sync::Mutex::default() }
+    }
+
+    fn gate(&self) -> std::sync::MutexGuard<'_, WriterGate> {
+        self.gate.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Ghi checkpoint số `seq` (blocking). Trả true nếu đã ghi.
+    pub fn write_checkpoint(&self, seq: u64, rec: &SessionRecord) -> bool {
+        let mut g = self.gate();
+        if g.closed || seq <= g.last_seq {
+            return false;
+        }
+        g.last_seq = seq;
+        // Giữ khoá trong lúc ghi → không xen với bản ghi cuối.
+        match self.save(rec) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("checkpoint phiên {} thất bại: {e}", rec.id);
+                false
+            }
+        }
+    }
+
+    /// Ghi bản ghi cuối (blocking) và chặn mọi checkpoint sau đó.
+    pub fn write_final(&self, rec: &SessionRecord) -> Result<(), StorageError> {
+        let mut g = self.gate();
+        g.closed = true;
+        self.save(rec)
+    }
+
+    fn save(&self, rec: &SessionRecord) -> Result<(), StorageError> {
+        self.history.save_session(&self.storage, rec)
+    }
+}
+
 /// `<storage root>/index.db`.
 pub fn index_path(root: &Path) -> std::path::PathBuf {
     root.join(INDEX_FILE)
@@ -215,6 +269,53 @@ mod tests {
         let mut ties: Vec<_> = recs[..3].iter().map(|r| r.id).collect();
         ties.sort();
         assert_eq!(&ids[4..], &ties[..], "trùng created_at → id tăng dần");
+    }
+
+    #[test]
+    fn writer_drops_stale_and_late_checkpoints() {
+        let f = fx();
+        let h = HistoryIndex::open(&f.storage);
+        h.sync(&f.storage);
+        let w = SessionWriter::new(f.storage.clone(), h.clone());
+        let mut r = record("đang chạy", "## A\nv1");
+        r.status = SessionStatus::Running;
+        assert!(w.write_checkpoint(2, &r));
+        let mut stale = r.clone();
+        stale.plans.clear();
+        assert!(!w.write_checkpoint(1, &stale), "checkpoint cũ đến sau bị bỏ");
+        assert_eq!(f.storage.load_session(r.id).unwrap().plans.len(), 1);
+        assert_eq!(h.list_sessions(&f.storage, 10).unwrap()[0].status, SessionStatus::Running);
+
+        r.status = SessionStatus::Converged;
+        w.write_final(&r).unwrap();
+        let mut late = r.clone();
+        late.status = SessionStatus::Running;
+        assert!(!w.write_checkpoint(3, &late), "checkpoint sau bản ghi cuối bị bỏ");
+        assert_eq!(f.storage.load_session(r.id).unwrap().status, SessionStatus::Converged);
+        assert_eq!(h.list_sessions(&f.storage, 10).unwrap()[0].status, SessionStatus::Converged);
+    }
+
+    #[test]
+    fn parent_survives_index_round_trip() {
+        let f = fx();
+        let mut child = record("chạy lại", "## A\nx");
+        child.parent = Some(crate::models::ParentRef { session_id: Uuid::new_v4(), scope: "main".into(), version_no: 3 });
+        let plain = record("phiên thường", "## A\ny");
+        f.storage.save_session(&child).unwrap();
+        let h = HistoryIndex::open(&f.storage);
+        h.sync(&f.storage);
+        h.save_session(&f.storage, &plain).unwrap();
+        assert!(h.is_ready());
+        let via_index = h.list_sessions(&f.storage, 10).unwrap();
+        assert_eq!(json(&via_index), json(&f.storage.list_sessions(10).unwrap()));
+        let got = via_index.iter().find(|s| s.id == child.id).unwrap();
+        assert_eq!(got.parent, child.parent);
+        assert!(via_index.iter().find(|s| s.id == plain.id).unwrap().parent.is_none());
+        // Mở lại index (lần chạy app sau) → vẫn còn.
+        drop(h);
+        let h2 = HistoryIndex::open(&f.storage);
+        h2.sync(&f.storage);
+        assert_eq!(h2.list_sessions(&f.storage, 10).unwrap().iter().find(|s| s.id == child.id).unwrap().parent, child.parent);
     }
 
     #[test]

@@ -20,7 +20,7 @@
 //! Plan bị cắt (`finish_reason=length`) → nối tiếp tối đa `MAX_CONTINUATIONS` lần; không cứu được
 //! → dừng vòng họp với `Truncated`, giữ phiên bản hợp lệ gần nhất.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -153,6 +153,23 @@ impl Drop for Hold<'_> {
     }
 }
 
+/// Điểm xuất phát của phiên chạy lại (`rerun_from_version`): bỏ bước nháp, cuộc họp chính
+/// bắt đầu bằng việc review đúng plan này với số hiệu `version`.
+#[derive(Debug, Clone)]
+pub struct Seed {
+    pub version: u32,
+    pub markdown: String,
+    /// Review REJECT của vòng gần nhất đã bác phiên bản này (issue còn mở) — reviewer nhận lại
+    /// như "review vòng trước" để kiểm chứng.
+    pub reviews: Vec<Review>,
+}
+
+/// Nơi nhận ảnh chụp `SessionRecord` (trạng thái `running`) sau mỗi vòng / mỗi phiên bản plan hợp lệ.
+/// Không bao giờ chứa phần plan đang stream dở.
+pub trait Checkpoint: Send + Sync + 'static {
+    fn save(&self, record: SessionRecord);
+}
+
 /// Ngữ cảnh bổ sung của 1 phiên: công cụ, bối cảnh công ty, tổng quan workspace.
 #[derive(Clone, Default)]
 pub struct SessionExtras {
@@ -165,6 +182,52 @@ pub struct SessionExtras {
     pub auto_staff: bool,
     /// Lệnh mời / mời ra của người dùng trong lúc họp (áp dụng từ vòng kế tiếp).
     pub control: Arc<MeetingControl>,
+    /// Phiên chạy lại: plan xuất phát cho cuộc họp chính.
+    pub seed: Option<Seed>,
+    /// Nguồn gốc (ghi vào bản ghi).
+    pub parent: Option<ParentRef>,
+    /// Lưu tiến độ giữa chừng (None = không lưu, như test).
+    pub checkpoint: Option<Arc<dyn Checkpoint>>,
+}
+
+/// Thông tin của 1 lần gọi LLM để ghi `CallUsage`.
+struct CallMeta<'a> {
+    scope: &'a str,
+    agent: &'a str,
+    kind: &'a str,
+    model: &'a str,
+    round: u32,
+    t0: Instant,
+}
+
+impl<'a> CallMeta<'a> {
+    fn new(scope: &'a str, agent: &'a str, kind: &'a str, model: &'a str, round: u32) -> Self {
+        Self { scope, agent, kind, model, round, t0: Instant::now() }
+    }
+}
+
+fn finish_name(f: Finish) -> &'static str {
+    match f {
+        Finish::Stop => "stop",
+        Finish::Length => "length",
+        Finish::Error => "error",
+    }
+}
+
+/// Sổ ghi từng lần gọi + chi phí cộng dồn (theo bảng giá lúc bắt đầu phiên).
+#[derive(Default)]
+struct CallLog {
+    calls: Vec<CallUsage>,
+    next_id: u32,
+    cost: f64,
+    unpriced: BTreeSet<String>,
+}
+
+/// Chép phần đuôi mới của `src` sang `dst` (plan / round chỉ được thêm vào cuối).
+fn sync_tail<T: Clone>(dst: &mut Vec<T>, src: &[T]) {
+    dst.truncate(src.len());
+    let n = dst.len();
+    dst.extend_from_slice(&src[n..]);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +388,9 @@ pub struct Council {
     budget: BudgetLedger,
     /// Có reviewer bị cắt output ở bất kỳ nơi họp nào → phiên không bao giờ kết thúc `Converged`.
     review_truncated: AtomicBool,
+    calls: Mutex<CallLog>,
+    /// Bản ghi đang dựng dở (chỉ khi có `extras.checkpoint`) — cập nhật tăng dần ở mỗi checkpoint.
+    progress: Mutex<Option<SessionRecord>>,
 }
 
 impl Council {
@@ -337,6 +403,11 @@ impl Council {
         cancel: CancellationToken,
         extras: SessionExtras,
     ) -> Self {
+        let mut cfg = cfg;
+        if extras.seed.is_some() {
+            // Plan xuất phát đã qua review → vòng 1 của phiên chạy lại không phải "lần đọc đầu".
+            cfg.meeting.strict_first_round = false;
+        }
         let permits = cfg.max_parallel_calls.clamp(1, 16) as usize;
         let budget = BudgetLedger::new(cfg.meeting.max_total_tokens);
         Self {
@@ -358,7 +429,70 @@ impl Council {
             reviewer_notes: Mutex::new(HashMap::new()),
             membership: Mutex::new(Vec::new()),
             extra_cast: Mutex::new(Vec::new()),
+            calls: Mutex::new(CallLog::default()),
+            progress: Mutex::new(None),
         }
+    }
+
+    // ── checkpoint ──
+
+    /// Ghi ảnh chụp tiến độ của `spec.scope` (plan + round đã chốt) qua `extras.checkpoint`.
+    fn checkpoint(&self, spec: &LoopSpec<'_>, out: &LoopResult) {
+        if self.extras.checkpoint.is_none() {
+            return;
+        }
+        self.checkpoint_with(|rec| {
+            let (plans, rounds) = match spec.ctx {
+                PlanContext::Main => (&mut rec.plans, &mut rec.rounds),
+                PlanContext::Department { dept, task } => {
+                    let i = match rec.departments.iter().position(|d| d.id == dept.id) {
+                        Some(i) => i,
+                        None => {
+                            rec.departments.push(DepartmentRecord {
+                                id: dept.id.clone(),
+                                name: dept.name.clone(),
+                                task: task.to_owned(),
+                                lead_id: dept.lead_id.clone(),
+                                member_ids: dept.member_ids.clone(),
+                                max_rounds: dept.max_rounds,
+                                status: SessionStatus::Running,
+                                plans: vec![],
+                                rounds: vec![],
+                                final_markdown: None,
+                                error: None,
+                            });
+                            rec.departments.len() - 1
+                        }
+                    };
+                    let d = &mut rec.departments[i];
+                    (&mut d.plans, &mut d.rounds)
+                }
+            };
+            sync_tail(plans, &out.plans);
+            sync_tail(rounds, &out.rounds);
+        });
+    }
+
+    /// Cập nhật bản ghi dựng dở bằng `f` + số liệu chung (usage, công cụ, thành viên) rồi gửi bản sao.
+    fn checkpoint_with(&self, f: impl FnOnce(&mut SessionRecord)) {
+        let Some(sink) = self.extras.checkpoint.as_ref() else { return };
+        let snapshot = {
+            let mut guard = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(rec) = guard.as_mut() else { return };
+            f(rec);
+            rec.status = SessionStatus::Running;
+            rec.usage = self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            rec.calls = self.calls.lock().unwrap_or_else(|e| e.into_inner()).calls.clone();
+            rec.activities = self.activities.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            rec.membership = self.membership.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for c in self.extra_cast.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+                if !rec.cast.iter().any(|x| x.id == c.id) {
+                    rec.cast.push(c.clone());
+                }
+            }
+            rec.clone()
+        };
+        sink.save(snapshot);
     }
 
     fn prompt_opts(&self) -> PromptOpts {
@@ -431,19 +565,48 @@ impl Council {
 
     // ── token ──
 
-    /// Ghi token của 1 lần gọi; thiếu `usage` → ước lượng theo độ dài prompt/output.
-    fn record_usage(&self, scope: &str, agent: &str, kind: &str, usage: Option<Usage>, prompt_chars: usize, output_chars: usize) {
-        let (p, c, estimated) = match usage {
-            Some(u) if u.prompt_tokens + u.completion_tokens > 0 => (u.prompt_tokens, u.completion_tokens, false),
-            _ => (estimate_tokens(prompt_chars), estimate_tokens(output_chars), true),
+    /// Ghi token của 1 lần gọi (tổng + từng lần gọi + chi phí); thiếu `usage` → ước lượng theo độ dài prompt/output.
+    fn record_usage(&self, m: &CallMeta<'_>, usage: Option<Usage>, finish: &str, prompt_chars: usize, output_chars: usize) {
+        let (p, cached, c, estimated) = match usage {
+            Some(u) if u.prompt_tokens + u.completion_tokens > 0 => (u.prompt_tokens, u.cached_tokens, u.completion_tokens, false),
+            _ => (estimate_tokens(prompt_chars), 0, estimate_tokens(output_chars), true),
         };
+        let (scope, agent, kind) = (m.scope, m.agent, m.kind);
         let total = {
             let mut r = self.usage.lock().unwrap_or_else(|e| e.into_inner());
-            r.total.add(p, c, estimated);
-            r.by_role.entry(agent.to_owned()).or_default().add(p, c, estimated);
-            r.by_scope.entry(scope.to_owned()).or_default().add(p, c, estimated);
-            r.by_kind.entry(kind.to_owned()).or_default().add(p, c, estimated);
+            r.total.add(p, cached, c, estimated);
+            r.by_role.entry(agent.to_owned()).or_default().add(p, cached, c, estimated);
+            r.by_scope.entry(scope.to_owned()).or_default().add(p, cached, c, estimated);
+            r.by_kind.entry(kind.to_owned()).or_default().add(p, cached, c, estimated);
             r.total
+        };
+        let (cost_usd, unpriced_models) = {
+            let mut log = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            let call_id = log.next_id;
+            log.next_id += 1;
+            match self.cfg.pricing.get(m.model) {
+                Some(price) => log.cost += price.cost(p, cached, c),
+                None => {
+                    log.unpriced.insert(m.model.to_owned());
+                }
+            }
+            if log.calls.len() < MAX_CALL_RECORDS {
+                log.calls.push(CallUsage {
+                    call_id,
+                    scope: scope.to_owned(),
+                    agent: agent.to_owned(),
+                    round: m.round,
+                    kind: kind.to_owned(),
+                    model: m.model.to_owned(),
+                    prompt: p,
+                    cached,
+                    completion: c,
+                    estimated,
+                    finish: finish.to_owned(),
+                    latency_ms: u64::try_from(m.t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+            (log.unpriced.is_empty().then_some(log.cost), log.unpriced.iter().cloned().collect())
         };
         self.emitter.send(CouncilEvent::UsageUpdated {
             scope: scope.to_owned(),
@@ -451,8 +614,11 @@ impl Council {
             kind: kind.to_owned(),
             prompt_tokens: p,
             completion_tokens: c,
+            cached_tokens: cached,
             estimated,
             total,
+            cost_usd,
+            unpriced_models,
         });
     }
 
@@ -501,18 +667,16 @@ impl Council {
     }
 
     /// Ghi token của lần gọi + settle chỗ giữ bằng cùng con số (thiếu usage → ước lượng theo độ dài).
-    #[allow(clippy::too_many_arguments)]
     fn account(
         &self,
         hold: Hold<'_>,
-        scope: &str,
-        agent: &str,
-        kind: &str,
+        meta: &CallMeta<'_>,
         usage: Option<Usage>,
+        finish: &str,
         prompt_chars: usize,
         output_chars: usize,
     ) {
-        self.record_usage(scope, agent, kind, usage, prompt_chars, output_chars);
+        self.record_usage(meta, usage, finish, prompt_chars, output_chars);
         let real = usage.filter(|u| u.prompt_tokens + u.completion_tokens > 0);
         hold.settle(real, estimate_tokens(prompt_chars) + estimate_tokens(output_chars));
     }
@@ -603,6 +767,7 @@ impl Council {
                 log::warn!("{}: hết ngân sách token → dừng bước nghiên cứu", role.name);
                 return Ok(None);
             };
+            let meta = CallMeta::new(scope, &role.id, "research", &ep.model, if phase == "review" { step } else { 0 });
             let turn = match self.llm.chat_tools(&ep, &msgs, &tools, allow, &self.cancel).await {
                 Ok(t) => t,
                 Err(LlmError::Cancelled) => return Err(Halt::Cancelled),
@@ -619,7 +784,8 @@ impl Council {
             };
             let out_chars = turn.content.as_deref().map_or(0, str::len)
                 + turn.tool_calls.iter().map(|c| c.arguments.len() + c.name.len()).sum::<usize>();
-            self.account(hold, scope, &role.id, "research", turn.usage, chars(&msgs), out_chars);
+            let finish = if turn.tool_calls.is_empty() { "stop" } else { "tool_calls" };
+            self.account(hold, &meta, turn.usage, finish, chars(&msgs), out_chars);
 
             if turn.tool_calls.is_empty() || !allow {
                 let notes = turn.content.unwrap_or_default();
@@ -708,6 +874,8 @@ impl Council {
         let mut staffing = None;
         if self.extras.auto_staff {
             // Giữ chỗ ngân sách trực tiếp trên sổ (chưa emit gì trước `SessionStarted`); settle sau đó.
+            let model = self.cfg.resolve(&self.cfg.meeting.chair_id).map(|e| e.model).unwrap_or_default();
+            let t0 = Instant::now();
             match self.budget.reserve(self.staffing_estimate(&prompt)) {
                 None => log::warn!("ngân sách token quá nhỏ cho bước chọn thành phần → dùng cấu hình mặc định"),
                 Some(rid) => match staffing::propose(&self.llm, &self.cfg, &prompt, &self.extras.company, &self.cancel).await {
@@ -716,7 +884,7 @@ impl Council {
                         m.chair_id = info.chair_id.clone();
                         m.reviewer_ids = info.reviewer_ids.clone();
                         m.department_ids = info.department_ids.clone();
-                        staffing = Some((info, usage, pc, oc, rid));
+                        staffing = Some((info, usage, pc, oc, rid, model, t0));
                     }
                     Err(_) => self.budget.settle(rid, Some(Usage::default()), 0),
                 },
@@ -729,6 +897,7 @@ impl Council {
         record.reviewer_ids = m.reviewer_ids.clone();
         record.cast = self.cast();
         record.options = self.extras.info.clone();
+        record.parent = self.extras.parent.clone();
 
         self.emitter.send(CouncilEvent::SessionStarted {
             prompt: prompt.clone(),
@@ -749,8 +918,10 @@ impl Council {
                 .collect(),
             options: self.extras.info.clone(),
         });
-        if let Some((info, usage, pc, oc, rid)) = staffing {
-            self.record_usage(MAIN_SCOPE, &info.chair_id, "staffing", usage, pc, oc);
+        if let Some((info, usage, pc, oc, rid, model, t0)) = staffing {
+            let mut meta = CallMeta::new(MAIN_SCOPE, &info.chair_id, "staffing", &model, 0);
+            meta.t0 = t0;
+            self.record_usage(&meta, usage, "stop", pc, oc);
             let real = usage.filter(|u| u.prompt_tokens + u.completion_tokens > 0);
             if real.is_none() && pc + oc == 0 {
                 // Không gọi model (chưa có chủ trì / model) → không tốn token.
@@ -760,6 +931,11 @@ impl Council {
             }
             self.emitter.send(CouncilEvent::StaffingDecided { staffing: info.clone() });
             record.staffing = Some(info);
+        }
+        if self.extras.checkpoint.is_some() {
+            // Ghi ngay bản ghi `running` đầu tiên: app tắt trước bản nháp vẫn còn yêu cầu trong lịch sử.
+            *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = Some(record.clone());
+            self.checkpoint_with(|_| {});
         }
 
         match self.run_inner(&prompt, &mut record).await {
@@ -778,6 +954,7 @@ impl Council {
             }
         }
         record.usage = self.usage.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        record.calls = std::mem::take(&mut self.calls.lock().unwrap_or_else(|e| e.into_inner()).calls);
         record.activities = std::mem::take(&mut *self.activities.lock().unwrap_or_else(|e| e.into_inner()));
         record.membership = std::mem::take(&mut *self.membership.lock().unwrap_or_else(|e| e.into_inner()));
         for c in self.extra_cast.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
@@ -799,6 +976,10 @@ impl Council {
     async fn run_inner(&self, prompt: &str, record: &mut SessionRecord) -> Result<(), Halt> {
         // ── Tầng 1: phòng ban ──
         let reports = self.run_departments(prompt, record).await?;
+        if !record.departments.is_empty() {
+            let depts = record.departments.clone();
+            self.checkpoint_with(move |rec| rec.departments = depts);
+        }
 
         // ── Tầng 2: cuộc họp chính ──
         let m = &self.cfg.meeting;
@@ -976,13 +1157,14 @@ impl Council {
                 round: 0,
                 plan_version: 0,
             });
+            let meta = CallMeta::new(MAIN_SCOPE, &chair.id, "assign", &ep.model, 0);
             let result = {
                 let _permit = self.permit().await?;
                 self.llm.chat_json::<RawAssignments>(&ep, &msgs, &self.cancel).await
             };
             match result {
                 Ok((raw, text, usage)) => {
-                    self.account(hold, MAIN_SCOPE, &chair.id, "assign", usage, msg_chars(&msgs), text.len());
+                    self.account(hold, &meta, usage, "stop", msg_chars(&msgs), text.len());
                     for a in raw.assignments {
                         let task = a.task.trim();
                         if !task.is_empty() && depts.iter().any(|d| d.id == a.department_id) {
@@ -1018,8 +1200,10 @@ impl Council {
         let mut invited: HashSet<String> = HashSet::new();
         let mut reviewed_once: HashSet<String> = HashSet::new();
 
+        // Phiên chạy lại: cuộc họp chính bắt đầu từ plan đã có (bỏ nghiên cứu + bản nháp).
+        let seed = if spec.scope == MAIN_SCOPE { self.extras.seed.as_ref() } else { None };
         // Người viết plan nghiên cứu (đọc workspace / tìm web) 1 lần trước bản nháp; ghi chú dùng lại khi chỉnh sửa.
-        let notes = if self.may_research(true) {
+        let notes = if seed.is_none() && self.may_research(true) {
             let purpose = match spec.ctx {
                 PlanContext::Main => "write the plan for the request",
                 PlanContext::Department { .. } => "write your department's plan for the assigned task",
@@ -1028,16 +1212,25 @@ impl Council {
         } else {
             None
         };
-        let draft = self.decorate(
-            prompts::author_draft_messages(spec.author, &spec.ctx, request, &spec.reports, &reviewers, &opts),
-            notes.as_deref(),
-            true,
-        );
-        let v1 = match self.call_author(spec.scope, spec.author, 1, &draft, ReviseKind::Initial).await? {
-            Authored::Plan(p) => p,
-            Authored::Stopped(status) => {
-                self.finish_loop(out, status);
-                return Ok(());
+        let v1 = if let Some(seed) = seed {
+            self.emitter.send(CouncilEvent::PlanReady {
+                scope: spec.scope.to_owned(),
+                version: seed.version,
+                markdown: seed.markdown.clone(),
+            });
+            PlanVersion::new(seed.version, seed.markdown.clone(), ReviseKind::Initial)
+        } else {
+            let draft = self.decorate(
+                prompts::author_draft_messages(spec.author, &spec.ctx, request, &spec.reports, &reviewers, &opts),
+                notes.as_deref(),
+                true,
+            );
+            match self.call_author(spec.scope, spec.author, 1, 0, &draft, ReviseKind::Initial).await? {
+                Authored::Plan(p) => p,
+                Authored::Stopped(status) => {
+                    self.finish_loop(out, status);
+                    return Ok(());
+                }
             }
         };
         if opts.routing && !reviewers.is_empty() && !routing::is_tagged(&v1.markdown) {
@@ -1046,6 +1239,7 @@ impl Council {
         // Section của phiên bản hiện tại, id ổn định giữa các phiên bản (dùng cho section revise).
         let mut cur_sections = sections::split(&v1.markdown);
         out.plans.push(v1);
+        self.checkpoint(spec, out);
 
         if reviewers.is_empty() {
             // Phòng ban không có thành viên phản biện → plan của trưởng phòng là kết quả.
@@ -1055,6 +1249,11 @@ impl Council {
         }
 
         let mut previous: HashMap<String, Review> = HashMap::new();
+        for r in seed.map(|s| s.reviews.as_slice()).unwrap_or(&[]) {
+            // Issue còn mở của plan xuất phát → reviewer kiểm chứng như vòng tiếp theo.
+            reviewed_once.insert(r.agent.clone());
+            previous.insert(r.agent.clone(), r.clone());
+        }
         let mut last_fp: HashMap<String, u64> = HashMap::new();
         // (role_id, lý do, người đề nghị) — áp dụng ở đầu vòng kế tiếp
         let mut proposed: Vec<(String, String, String)> = Vec::new();
@@ -1241,6 +1440,7 @@ impl Council {
                     .collect();
                 let n = slots.len();
                 out.rounds.push(RoundRecord { round, plan_version: plan.version, slots, approvals: 0, converged: false });
+                self.checkpoint(spec, out);
                 return Err(Halt::Failed(format!("Toàn bộ {n} reviewer đều lỗi ở round {round} — {}", errs.join(" | "))));
             }
             let voting: Vec<&&Review> = ok.iter().filter(|r| r.verdict != Verdict::Abstain).collect();
@@ -1262,6 +1462,7 @@ impl Council {
                 converged,
             });
             out.rounds.push(RoundRecord { round, plan_version: plan.version, slots, approvals, converged });
+            self.checkpoint(spec, out);
 
             let status = if converged {
                 // Từng có reviewer bị cắt output → không khẳng định hội tụ.
@@ -1353,7 +1554,7 @@ impl Council {
                     };
                     let msgs = self.decorate(base, notes.as_deref(), false);
                     // `call_author` lo phần cắt cụt / ngân sách và trả `Authored::Stopped` khi phải dừng.
-                    match self.call_author(spec.scope, spec.author, plan.version + 1, &msgs, ReviseKind::Full).await? {
+                    match self.call_author(spec.scope, spec.author, plan.version + 1, round, &msgs, ReviseKind::Full).await? {
                         Authored::Plan(mut p) => {
                             p.fallback_reason = fallback.map(fallback_name);
                             let secs = sections::inherit_ids(&cur_sections, sections::split(&p.markdown));
@@ -1368,6 +1569,7 @@ impl Council {
             };
             cur_sections = next_sections;
             out.plans.push(next);
+            self.checkpoint(spec, out);
         }
         self.finish_loop(out, SessionStatus::MaxRoundsReached);
         Ok(())
@@ -1407,6 +1609,7 @@ impl Council {
         scope: &str,
         author: &RoleDef,
         version: u32,
+        round: u32,
         messages: &[ChatMessage],
         kind: ReviseKind,
     ) -> Result<Authored, Halt> {
@@ -1425,8 +1628,9 @@ impl Council {
             plan_version: version,
         });
 
+        let meta = CallMeta::new(scope, &author.id, "plan", &ep.model, round);
         let raw = self.author_completion(&ep, scope, version, messages, true).await?;
-        self.account(hold, scope, &author.id, "plan", raw.usage, msg_chars(messages), raw.text.len());
+        self.account(hold, &meta, raw.usage, finish_name(raw.finish), msg_chars(messages), raw.text.len());
 
         let markdown = match raw.finish {
             Finish::Stop => unwrap_markdown_fence(&raw.text),
@@ -1441,7 +1645,7 @@ impl Council {
                 } else {
                     "length"
                 };
-                match self.continue_plan(&ep, scope, author, version, messages, &raw.text, reason).await? {
+                match self.continue_plan(&ep, scope, author, version, round, messages, &raw.text, reason).await? {
                     Ok(md) => {
                         self.emit_truncated(scope, &author.id, "plan", true, reason);
                         // UI đã nhận phần đuôi bị cắt qua stream → xoá và gửi lại toàn văn bản ghép.
@@ -1518,6 +1722,7 @@ impl Council {
             log::warn!("[{}] hết ngân sách token trước plan v{version} (section revise) → dừng", spec.scope);
             return Ok(SectionRevise::Stopped(SessionStatus::BudgetExhausted));
         };
+        let meta = CallMeta::new(spec.scope, &author.id, "plan", &ep.model, round.round);
         let raw = {
             let _permit = self.permit().await?;
             self.emitter.send(CouncilEvent::AgentThinking {
@@ -1529,7 +1734,7 @@ impl Council {
             // Không chuyển delta lên UI: output là patch, UI chỉ nhận plan đã ghép.
             self.author_completion(&ep, spec.scope, version, &msgs, false).await?
         };
-        self.account(hold, spec.scope, &author.id, "plan", raw.usage, msg_chars(&msgs), raw.text.len());
+        self.account(hold, &meta, raw.usage, finish_name(raw.finish), msg_chars(&msgs), raw.text.len());
         if raw.finish != Finish::Stop {
             return Ok(SectionRevise::Fallback(FallbackReason::Truncated));
         }
@@ -1570,6 +1775,7 @@ impl Council {
                     self.emit_truncated(spec.scope, &checker.id, "consistency", false, "budget");
                     break;
                 };
+                let meta = CallMeta::new(spec.scope, &checker.id, "consistency", &ep.model, round);
                 let res = {
                     let _permit = self.permit().await?;
                     self.emitter.send(CouncilEvent::AgentThinking {
@@ -1593,7 +1799,7 @@ impl Council {
                         break;
                     }
                 };
-                self.account(hold, spec.scope, &checker.id, "consistency", c.usage, msg_chars(&msgs), c.text.len());
+                self.account(hold, &meta, c.usage, finish_name(c.finish), msg_chars(&msgs), c.text.len());
                 if c.finish != Finish::Stop {
                     let reason = if c.finish == Finish::Error { "stream_error" } else { "length" };
                     self.emit_truncated(spec.scope, &checker.id, "consistency", false, reason);
@@ -1691,6 +1897,7 @@ impl Council {
         scope: &str,
         author: &RoleDef,
         version: u32,
+        round: u32,
         messages: &[ChatMessage],
         cut_text: &str,
         reason: &'static str,
@@ -1704,8 +1911,9 @@ impl Council {
             let Some(hold) = self.hold(estimate_call(&msgs, ep.max_tokens)) else {
                 return Ok(Err("budget"));
             };
+            let meta = CallMeta::new(scope, &author.id, "plan", &ep.model, round);
             let c = self.author_completion(ep, scope, version, &msgs, false).await?;
-            self.account(hold, scope, &author.id, "plan", c.usage, msg_chars(&msgs), c.text.len());
+            self.account(hold, &meta, c.usage, finish_name(c.finish), msg_chars(&msgs), c.text.len());
             if let Some(md) = accept_continuation(&kept, &heading, &c) {
                 return Ok(Ok(md));
             }
@@ -1795,6 +2003,7 @@ impl Council {
             self.record_saving(spec.scope, &reviewer.id, tokens, false);
         }
 
+        let meta = CallMeta::new(spec.scope, &reviewer.id, "review", &ep.model, round);
         let (raw, raw_text, usage) = match self.llm.chat_json::<RawReview>(&ep, &messages, &self.cancel).await {
             Ok(r) => r,
             Err(e) => {
@@ -1804,7 +2013,7 @@ impl Council {
                 return Err(e);
             }
         };
-        self.account(hold, spec.scope, &reviewer.id, "review", usage, msg_chars(&messages), raw_text.len());
+        self.account(hold, &meta, usage, "stop", msg_chars(&messages), raw_text.len());
         let mut review = Review::from_raw(&reviewer.id, &reviewer.name, raw);
 
         if strict && review.violates_round_one_policy() {
@@ -1812,11 +2021,12 @@ impl Council {
             log::info!("{} vi phạm round-1 policy; yêu cầu review lại", reviewer.name);
             messages.push(ChatMessage::assistant(raw_text));
             messages.push(ChatMessage::user(prompts::ROUND_ONE_CORRECTION));
+            let meta2 = CallMeta::new(spec.scope, &reviewer.id, "review", &ep.model, round);
             match self.hold(estimate_call(&messages, ep.max_tokens)) {
                 None => log::warn!("{}: hết ngân sách token cho lần sửa review; giữ review gốc", reviewer.name),
                 Some(hold2) => match self.llm.chat_json::<RawReview>(&ep, &messages, &self.cancel).await {
                     Ok((raw2, text2, usage2)) => {
-                        self.account(hold2, spec.scope, &reviewer.id, "review", usage2, msg_chars(&messages), text2.len());
+                        self.account(hold2, &meta2, usage2, "stop", msg_chars(&messages), text2.len());
                         review = Review::from_raw(&reviewer.id, &reviewer.name, raw2);
                     }
                     Err(LlmError::Cancelled) => return Err(LlmError::Cancelled),
@@ -3243,5 +3453,166 @@ mod tests {
         assert_eq!(seen.lock().unwrap().section.len(), 1);
         assert!(fallbacks(&sink).is_empty());
         assert_eq!(rec.plans[2].revise_mode, ReviseKind::Section);
+    }
+
+    // ── checkpoint / rerun / usage từng lần gọi ──
+
+    #[derive(Default)]
+    struct CollectCheckpoint(Mutex<Vec<SessionRecord>>);
+    impl Checkpoint for CollectCheckpoint {
+        fn save(&self, record: SessionRecord) {
+            self.0.lock().unwrap().push(record);
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoints_are_written_after_each_plan_and_round() {
+        let cp = Arc::new(CollectCheckpoint::default());
+        let extras = SessionExtras { checkpoint: Some(cp.clone()), ..SessionExtras::default() };
+        let (rec, _) = run_with_extras(standard_router(false), |_| {}, None, extras).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        let cps = cp.0.lock().unwrap();
+        assert!(cps.iter().all(|c| c.status == SessionStatus::Running && c.id == rec.id && c.finished_at.is_none()));
+        let shape: Vec<(usize, usize)> = cps.iter().map(|c| (c.plans.len(), c.rounds.len())).collect();
+        // bắt đầu → v1 → round 1 → v2 → round 2
+        assert_eq!(shape, vec![(0, 0), (1, 0), (1, 1), (2, 1), (2, 2)]);
+        let after_round_one = &cps[2];
+        assert_eq!(after_round_one.rounds[0].slots.len(), 3);
+        assert_eq!(after_round_one.prompt, rec.prompt);
+        // Chỉ phiên bản đã hoàn tất (không có phần stream dở) + usage cập nhật tới thời điểm đó.
+        assert_eq!(after_round_one.plans[0].markdown, rec.plans[0].markdown);
+        assert_eq!(after_round_one.usage.total.calls, 4);
+        assert_eq!(after_round_one.calls.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn department_rounds_are_checkpointed_too() {
+        let cp = Arc::new(CollectCheckpoint::default());
+        let extras = SessionExtras { checkpoint: Some(cp.clone()), ..SessionExtras::default() };
+        let (rec, _) = run_with_extras(standard_router(false), |c| c.meeting.department_ids = vec!["qa".into()], None, extras).await;
+        assert_eq!(rec.departments.len(), 1, "{:?}", rec.error);
+        let cps = cp.0.lock().unwrap();
+        let first_dept = cps.iter().find(|c| !c.departments.is_empty()).unwrap();
+        assert_eq!(first_dept.departments[0].id, "qa");
+        assert_eq!(first_dept.departments[0].status, SessionStatus::Running);
+        assert!(first_dept.plans.is_empty(), "cuộc họp chính chưa bắt đầu");
+        // Sau khi phòng ban xong, checkpoint của cuộc họp chính mang trạng thái thật của phòng ban.
+        let last = cps.last().unwrap();
+        assert_eq!(last.departments[0].status, rec.departments[0].status);
+    }
+
+    #[tokio::test]
+    async fn rerun_starts_at_review_of_the_seeded_version() {
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let b2 = bodies.clone();
+        let handler: Handler = Arc::new(move |body: &Value| {
+            b2.lock().unwrap().push(body.clone());
+            if is_author(body) {
+                return completion(&plan_md(3));
+            }
+            if plan_version_of(body) == 2 { completion(&reject()) } else { completion(&approve()) }
+        });
+        let base = spawn_mock(handler).await;
+        let cfg = cfg_for(&base, false);
+        let parent = crate::rerun::tests::parent_record(&cfg);
+        let plan = crate::rerun::plan_rerun(&cfg, &parent, MAIN_SCOPE, 2, &crate::rerun::RerunOverrides::default()).unwrap();
+        assert!(plan.blocking.is_empty());
+        let sink = Arc::new(CollectSink::default());
+        let llm = LlmClient::new(crate::llm_client::build_http_client().unwrap(), &plan.cfg);
+        let extras = SessionExtras { seed: plan.seed.clone(), parent: Some(plan.parent.clone()), ..SessionExtras::default() };
+        let council = Council::with_extras(llm, plan.cfg.clone(), sink.clone(), Uuid::new_v4(), CancellationToken::new(), extras);
+        let rec = council.run(plan.prompt.clone()).await;
+
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert_eq!(rec.plans.iter().map(|p| p.version).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(rec.plans[0].markdown, crate::rerun::tests::TAGGED);
+        assert_eq!(rec.rounds.iter().map(|r| (r.round, r.plan_version)).collect::<Vec<_>>(), vec![(1, 2), (2, 3)]);
+        assert_eq!(rec.parent, Some(ParentRef { session_id: parent.id, scope: "main".into(), version_no: 2 }));
+        assert_eq!(rec.summary().parent, rec.parent);
+
+        let bodies = bodies.lock().unwrap();
+        // Không có bản nháp: lần gọi đầu tiên là review của v2.
+        assert!(!is_author(&bodies[0]), "lần gọi đầu phải là review");
+        let first_author = bodies.iter().position(is_author).unwrap();
+        assert!(first_author >= 3, "3 reviewer review v2 trước khi người viết sửa");
+        let scale_v2 = bodies
+            .iter()
+            .find(|b| system_of(b).contains("[PLAN REVIEWER]") && all_text(b).contains("Issue mở của scale_reviewer"))
+            .unwrap();
+        let t = all_text(scale_v2);
+        assert!(t.contains("<plan version=\"2\""), "{t}");
+        assert!(t.contains("Shard theo user"), "plan gieo nằm trong body review");
+        assert!(t.contains("Issue mở của scale_reviewer ở v2"), "issue còn mở được gửi lại cho reviewer");
+        // Người viết sửa từ đúng plan gieo.
+        assert!(all_text(&bodies[first_author]).contains("Shard theo user"));
+        // Event: PlanReady v2 trước review đầu tiên.
+        let types = sink.types();
+        let ready = types.iter().position(|t| t == "plan_ready").unwrap();
+        let first_review = types.iter().position(|t| t == "review_ready").unwrap();
+        assert!(ready < first_review);
+    }
+
+    #[tokio::test]
+    async fn calls_are_recorded_with_cached_tokens_and_live_cost() {
+        let handler: Handler = Arc::new(|body: &Value| {
+            let content = if is_author(body) { plan_md(1) } else if plan_version_of(body) == 1 { reject() } else { approve() };
+            let resp = json!({
+                "choices":[{"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1000,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":400}}
+            });
+            MockResp::http(200, "application/json", resp.to_string())
+        });
+        let (rec, sink) = run_with(
+            handler,
+            |c| {
+                c.pricing.insert("gpt-4.1-mini".into(), crate::config::ModelPrice { input_per_m: 1.0, cached_per_m: 0.5, output_per_m: 4.0 });
+            },
+            None,
+        )
+        .await;
+        assert_eq!(rec.calls.len() as u32, rec.usage.total.calls);
+        assert_eq!(rec.usage.total.cached_tokens, 400 * u64::from(rec.usage.total.calls));
+        let c0 = &rec.calls[0];
+        assert_eq!((c0.call_id, c0.kind.as_str(), c0.round, c0.model.as_str()), (0, "plan", 0, "gpt-4.1-mini"));
+        assert_eq!((c0.prompt, c0.cached, c0.completion, c0.estimated, c0.finish.as_str()), (1000, 400, 100, false, "stop"));
+        assert!(rec.calls.iter().any(|c| c.kind == "review" && c.round == 2));
+        assert!(rec.calls.windows(2).all(|w| w[0].call_id < w[1].call_id));
+        // Mỗi lần gọi: 600 × 1 + 400 × 0.5 + 100 × 4 = 1200 µUSD.
+        let per_call = 0.0012;
+        let last = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                CouncilEvent::UsageUpdated { cost_usd, unpriced_models, cached_tokens, .. } => Some((*cost_usd, unpriced_models.clone(), *cached_tokens)),
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        let expect = per_call * f64::from(rec.usage.total.calls);
+        assert!((last.0.unwrap() - expect).abs() < 1e-9, "{:?} vs {expect}", last.0);
+        assert!(last.1.is_empty() && last.2 == 400);
+        // Đọc lại bằng get_usage với bảng giá rỗng → null + model chưa có giá.
+        let u = crate::cost::usage_breakdown(&rec, &Default::default());
+        assert_eq!(u.totals.cost_usd, None);
+        assert_eq!(u.unpriced_models, vec!["gpt-4.1-mini"]);
+        assert_eq!(u.by_round.first().map(|r| r.round), Some(0));
+    }
+
+    #[tokio::test]
+    async fn live_cost_is_null_without_pricing() {
+        let (_, sink) = run_council(standard_router(false), false, None).await;
+        let events = sink.0.lock().unwrap();
+        let (cost, unpriced) = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                CouncilEvent::UsageUpdated { cost_usd, unpriced_models, .. } => Some((*cost_usd, unpriced_models.clone())),
+                _ => None,
+            })
+            .next_back()
+            .unwrap();
+        assert_eq!(cost, None);
+        assert_eq!(unpriced, vec!["gpt-4.1-mini"]);
     }
 }

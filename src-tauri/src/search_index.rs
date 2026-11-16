@@ -24,7 +24,8 @@ use crate::models::{SessionRecord, SessionStatus, SessionSummary, MAIN_SCOPE};
 use crate::normalize::{fold, fold_query, word_spans};
 
 /// Tăng khi đổi schema / cách dựng dữ liệu → index cũ tự bị xoá và dựng lại.
-pub const SCHEMA_VERSION: i32 = 1;
+/// v2: thêm cột `parent` (nguồn gốc phiên chạy lại).
+pub const SCHEMA_VERSION: i32 = 2;
 pub const MAX_SEARCH_LIMIT: u32 = 50;
 /// Độ dài (ký tự) xấp xỉ của đoạn trích quanh chỗ khớp đầu tiên.
 const SNIPPET_CHARS: usize = 80;
@@ -45,7 +46,8 @@ CREATE TABLE sessions(
     versions     INTEGER NOT NULL,
     rounds       INTEGER NOT NULL,
     departments  INTEGER NOT NULL,
-    total_tokens INTEGER NOT NULL
+    total_tokens INTEGER NOT NULL,
+    parent       TEXT
 );
 CREATE INDEX sessions_by_created ON sessions(created_at DESC);
 CREATE VIRTUAL TABLE search_fts USING fts5(
@@ -460,8 +462,8 @@ impl SearchIndex {
         delete_session_rows(&tx, &id)?;
         tx.execute(
             "INSERT INTO sessions(id, file_mtime, file_size, title, status, created_at, finished_at,
-                versions, rounds, departments, total_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                versions, rounds, departments, total_tokens, parent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 mtime,
@@ -474,6 +476,7 @@ impl SearchIndex {
                 summary.rounds,
                 summary.departments,
                 i64::try_from(summary.total_tokens).unwrap_or(i64::MAX),
+                summary.parent.as_ref().and_then(|p| serde_json::to_string(p).ok()),
             ],
         )?;
         insert_rows(&tx, &id, &rows)?;
@@ -587,7 +590,7 @@ impl SearchIndex {
     pub fn list(&self, limit: u32, offset: u32) -> Result<Vec<SessionSummary>, IndexError> {
         let conn = lock(&self.conn);
         let mut stmt = conn.prepare_cached(
-            "SELECT id, title, created_at, status, versions, rounds, departments, total_tokens
+            "SELECT id, title, created_at, status, versions, rounds, departments, total_tokens, parent
              FROM sessions ORDER BY created_at DESC, id LIMIT ?1 OFFSET ?2",
         )?;
         let rows = stmt.query_map(params![limit, offset], |r| {
@@ -600,11 +603,12 @@ impl SearchIndex {
                 r.get::<_, u32>(5)?,
                 r.get::<_, u32>(6)?,
                 r.get::<_, i64>(7)?,
+                r.get::<_, Option<String>>(8)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, title, created, status, versions, rounds, departments, tokens) = row?;
+            let (id, title, created, status, versions, rounds, departments, tokens, parent) = row?;
             let (Ok(uuid), Some(status)) = (Uuid::parse_str(&id), parse_status(&status)) else {
                 log::warn!("bỏ qua hàng index không hợp lệ: id={id} status={status}");
                 continue;
@@ -618,6 +622,8 @@ impl SearchIndex {
                 rounds,
                 departments,
                 total_tokens: u64::try_from(tokens).unwrap_or(0),
+                // JSON hỏng (không thể xảy ra với dữ liệu tự ghi) → coi như không có nguồn gốc.
+                parent: parent.and_then(|p| serde_json::from_str(&p).ok()),
             });
         }
         Ok(out)

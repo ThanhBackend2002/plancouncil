@@ -20,6 +20,7 @@ import type {
   UsageSummary,
 } from "./contracts";
 import type { KeyStorage, SecretCommandError, SecretStatusReport, SecretTarget, SetSecretResult } from "./contracts";
+import type { RerunCommandError, RerunOverrides, RestartResult, UsageBreakdown } from "./contracts";
 
 const KINDS: ReadonlySet<CommandError["kind"]> = new Set([
   "invalid",
@@ -104,17 +105,12 @@ export const ipc = {
   defaultRoles: () => call<RoleDef[]>("default_roles"),
   /**
    * Chạy tiếp từ 1 version: tạo phiên MỚI (không resume tại chỗ). `dry_run` chỉ kiểm tra.
-   * Tên tham số Tauri dùng camelCase như các lệnh khác (đổi nếu backend dùng rename_all = "snake_case").
+   * Backend dùng `rename_all = "snake_case"` → đi qua `rerunIpc` (giữ nguyên kind + payload lỗi).
    */
-  rerunFromVersion: (args: RerunArgs) => call<RerunResult>("rerun_from_version", {
-      sessionId: args.session_id,
-      scope: args.scope,
-      versionNo: args.version_no,
-      dryRun: args.dry_run,
-      overrides: args.overrides,
-    }),
-  restartFromRequest: (sessionId: string) => call<{ new_session_id: string }>("restart_from_request", { sessionId }),
-  getUsage: (sessionId: string) => call<UsageSummary>("get_usage", { sessionId }),
+  rerunFromVersion: (args: RerunArgs): Promise<RerunResult> =>
+    rerunIpc.rerunFromVersion(args.session_id, args.scope, args.version_no, args.dry_run, args.overrides),
+  restartFromRequest: (sessionId: string): Promise<RestartResult> => rerunIpc.restartFromRequest(sessionId),
+  getUsage: (sessionId: string): Promise<UsageSummary> => rerunIpc.getUsage(sessionId),
   exportMarkdown: (content: string, suggestedName: string) =>
     call<string | null>("export_markdown", { content, suggestedName }),
 };
@@ -143,4 +139,41 @@ export const secretIpc = {
   deleteSecret: (target: SecretTarget) => callSecret<void>("delete_secret", { target }),
   status: () => callSecret<SecretStatusReport>("secret_status"),
   deleteLeftoverFiles: (files: string[]) => callSecret<string[]>("delete_leftover_files", { files }),
+};
+
+// ── Chạy lại phiên + chi phí — giữ nguyên `kind` và payload lỗi (`available_versions`, `missing_roles`) ──
+
+async function callRerun<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (!inTauri()) {
+    throw { kind: "internal", message: "Không chạy trong Tauri — hãy mở app bằng `npm run tauri dev`." } satisfies RerunCommandError;
+  }
+  try {
+    return await invoke<T>(cmd, args);
+  } catch (e) {
+    if (e && typeof e === "object" && "kind" in e && "message" in e) {
+      const o = e as RerunCommandError;
+      throw {
+        kind: String(o.kind),
+        message: String(o.message),
+        available_versions: o.available_versions,
+        missing_roles: o.missing_roles,
+        target: o.target,
+      } satisfies RerunCommandError;
+    }
+    throw { kind: "internal", message: e instanceof Error ? e.message : String(e) } satisfies RerunCommandError;
+  }
+}
+
+export const rerunIpc = {
+  /** `dryRun` = chỉ kiểm tra (không bị chặn khi đang có phiên chạy). `scope` = "main". */
+  rerunFromVersion: (sessionId: string, scope: string, versionNo: number, dryRun?: boolean, overrides?: RerunOverrides) =>
+    callRerun<RerunResult>("rerun_from_version", {
+      session_id: sessionId,
+      scope,
+      version_no: versionNo,
+      dry_run: dryRun,
+      overrides,
+    }),
+  restartFromRequest: (sessionId: string) => callRerun<RestartResult>("restart_from_request", { session_id: sessionId }),
+  getUsage: (sessionId: string) => callRerun<UsageBreakdown>("get_usage", { session_id: sessionId }),
 };

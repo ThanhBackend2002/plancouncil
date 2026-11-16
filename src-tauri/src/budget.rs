@@ -128,7 +128,7 @@ mod tests {
     use super::*;
 
     fn usage(p: u64, c: u64) -> Option<Usage> {
-        Some(Usage { prompt_tokens: p, completion_tokens: c })
+        Some(Usage { prompt_tokens: p, completion_tokens: c, cached_tokens: 0 })
     }
 
     #[test]

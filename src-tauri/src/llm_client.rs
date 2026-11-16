@@ -112,12 +112,50 @@ impl LlmError {
 }
 
 /// Token tiêu thụ của 1 lần gọi (theo `usage` provider trả về).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
-    #[serde(default)]
     pub prompt_tokens: u64,
-    #[serde(default)]
     pub completion_tokens: u64,
+    /// Phần `prompt_tokens` đọc từ cache của provider (`prompt_tokens_details.cached_tokens`); thiếu → 0.
+    pub cached_tokens: u64,
+}
+
+/// Dạng thô provider trả về; `cached_tokens` nằm trong `prompt_tokens_details` (OpenAI) —
+/// vài proxy đặt thẳng ở cấp ngoài, nên nhận cả hai.
+#[derive(Deserialize)]
+struct RawUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<RawPromptDetails>,
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RawPromptDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = RawUsage::deserialize(d)?;
+        let prompt_tokens = raw.prompt_tokens.unwrap_or(0);
+        let cached = raw
+            .prompt_tokens_details
+            .and_then(|p| p.cached_tokens)
+            .or(raw.cached_tokens)
+            .unwrap_or(0);
+        Ok(Usage {
+            prompt_tokens,
+            completion_tokens: raw.completion_tokens.unwrap_or(0),
+            // Cache không thể lớn hơn tổng prompt (provider lỗi số liệu → kẹp lại).
+            cached_tokens: cached.min(prompt_tokens),
+        })
+    }
 }
 
 impl Usage {
@@ -125,6 +163,7 @@ impl Usage {
         Usage {
             prompt_tokens: self.prompt_tokens + o.prompt_tokens,
             completion_tokens: self.completion_tokens + o.completion_tokens,
+            cached_tokens: self.cached_tokens + o.cached_tokens,
         }
     }
 }
@@ -1106,7 +1145,7 @@ mod tests {
         assert_eq!(
             parse_sse_line(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n").unwrap(),
             SseLine::Data(SseData {
-                usage: Some(Usage { prompt_tokens: 12, completion_tokens: 3 }),
+                usage: Some(Usage { prompt_tokens: 12, completion_tokens: 3, cached_tokens: 0 }),
                 ..Default::default()
             })
         );
@@ -1165,7 +1204,7 @@ mod tests {
         assert_eq!(c.finish, Finish::Length);
         assert_eq!(c.text, "{\"a\":");
         assert_eq!(seen, c.text);
-        assert_eq!(c.usage, Some(Usage { prompt_tokens: 5, completion_tokens: 7 }));
+        assert_eq!(c.usage, Some(Usage { prompt_tokens: 5, completion_tokens: 7, cached_tokens: 0 }));
     }
 
     #[test]
@@ -1204,12 +1243,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.finish, Finish::Length);
-        assert_eq!(c.usage, Some(Usage { prompt_tokens: 9, completion_tokens: 4096 }));
+        assert_eq!(c.usage, Some(Usage { prompt_tokens: 9, completion_tokens: 4096, cached_tokens: 0 }));
         let c = parse_completion(r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#).unwrap();
         assert_eq!(c.finish, Finish::Stop);
         // Thiếu finish_reason → Stop.
         let c = parse_completion(r#"{"choices":[{"message":{"content":"ok"}}]}"#).unwrap();
         assert_eq!(c.finish, Finish::Stop);
+    }
+
+    #[test]
+    fn cached_tokens_are_parsed_and_summed() {
+        let c = parse_completion(
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":64}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.usage, Some(Usage { prompt_tokens: 100, completion_tokens: 7, cached_tokens: 64 }));
+        // details = null / thiếu cached_tokens → 0; cached > prompt → kẹp lại.
+        let u: Usage = serde_json::from_str(r#"{"prompt_tokens":5,"completion_tokens":1,"prompt_tokens_details":null}"#).unwrap();
+        assert_eq!(u.cached_tokens, 0);
+        let u: Usage = serde_json::from_str(r#"{"prompt_tokens":5,"prompt_tokens_details":{"cached_tokens":9}}"#).unwrap();
+        assert_eq!((u.cached_tokens, u.completion_tokens), (5, 0));
+        // Chunk usage cuối của stream cũng đọc được cache.
+        let s = run_stream(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n\
+             data: [DONE]\n\n",
+        )
+        .0
+        .unwrap();
+        assert_eq!(s.usage.map(|u| u.cached_tokens), Some(4));
+        let sum = sum_usage(s.usage, c.usage).unwrap();
+        assert_eq!((sum.prompt_tokens, sum.cached_tokens, sum.completion_tokens), (110, 68, 9));
     }
 
     #[test]
@@ -1230,7 +1295,7 @@ mod tests {
         assert_eq!(t.tool_calls.len(), 1);
         assert_eq!(t.tool_calls[0].name, "read_file");
         assert_eq!(t.tool_calls[0].arguments, r#"{"path":"README.md"}"#);
-        assert_eq!(t.usage, Some(Usage { prompt_tokens: 50, completion_tokens: 5 }));
+        assert_eq!(t.usage, Some(Usage { prompt_tokens: 50, completion_tokens: 5, cached_tokens: 0 }));
         assert!(t.content.is_none());
         assert_eq!(t.assistant_message["tool_calls"][0]["id"], "c1");
 

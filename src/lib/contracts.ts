@@ -548,13 +548,136 @@ export interface SecretCommandError {
 // delete_secret({ target }) / secret_status() → SecretStatusReport / delete_leftover_files({ files }) → string[]
 // start_council có thể trả lỗi { kind: "secret_missing", target }
 
-// ── Chạy tiếp / bắt đầu lại / chi phí (rerun_from_version, restart_from_request, get_usage) ──
+// ── Crash safety / chạy lại / chi phí (bổ sung — interface trùng tên được TS gộp khai báo) ──
+
+/** Nguồn gốc phiên chạy lại. `version_no = 0` = chạy lại từ yêu cầu gốc (`restart_from_request`). */
+export interface ParentRef {
+  session_id: string;
+  /** "main" (phòng ban hiện báo `unsupported_scope`). */
+  scope: string;
+  version_no: number;
+}
+
+/** Token của 1 lần gọi LLM (`SessionRecord.calls`, tối đa 2000; bản ghi cũ: []). */
+export interface CallUsage {
+  call_id: number;
+  scope: string;
+  agent: RoleId;
+  /** 0 = trước vòng review đầu (chọn thành phần / giao việc / bản nháp). */
+  round: number;
+  kind: UsageKind | "consistency";
+  model: string;
+  prompt: number;
+  cached: number;
+  completion: number;
+  estimated: boolean;
+  finish: "stop" | "length" | "error" | "tool_calls";
+  latency_ms: number;
+}
+
+export interface SessionRecord {
+  /** null = phiên mới / bản ghi cũ. */
+  parent?: ParentRef | null;
+  calls?: CallUsage[];
+}
+
+export interface SessionSummary {
+  parent?: ParentRef | null;
+}
+
+export interface TokenUsage {
+  /** Phần prompt_tokens đọc từ cache của provider (bản ghi cũ: 0 / thiếu). */
+  cached_tokens?: number;
+}
+
+/** USD / 1 triệu token. */
+export interface ModelPrice {
+  input_per_m: number;
+  cached_per_m: number;
+  output_per_m: number;
+}
+/** Tên model (đúng chuỗi `model` của role) → giá. Mặc định rỗng; số hữu hạn ≥ 0. */
+export type Pricing = Record<string, ModelPrice>;
+
+export interface AppConfig {
+  pricing?: Pricing;
+}
+
+/**
+ * Field thêm vào event `usage_updated` (luôn có từ backend mới). Chi phí cộng dồn của phiên theo bảng
+ * giá lúc BẮT ĐẦU phiên; `cost_usd = null` khi có model chưa có giá (`unpriced_models`).
+ */
+export interface UsageUpdatedCost {
+  cached_tokens: number;
+  cost_usd: number | null;
+  unpriced_models: string[];
+}
+export type UsageUpdatedEvent = Extract<CouncilEvent, { type: "usage_updated" }> & UsageUpdatedCost;
+
 export interface RerunOverrides {
-  reviewers?: string[];
+  /** Tập con reviewer của phiên gốc. */
+  reviewers?: RoleId[];
+  /** 1..=10. */
   max_rounds?: number;
+  /** Thiếu = giữ cấu hình hiện tại; null = không giới hạn; số ≥ 1000. */
   max_total_tokens?: number | null;
 }
 
+export interface RerunResult {
+  /** null khi dry_run. */
+  new_session_id: string | null;
+  /** Section chỉ gắn tag cho reviewer không còn trong nhóm mới. */
+  uncovered_sections: string[];
+  /** Role của phiên gốc không còn / không có provider-model dùng được. */
+  missing_roles: RoleId[];
+  available_versions: number[];
+}
+
+export interface RestartResult { new_session_id: string }
+
+/** Lỗi của rerun_from_version / restart_from_request / get_usage (giữ nguyên `kind` + payload). */
+export interface RerunCommandError {
+  kind:
+    | "no_valid_version"
+    | "missing_roles"
+    | "unsupported_scope"
+    | "already_running"
+    | "not_found"
+    | "invalid"
+    | "secret_missing"
+    | (string & {});
+  message: string;
+  /** Chỉ với `no_valid_version`. */
+  available_versions?: number[];
+  /** Chỉ với `missing_roles`. */
+  missing_roles?: RoleId[];
+  target?: SecretTarget;
+}
+
+export interface UsageRow {
+  prompt: number;
+  cached: number;
+  completion: number;
+  calls: number;
+  estimated: boolean;
+  cost_usd: number | null;
+}
+export interface RoleUsageRow extends UsageRow { agent: RoleId }
+export interface RoundUsageRow extends UsageRow { scope: string; round: number }
+
+/** get_usage({ session_id }) — chi phí tính bằng bảng giá HIỆN TẠI. Bản ghi cũ: by_round = [], cost null. */
+export interface UsageBreakdown {
+  by_role: RoleUsageRow[];
+  by_round: RoundUsageRow[];
+  totals: { prompt: number; cached: number; completion: number; estimated: boolean; cost_usd: number | null };
+  unpriced_models: string[];
+}
+
+// rerun_from_version({ session_id, scope, version_no, dry_run?, overrides? }) → RerunResult
+// restart_from_request({ session_id }) → RestartResult
+// get_usage({ session_id }) → UsageBreakdown
+
+/** Tham số rerun_from_version phía FE (snake_case — command dùng rename_all = "snake_case"). */
 export interface RerunArgs {
   session_id: string;
   scope: string;
@@ -562,36 +685,5 @@ export interface RerunArgs {
   dry_run?: boolean;
   overrides?: RerunOverrides;
 }
-
-export interface RerunResult {
-  /** null khi dry_run. */
-  new_session_id: string | null;
-  /** Section có tag reviewer không còn trong cuộc họp → được coi như `reviewers: all`. */
-  uncovered_sections: string[];
-  missing_roles: string[];
-  available_versions: number[];
-}
-
-export interface UsageRow {
-  /** Id role (by_role) hoặc số round (by_round). */
-  key: string;
-  prompt: number;
-  cached: number;
-  completion: number;
-  cost_usd: number | null;
-}
-
-export interface UsageTotals {
-  prompt: number;
-  cached: number;
-  completion: number;
-  estimated: boolean;
-  cost_usd: number | null;
-}
-
-export interface UsageSummary {
-  by_role: UsageRow[];
-  by_round: UsageRow[];
-  totals: UsageTotals;
-  unpriced_models: string[];
-}
+export type UsageSummary = UsageBreakdown;
+export type UsageTotals = UsageBreakdown["totals"];
