@@ -32,7 +32,7 @@ const components: Components = {
     );
   },
   img({ node: _node, alt }) {
-    return <span className="text-neutral-500">[ảnh: {alt}]</span>;
+    return <span className="text-fg-subtle">[ảnh: {alt}]</span>;
   },
 };
 

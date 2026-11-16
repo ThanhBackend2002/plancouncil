@@ -1,4 +1,4 @@
-import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, FileText, FolderTree, Globe, Link, LoaderCircle, Search, TriangleExclamationPoint, UserMinus, UserPlus, Wrench } from "lucide-react";
 import { STATUS_META, type RoleResolver } from "../lib/agents";
 import type { MembershipChange, RoleId, ToolActivity } from "../lib/contracts";
@@ -77,9 +77,10 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
 
   return (
     <Panel className="flex min-h-[140px] flex-1 flex-col overflow-hidden">
-      <div className="flex items-center gap-2 border-b border-neutral-800 px-3 py-2 text-xs font-medium text-neutral-400">
+      <LiveAnnouncer scope={scope} resolve={resolve} sessionKey={session.id} />
+      <div className="flex items-center gap-2 border-b border-line px-3 py-2 text-xs font-medium text-fg-muted">
         Hội thoại · {scope.name}
-        <span className="ml-auto font-normal text-neutral-600">
+        <span className="ml-auto font-normal text-fg-subtle">
           {scope.rounds.length} round · {scope.reviewerIds.length} reviewer
         </span>
       </div>
@@ -98,7 +99,7 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
           <Notice>Webview vừa reload: chỉ hiển thị hội thoại từ thời điểm kết nối lại.</Notice>
         )}
         {msgs.length === 0 && (
-          <p className="px-2 py-6 text-center text-xs text-neutral-600">
+          <p className="px-2 py-6 text-center text-xs text-fg-subtle">
             {running ? `${resolve(scope.authorId).name || "Người viết"} đang chuẩn bị bản nháp…` : "Chưa có hội thoại nào."}
           </p>
         )}
@@ -139,7 +140,7 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
 
 const Notice = memo(function Notice({ children }: { children: React.ReactNode }) {
   return (
-    <div className="flex items-start gap-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-200">
+    <div className="flex items-start gap-2 rounded-control border border-warn-line bg-warn-subtle px-2.5 py-1.5 text-[11px] text-warn">
       <TriangleExclamationPoint className="mt-px size-3.5 shrink-0" />
       {children}
     </div>
@@ -148,10 +149,10 @@ const Notice = memo(function Notice({ children }: { children: React.ReactNode })
 
 const SystemLine = memo(function SystemLine({ text }: { text: string }) {
   return (
-    <div className="flex items-center gap-2 text-[11px] text-neutral-500">
-      <span className="h-px flex-1 bg-neutral-800" />
+    <div className="flex items-center gap-2 text-[11px] text-fg-subtle">
+      <span className="h-px flex-1 bg-surface-2" />
       <span className="max-w-[85%] text-center break-words">{text}</span>
-      <span className="h-px flex-1 bg-neutral-800" />
+      <span className="h-px flex-1 bg-surface-2" />
     </div>
   );
 });
@@ -176,11 +177,11 @@ function Bubble({
           <span className="px-font text-xs font-bold" style={{ color: m.color }}>
             {m.name}
           </span>
-          {m.title && m.title !== m.name && <span className="truncate text-[10px] text-neutral-600">{m.title}</span>}
+          {m.title && m.title !== m.name && <span className="truncate text-[10px] text-fg-subtle">{m.title}</span>}
         </div>
         <div
-          className="rounded-md rounded-tl-none border bg-neutral-900/70 px-2.5 py-1.5 text-xs text-neutral-300"
-          style={{ borderColor: accent ?? "#27272a" }}
+          className="rounded-control rounded-tl-none border bg-surface/70 px-2.5 py-1.5 text-xs text-fg-soft"
+          style={{ borderColor: accent ?? "var(--line)" }}
         >
           {children}
         </div>
@@ -206,16 +207,16 @@ const PlanMsg = memo(function PlanMsg({
     <Bubble agentId={agentId} resolve={resolve}>
       {complete ? (
         <span className="flex items-center gap-2">
-          <FileText className="size-3.5 shrink-0 text-violet-400" />
+          <FileText className="size-3.5 shrink-0 text-accent-fg" />
           <span className="flex-1">
             {first ? "Đây là bản nháp Plan v1, mời mọi người góp ý." : `Đã chỉnh sửa theo góp ý → Plan v${version}.`}
           </span>
-          <button type="button" onClick={() => focus(version)} className="shrink-0 text-[11px] text-violet-300 hover:text-violet-200">
+          <button type="button" onClick={() => focus(version)} className="shrink-0 text-[11px] text-accent-fg hover:text-accent-fg">
             Xem v{version} →
           </button>
         </span>
       ) : (
-        <span className="inline-flex items-center gap-1.5 text-neutral-400">
+        <span className="inline-flex items-center gap-1.5 text-fg-muted">
           <LoaderCircle className="size-3 animate-spin" /> Đang viết Plan v{version}…
         </span>
       )}
@@ -226,7 +227,7 @@ const PlanMsg = memo(function PlanMsg({
 const ReviewMsg = memo(function ReviewMsg({ agentId, slot, resolve }: { agentId: RoleId; slot: SlotView; resolve: RoleResolver }) {
   const [open, setOpen] = useState(false);
   const r = slot.review;
-  const accent = r ? (r.verdict === "APPROVE" ? "#16a34a66" : "#dc262666") : slot.error ? "#d9770666" : undefined;
+  const accent = r ? (r.verdict === "APPROVE" ? "var(--success-line)" : "var(--danger-line)") : slot.error ? "var(--warn-line)" : undefined;
   const expandable =
     !!r &&
     (r.critical_issues.length > 0 ||
@@ -238,11 +239,11 @@ const ReviewMsg = memo(function ReviewMsg({ agentId, slot, resolve }: { agentId:
   return (
     <Bubble agentId={agentId} resolve={resolve} accent={accent}>
       {slot.pending ? (
-        <span className="inline-flex items-center gap-1.5 text-neutral-500">
+        <span className="inline-flex items-center gap-1.5 text-fg-subtle">
           <LoaderCircle className="size-3 animate-spin" /> đang đọc plan…
         </span>
       ) : slot.error ? (
-        <span className="break-words text-amber-300">Không review được: {slot.error}</span>
+        <span className="break-words text-warn">Không review được: {slot.error}</span>
       ) : r ? (
         <>
           <button
@@ -255,29 +256,29 @@ const ReviewMsg = memo(function ReviewMsg({ agentId, slot, resolve }: { agentId:
             <VerdictBadge verdict={r.verdict} carried={r.carried_over} />
             {r.policy_override && (
               <span title={r.policy_override}>
-                <TriangleExclamationPoint className="mt-0.5 size-3.5 text-amber-400" />
+                <TriangleExclamationPoint className="mt-0.5 size-3.5 text-warn" />
               </span>
             )}
             <span className="min-w-0 flex-1 break-words">{r.summary_bubble}</span>
             {expandable &&
               (open ? (
-                <ChevronDown className="mt-0.5 size-3.5 shrink-0 text-neutral-500" />
+                <ChevronDown className="mt-0.5 size-3.5 shrink-0 text-fg-subtle" />
               ) : (
-                <ChevronRight className="mt-0.5 size-3.5 shrink-0 text-neutral-500" />
+                <ChevronRight className="mt-0.5 size-3.5 shrink-0 text-fg-subtle" />
               ))}
           </button>
           {!open && expandable && (
-            <div className="mt-1 text-[10px] text-neutral-500">
+            <div className="mt-1 text-[10px] text-fg-subtle">
               {r.critical_issues.length} vấn đề · {r.suggestions.length} gợi ý
             </div>
           )}
           {open && (
-            <div className="mt-2 space-y-2 border-t border-neutral-800 pt-2">
-              {r.policy_override && <p className="text-amber-300">{r.policy_override}</p>}
+            <div className="mt-2 space-y-2 border-t border-line pt-2">
+              {r.policy_override && <p className="text-warn">{r.policy_override}</p>}
               {r.critical_issues.length > 0 && (
                 <div>
-                  <div className="mb-1 font-medium text-red-300">Critical issues</div>
-                  <ol className="list-decimal space-y-1 pl-4 marker:text-neutral-600">
+                  <div className="mb-1 font-medium text-danger">Critical issues</div>
+                  <ol className="list-decimal space-y-1 pl-4 marker:text-fg-faint">
                     {r.critical_issues.map((it, i) => (
                       <li key={i} className="break-words">
                         {it}
@@ -288,8 +289,8 @@ const ReviewMsg = memo(function ReviewMsg({ agentId, slot, resolve }: { agentId:
               )}
               {(r.out_of_scope?.length ?? 0) > 0 && (
                 <div>
-                  <div className="mb-1 font-medium text-neutral-400">Ngoài phạm vi (không bắt buộc sửa)</div>
-                  <ul className="list-disc space-y-1 pl-4 text-neutral-500 marker:text-neutral-700">
+                  <div className="mb-1 font-medium text-fg-muted">Ngoài phạm vi (không bắt buộc sửa)</div>
+                  <ul className="list-disc space-y-1 pl-4 text-fg-subtle marker:text-fg-faint">
                     {r.out_of_scope!.map((it, i) => (
                       <li key={i} className="break-words">
                         {it}
@@ -299,14 +300,14 @@ const ReviewMsg = memo(function ReviewMsg({ agentId, slot, resolve }: { agentId:
                 </div>
               )}
               {(r.invites?.length ?? 0) > 0 && (
-                <div className="text-emerald-300/90">
+                <div className="text-success/90">
                   Đề nghị mời: {r.invites!.map((i) => `${resolve(i.role_id).name}${i.reason ? ` (${i.reason})` : ""}`).join(", ")}
                 </div>
               )}
               {r.suggestions.length > 0 && (
                 <div>
-                  <div className="mb-1 font-medium text-sky-300">Gợi ý</div>
-                  <ul className="list-disc space-y-1 pl-4 text-neutral-400 marker:text-neutral-600">
+                  <div className="mb-1 font-medium text-info">Gợi ý</div>
+                  <ul className="list-disc space-y-1 pl-4 text-fg-muted marker:text-fg-faint">
                     {r.suggestions.map((it, i) => (
                       <li key={i} className="break-words">
                         {it}
@@ -336,8 +337,8 @@ const ToolLine = memo(function ToolLine({ activity: a, resolve }: { activity: To
   const Icon = TOOL_ICON[a.tool] ?? Wrench;
   return (
     <div className="flex items-center gap-2 pl-9 text-[11px]" title={a.summary}>
-      <Icon className={cx("size-3.5 shrink-0", a.ok ? "text-sky-400" : "text-amber-400")} />
-      <span className="truncate text-neutral-500">
+      <Icon className={cx("size-3.5 shrink-0", a.ok ? "text-info" : "text-warn")} />
+      <span className="truncate text-fg-subtle">
         <span style={{ color: m.color }}>{m.name}</span> {a.summary}
       </span>
     </div>
@@ -355,12 +356,12 @@ const MemberLine = memo(function MemberLine({ change: c, resolve }: { change: Me
         : "tự rút khỏi cuộc họp";
   const Icon = c.action === "invited" ? UserPlus : UserMinus;
   return (
-    <div className="flex items-start gap-2 rounded-md bg-neutral-900/40 px-2 py-1.5 text-[11px] text-neutral-400">
-      <Icon className={cx("mt-px size-3.5 shrink-0", c.action === "invited" ? "text-emerald-400" : "text-neutral-500")} />
+    <div className="flex items-start gap-2 rounded-control bg-surface/40 px-2 py-1.5 text-[11px] text-fg-muted">
+      <Icon className={cx("mt-px size-3.5 shrink-0", c.action === "invited" ? "text-success" : "text-fg-subtle")} />
       <PixelPortrait meta={m} size={16} />
       <span className="min-w-0 break-words">
         <b style={{ color: m.color }}>{m.name}</b> {text}
-        {c.reason && <span className="text-neutral-500"> — {c.reason}</span>}
+        {c.reason && <span className="text-fg-subtle"> — {c.reason}</span>}
       </span>
     </div>
   );
@@ -369,14 +370,14 @@ const MemberLine = memo(function MemberLine({ change: c, resolve }: { change: Me
 const RoundLine = memo(function RoundLine({ round }: { round: RoundView }) {
   const failed = Object.values(round.slots).filter((s) => s.error).length;
   return (
-    <div className="flex items-center justify-center gap-1.5 text-[11px] text-neutral-500">
-      <span className="h-px flex-1 bg-neutral-800" />
+    <div className="flex items-center justify-center gap-1.5 text-[11px] text-fg-subtle">
+      <span className="h-px flex-1 bg-surface-2" />
       Round {round.round}:
       <Badge tone={round.converged ? "success" : round.approvals > 0 ? "warning" : "danger"}>
         {round.approvals}/{round.total} APPROVE
       </Badge>
       {failed > 0 && <Badge tone="warning">{failed} lỗi</Badge>}
-      <span className="h-px flex-1 bg-neutral-800" />
+      <span className="h-px flex-1 bg-surface-2" />
     </div>
   );
 });
@@ -409,9 +410,62 @@ const Outcome = memo(function Outcome({
     failed: error ?? "Gặp lỗi.",
   };
   return (
-    <div className={cx("flex items-start gap-2 rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2 text-xs text-neutral-300")}>
+    <div className={cx("flex items-start gap-2 rounded-control border border-line bg-canvas/60 px-2.5 py-2 text-xs text-fg-soft")}>
       <Badge tone={meta.tone}>{meta.label}</Badge>
       <span className="break-words">{text[status]}</span>
+    </div>
+  );
+});
+
+/** Các sự kiện "đã xong" (plan version viết xong, lượt review xong) — không gồm delta đang stream. */
+function completedEvents(scope: ScopeState, resolve: RoleResolver): { key: string; text: string }[] {
+  const out: { key: string; text: string }[] = [];
+  const where = scope.kind === "main" ? "" : ` (${scope.name})`;
+  for (const p of scope.plans) {
+    if (p.complete) out.push({ key: `p${p.version}`, text: `Plan v${p.version} đã sẵn sàng${where}` });
+  }
+  for (const r of scope.rounds) {
+    for (const [id, slot] of Object.entries(r.slots)) {
+      const name = resolve(id).name;
+      if (slot.review) out.push({ key: `r${r.round}-${id}`, text: `${name} đã review xong round ${r.round}: ${slot.review.verdict}${where}` });
+      else if (slot.error) out.push({ key: `r${r.round}-${id}`, text: `${name} không review được round ${r.round}${where}` });
+    }
+  }
+  return out;
+}
+
+/** Vùng ẩn cho trình đọc màn hình: chỉ đọc khi có tin nhắn hoàn chỉnh mới, không đọc từng delta. */
+const LiveAnnouncer = memo(function LiveAnnouncer({
+  scope,
+  resolve,
+  sessionKey,
+}: {
+  scope: ScopeState;
+  resolve: RoleResolver;
+  sessionKey: string | null;
+}) {
+  const [text, setText] = useState("");
+  const seen = useRef<{ key: string; ids: Set<string> } | null>(null);
+
+  useEffect(() => {
+    const key = `${sessionKey ?? ""}:${scope.id}`;
+    const events = completedEvents(scope, resolve);
+    // Đổi phiên / đổi nơi họp / mở phiên cũ: ghi nhận hiện trạng, không đọc lại cả lịch sử.
+    if (!seen.current || seen.current.key !== key) {
+      seen.current = { key, ids: new Set(events.map((e) => e.key)) };
+      setText("");
+      return;
+    }
+    const ids = seen.current.ids;
+    const fresh = events.filter((e) => !ids.has(e.key));
+    if (fresh.length === 0) return;
+    for (const e of fresh) ids.add(e.key);
+    setText(fresh.map((e) => e.text).join(". "));
+  }, [scope, resolve, sessionKey]);
+
+  return (
+    <div className="sr-only" aria-live="polite" aria-atomic="true">
+      {text}
     </div>
   );
 });

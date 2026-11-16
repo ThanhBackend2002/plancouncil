@@ -156,11 +156,11 @@ export const STATUS_META: Record<SessionStatus | "idle", { label: string; tone: 
 };
 
 export const TONE_CLASS: Record<Tone, string> = {
-  neutral: "bg-neutral-800 text-neutral-300 ring-neutral-700",
-  info: "bg-sky-500/15 text-sky-300 ring-sky-500/30",
-  success: "bg-emerald-500/15 text-emerald-300 ring-emerald-500/30",
-  warning: "bg-amber-500/15 text-amber-300 ring-amber-500/30",
-  danger: "bg-red-500/15 text-red-300 ring-red-500/30",
+  neutral: "bg-surface-2 text-fg-soft ring-line-strong",
+  info: "bg-info-subtle text-info ring-info-line",
+  success: "bg-success-subtle text-success ring-success-line",
+  warning: "bg-warn-subtle text-warn ring-warn-line",
+  danger: "bg-danger-subtle text-danger ring-danger-line",
 };
 
 export const ERROR_TITLE: Record<string, string> = {

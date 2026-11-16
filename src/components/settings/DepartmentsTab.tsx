@@ -60,13 +60,13 @@ export function DepartmentsTab({
           const isDefault = draft.meeting.department_ids.includes(d.id);
           const hasError = Object.keys(errors).some((k) => k.startsWith(`dept.${d.id}.`));
           return (
-            <div key={d.id} className={cx("rounded-lg border bg-neutral-950/40 p-3", hasError ? "border-red-500/40" : "border-neutral-800")}>
+            <div key={d.id} className={cx("rounded-lg border bg-canvas/40 p-3", hasError ? "border-danger-solid/40" : "border-line")}>
               <div className="mb-3 flex items-center gap-2">
-                <span className="grid size-7 place-items-center rounded-md bg-neutral-800">
-                  <Network className="size-4 text-neutral-300" />
+                <span className="grid size-7 place-items-center rounded-control bg-surface-2">
+                  <Network className="size-4 text-fg-soft" />
                 </span>
-                <span className="text-sm font-medium text-neutral-100">{d.name || "(chưa đặt tên)"}</span>
-                <span className="text-[11px] text-neutral-500">
+                <span className="text-sm font-medium text-fg">{d.name || "(chưa đặt tên)"}</span>
+                <span className="text-[11px] text-fg-subtle">
                   {1 + d.member_ids.length} người · tối đa {d.max_rounds} vòng
                 </span>
                 <div className="ml-auto flex items-center gap-2">
@@ -105,7 +105,7 @@ export function DepartmentsTab({
           );
         })}
         {draft.departments.length === 0 && (
-          <p className="py-6 text-center text-sm text-neutral-500">Chưa có phòng ban nào. Cuộc họp sẽ chỉ gồm chủ trì và reviewer.</p>
+          <p className="py-6 text-center text-sm text-fg-subtle">Chưa có phòng ban nào. Cuộc họp sẽ chỉ gồm chủ trì và reviewer.</p>
         )}
       </div>
     </Panel>

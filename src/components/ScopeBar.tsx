@@ -17,7 +17,7 @@ export const ScopeBar = memo(function ScopeBar({ active }: { active: string }) {
   if (scopeOrder.length <= 1) return null;
 
   return (
-    <div className="flex shrink-0 items-center gap-1 overflow-x-auto rounded-xl border border-neutral-800 bg-neutral-900/40 p-1">
+    <div className="flex shrink-0 items-center gap-1 overflow-x-auto rounded-panel border border-line bg-panel p-1">
       {scopeOrder.map((id) => {
         const sc = scopes[id];
         if (!sc) return null;
@@ -39,17 +39,17 @@ export const ScopeBar = memo(function ScopeBar({ active }: { active: string }) {
             title={sc.task ?? sc.name}
             className={cx(
               "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-xs transition-colors",
-              active === id ? "bg-neutral-800 text-neutral-50" : "text-neutral-400 hover:bg-neutral-800/60 hover:text-neutral-200",
+              active === id ? "bg-surface-2 text-fg" : "text-fg-muted hover:bg-surface-2/60 hover:text-fg-soft",
             )}
           >
             <Icon className="size-3.5" />
             <span className="max-w-[140px] truncate">{isMain ? "Họp chính" : sc.name}</span>
             {thinking ? (
-              <LoaderCircle className="size-3 animate-spin text-sky-400" />
+              <LoaderCircle className="size-3 animate-spin text-info" />
             ) : StatusIcon ? (
-              <StatusIcon className={cx("size-3", sc.status === "failed" ? "text-red-400" : "text-emerald-400")} />
+              <StatusIcon className={cx("size-3", sc.status === "failed" ? "text-danger" : "text-success")} />
             ) : sc.currentRound > 0 ? (
-              <span className="text-[10px] text-neutral-500">
+              <span className="text-[10px] text-fg-subtle">
                 R{sc.currentRound}/{sc.maxRounds}
               </span>
             ) : null}
@@ -61,7 +61,7 @@ export const ScopeBar = memo(function ScopeBar({ active }: { active: string }) {
         onClick={() => setScope("auto")}
         className={cx(
           "ml-auto shrink-0 rounded-lg px-2 py-1 text-[11px]",
-          sel === "auto" ? "text-sky-300" : "text-neutral-500 hover:text-neutral-300",
+          sel === "auto" ? "text-info" : "text-fg-subtle hover:text-fg-soft",
         )}
         title="Tự chuyển sang nơi đang họp"
       >

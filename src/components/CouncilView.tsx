@@ -41,12 +41,15 @@ export function CouncilView() {
       <div className="flex min-h-0 min-w-0 flex-col gap-3 overflow-y-auto">
         <PromptPanel />
         <ScopeBar active={scope.id} />
-        <MeetingRoom
-          scope={scope}
-          resolve={resolve}
-          title={title}
-          idleCaption={status === "idle" ? "PHÒNG HỌP TRỐNG" : undefined}
-        />
+        {/* data-scene: cảnh pixel giữ palette tối gốc ở light theme (xem index.css). */}
+        <div data-scene className="contents">
+          <MeetingRoom
+            scope={scope}
+            resolve={resolve}
+            title={title}
+            idleCaption={status === "idle" ? "PHÒNG HỌP TRỐNG" : undefined}
+          />
+        </div>
         <MemberControls scope={scope} resolve={resolve} />
         <Timeline scope={scope} resolve={resolve} />
       </div>
