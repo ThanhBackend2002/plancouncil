@@ -1,10 +1,23 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { ChevronDown, CircleCheck, CircleX, LoaderCircle, Plus, RotateCcw, Server, Trash } from "lucide-react";
 import { formatDate } from "../../lib/agents";
 import { MASK_PREFIX, type AppConfig, type Provider } from "../../lib/contracts";
 import { isLocalUrl } from "../../store/config";
 import { Button, Panel } from "../ui";
-import { Field, INPUT, KeyInput, ModelPicker, SectionTitle, TextInput, newId, type Errors } from "./fields";
+import {
+  Field,
+  INPUT,
+  KeyInput,
+  LeftoverFilesWarning,
+  ModelPicker,
+  SecretControls,
+  SectionTitle,
+  TextInput,
+  findStatus,
+  newId,
+  useSecretStatus,
+  type Errors,
+} from "./fields";
 
 export const PRESETS: { name: string; base_url: string }[] = [
   { name: "OpenAI", base_url: "https://api.openai.com/v1" },
@@ -42,6 +55,8 @@ export function ProvidersTab({
   onFetch: (p: Provider) => void;
   onCommit: (id: string) => void;
 }) {
+  // Trạng thái nơi lưu key — tải lại sau mỗi lần lưu cấu hình.
+  const secrets = useSecretStatus(saved);
   const setProvider = (id: string, patch: Partial<Provider>) =>
     update((c) => ({ ...c, providers: c.providers.map((p) => (p.id === id ? { ...p, ...patch } : p)) }));
 
@@ -84,6 +99,7 @@ export function ProvidersTab({
       >
         <AddProviderMenu onPick={add} />
       </SectionTitle>
+      <LeftoverFilesWarning files={secrets.report?.leftover_files ?? []} refresh={secrets.refresh} />
       {draft.providers.length === 0 && (
         <p className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
           Chưa có provider nào. Bấm <b>Thêm provider</b>, nhập base URL + API key; mọi role sẽ được gán vào provider đầu tiên.
@@ -103,6 +119,20 @@ export function ProvidersTab({
             onFetch={() => onFetch(p)}
             others={draft.providers.filter((x) => x.id !== p.id)}
             onRemove={(target, model) => remove(p.id, target, model)}
+            secret={
+              <SecretControls
+                target={{ kind: "provider", id: p.id }}
+                status={findStatus(secrets.report, { kind: "provider", id: p.id })}
+                secretsFile={secrets.report?.secrets_file}
+                value={p.api_key}
+                canStore={(() => {
+                  const s = saved.providers.find((x) => x.id === p.id);
+                  return !!s && apiRoot(s.base_url) === apiRoot(p.base_url);
+                })()}
+                update={update}
+                refresh={secrets.refresh}
+              />
+            }
           />
         ))}
       </div>
@@ -150,6 +180,7 @@ function ProviderCard({
   onFetch,
   others,
   onRemove,
+  secret,
 }: {
   provider: Provider;
   saved: Provider | undefined;
@@ -161,6 +192,8 @@ function ProviderCard({
   onFetch: () => void;
   others: Provider[];
   onRemove: (target: string | null, model: string) => void;
+  /** Nơi lưu key + thao tác keyring (badge, thử lại, hộp thoại đồng ý). */
+  secret?: ReactNode;
 }) {
   const [removing, setRemoving] = useState(false);
   const [target, setTarget] = useState<string>(others[0]?.id ?? "");
@@ -267,6 +300,7 @@ function ProviderCard({
               Đã đổi base URL: key cũ sẽ không được gửi tới host mới. Hãy nhập lại key.
             </span>
           )}
+          {secret}
         </Field>
       </div>
       <div className="mt-3 flex items-center gap-3 rounded-md bg-neutral-900/60 px-3 py-2 text-xs">

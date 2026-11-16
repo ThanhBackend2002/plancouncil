@@ -46,6 +46,16 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 rusqlite = { version = "0.37", features = ["bundled"] }
 unicode-normalization = "0.1"
 
+# Keyring của hệ điều hành (secrets.rs). keyring v3 KHÔNG bật feature = mock không lưu gì
+# → bật backend thật theo từng OS. Linux/BSD: Secret Service qua zbus (thuần Rust, không cần
+# libdbus-dev / openssl headers khi build trên Linux/WSL), runtime async-io, mã hoá crypto-rust.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+keyring = { version = "=3.6.3", features = ["apple-native"] }
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "=3.6.3", features = ["windows-native"] }
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+keyring = { version = "=3.6.3", features = ["async-secret-service", "async-io", "crypto-rust"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"

@@ -16,6 +16,7 @@ import type {
   StaffingProposal,
   SessionSummary,
 } from "./contracts";
+import type { KeyStorage, SecretCommandError, SecretStatusReport, SecretTarget, SetSecretResult } from "./contracts";
 
 const KINDS: ReadonlySet<CommandError["kind"]> = new Set([
   "invalid",
@@ -91,4 +92,30 @@ export const ipc = {
   defaultRoles: () => call<RoleDef[]>("default_roles"),
   exportMarkdown: (content: string, suggestedName: string) =>
     call<string | null>("export_markdown", { content, suggestedName }),
+};
+
+// ── API key (keyring) — giữ nguyên `kind` của backend để UI phân biệt keyring_unavailable / keyring_locked ──
+
+async function callSecret<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (!inTauri()) {
+    throw { kind: "internal", message: "Không chạy trong Tauri — hãy mở app bằng `npm run tauri dev`." } satisfies SecretCommandError;
+  }
+  try {
+    return await invoke<T>(cmd, args);
+  } catch (e) {
+    if (e && typeof e === "object" && "kind" in e && "message" in e) {
+      const o = e as { kind: unknown; message: unknown; target?: SecretTarget };
+      throw { kind: String(o.kind), message: String(o.message), target: o.target } satisfies SecretCommandError;
+    }
+    throw { kind: "internal", message: e instanceof Error ? e.message : String(e) } satisfies SecretCommandError;
+  }
+}
+
+export const secretIpc = {
+  /** `apiKey` là giá trị mask = dùng key hiện tại (đổi nơi lưu / thử lại / mở khoá). "file" chỉ gửi khi người dùng đã đồng ý. */
+  setSecret: (target: SecretTarget, apiKey: string, storage: KeyStorage) =>
+    callSecret<SetSecretResult>("set_secret", { target, api_key: apiKey, storage }),
+  deleteSecret: (target: SecretTarget) => callSecret<void>("delete_secret", { target }),
+  status: () => callSecret<SecretStatusReport>("secret_status"),
+  deleteLeftoverFiles: (files: string[]) => callSecret<string[]>("delete_leftover_files", { files }),
 };

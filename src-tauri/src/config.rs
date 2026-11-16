@@ -9,6 +9,8 @@
 //! - `Debug` được implement thủ công để KHÔNG BAO GIỜ in key ra log.
 //! - `redacted()` che key trước khi gửi lên webview; key thật chỉ sống ở Rust.
 //! - `merge_secrets()`: giá trị mask (`••••abcd`) = giữ key cũ, nhưng chỉ khi base_url không đổi.
+//! - Key thật KHÔNG BAO GIỜ được serialize (`ser_masked_only`): ra ngoài chỉ có giá trị mask hoặc
+//!   `null`. Key nằm trong keyring / `secrets.json` / RAM theo `key_storage` — xem `secrets.rs`.
 //!
 //! Config v1 (endpoint mặc định + override 4 agent) và v2 (4 role cố định) được migrate tự động.
 
@@ -40,6 +42,32 @@ pub enum JsonMode {
     JsonObject,
 }
 
+// ───────────────────────────── Nơi lưu API key ─────────────────────────────
+
+/// Nơi lưu API key (key thật chỉ sống trong RAM của Rust, không nằm trong config.json).
+/// Config cũ không có trường này → mặc định `keyring`; key plaintext còn sót trong config.json
+/// được `secrets::Secrets::startup` migrate sang keyring (thất bại thì giữ nguyên chỗ cũ).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStorage {
+    /// Keychain (macOS) / Credential Manager (Windows) / Secret Service (Linux).
+    #[default]
+    Keyring,
+    /// `secrets.json` plaintext (0600) — chỉ khi người dùng đồng ý rõ ràng.
+    File,
+    /// Chỉ trong RAM — mất khi đóng app.
+    Memory,
+}
+
+/// Chỉ cho phép serialize giá trị đã mask; key thật → `null` (config.json, webview, log JSON).
+/// Key plaintext chưa migrate được do `secrets.rs` chèn lại vào config.json có chủ đích.
+fn ser_masked_only<S: serde::Serializer>(key: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    match key.as_deref() {
+        Some(k) if k.starts_with(MASK_PREFIX) => s.serialize_some(k),
+        _ => s.serialize_none(),
+    }
+}
+
 // ───────────────────────────── Provider ─────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -48,7 +76,9 @@ pub struct Provider {
     pub id: String,
     pub name: String,
     pub base_url: String,
+    #[serde(serialize_with = "ser_masked_only")]
     pub api_key: Option<String>,
+    pub key_storage: KeyStorage,
     /// Cache kết quả `GET /models` gần nhất để dropdown hiện ngay.
     pub models: Vec<String>,
     pub models_fetched_at: Option<DateTime<Utc>>,
@@ -61,6 +91,7 @@ impl Default for Provider {
             name: "OpenAI".into(),
             base_url: "https://api.openai.com/v1".into(),
             api_key: None,
+            key_storage: KeyStorage::default(),
             models: vec![],
             models_fetched_at: None,
         }
@@ -268,11 +299,25 @@ pub enum WebSearchProvider {
     Searxng,
 }
 
+impl WebSearchProvider {
+    /// Tên ổn định (khớp serde) — dùng làm account keyring `websearch:<provider>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Duckduckgo => "duckduckgo",
+            Self::Tavily => "tavily",
+            Self::Brave => "brave",
+            Self::Searxng => "searxng",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebSearchConfig {
     pub provider: WebSearchProvider,
+    #[serde(serialize_with = "ser_masked_only")]
     pub api_key: Option<String>,
+    pub key_storage: KeyStorage,
     /// Chỉ dùng cho SearXNG.
     pub base_url: String,
     pub max_results: u32,
@@ -285,6 +330,7 @@ impl Default for WebSearchConfig {
         Self {
             provider: WebSearchProvider::Duckduckgo,
             api_key: None,
+            key_storage: KeyStorage::default(),
             base_url: String::new(),
             max_results: 5,
             enabled_by_default: false,
@@ -465,6 +511,8 @@ impl AppConfig {
     pub fn merge_secrets(mut self, existing: &AppConfig) -> AppConfig {
         for p in &mut self.providers {
             let old = existing.provider(&p.id);
+            // Nơi lưu key chỉ đổi qua `set_secret` (cần người dùng đồng ý) → lấy theo bản đang lưu.
+            p.key_storage = old.map(|o| o.key_storage).unwrap_or_default();
             p.api_key = match p.api_key.take() {
                 Some(k) if k.starts_with(MASK_PREFIX) => match old {
                     Some(o) if api_root(&o.base_url) == api_root(&p.base_url) => o.api_key.clone(),
@@ -481,6 +529,8 @@ impl AppConfig {
         }
         // Key dịch vụ tìm kiếm: giữ key cũ chỉ khi vẫn cùng dịch vụ.
         let old = &existing.web_search;
+        self.web_search.key_storage =
+            if old.provider == self.web_search.provider { old.key_storage } else { KeyStorage::default() };
         self.web_search.api_key = match self.web_search.api_key.take() {
             Some(k) if k.starts_with(MASK_PREFIX) => {
                 (old.provider == self.web_search.provider).then(|| old.api_key.clone()).flatten()
@@ -966,6 +1016,7 @@ impl LegacyV1 {
             name: host_name(&d.base_url),
             base_url: d.base_url.trim().to_owned(),
             api_key: non_empty(&d.api_key).map(str::to_owned),
+            key_storage: KeyStorage::default(),
             models: vec![],
             models_fetched_at: None,
         }];
@@ -988,6 +1039,7 @@ impl LegacyV1 {
                         name,
                         base_url: base,
                         api_key: key,
+                        key_storage: KeyStorage::default(),
                         models: vec![],
                         models_fetched_at: None,
                     });
@@ -1037,6 +1089,7 @@ impl fmt::Debug for Provider {
             .field("name", &self.name)
             .field("base_url", &self.base_url)
             .field("api_key", &fmt_key(&self.api_key))
+            .field("key_storage", &self.key_storage)
             .field("models", &self.models.len())
             .finish()
     }
@@ -1148,6 +1201,41 @@ pub(crate) mod tests {
         assert_eq!(merged.providers[0].api_key.as_deref(), Some("sk-default-123456"));
         assert_eq!(merged.providers[1].api_key, None);
         assert_eq!(merged.providers[2].api_key.as_deref(), Some("sk-new"));
+    }
+
+    #[test]
+    fn real_keys_are_never_serialized_and_storage_comes_from_saved_config() {
+        let mut stored = with_openrouter();
+        stored.providers[1].key_storage = KeyStorage::File;
+        stored.web_search.provider = WebSearchProvider::Tavily;
+        stored.web_search.api_key = Some("tvly-secret-123456".into());
+        stored.web_search.key_storage = KeyStorage::Memory;
+        let json = serde_json::to_string(&stored).unwrap();
+        assert!(!json.contains("sk-default") && !json.contains("sk-or-") && !json.contains("tvly-"), "{json}");
+        assert!(json.contains(r#""key_storage":"file""#));
+        // Bản mask vẫn đi ra webview được.
+        let view = serde_json::to_value(stored.redacted()).unwrap();
+        assert_eq!(view["providers"][0]["api_key"], "••••3456");
+        assert_eq!(view["web_search"]["key_storage"], "memory");
+
+        // Webview gửi key_storage khác → bỏ qua, chỉ `set_secret` mới đổi được nơi lưu.
+        let mut incoming = stored.redacted();
+        incoming.providers[0].key_storage = KeyStorage::File;
+        incoming.providers[1].key_storage = KeyStorage::Keyring;
+        incoming.web_search.key_storage = KeyStorage::File;
+        let merged = incoming.merge_secrets(&stored);
+        assert_eq!(merged.providers[0].key_storage, KeyStorage::Keyring);
+        assert_eq!(merged.providers[1].key_storage, KeyStorage::File);
+        assert_eq!(merged.web_search.key_storage, KeyStorage::Memory);
+        assert_eq!(merged.web_search.api_key.as_deref(), Some("tvly-secret-123456"));
+
+        // Config cũ (không có key_storage) → mặc định keyring, key plaintext vẫn đọc được để migrate.
+        let (c, _) = AppConfig::from_json(
+            br#"{"schema_version":3,"providers":[{"id":"a","name":"A","base_url":"https://x/v1","api_key":"sk-legacy-1234"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.providers[0].key_storage, KeyStorage::Keyring);
+        assert_eq!(c.providers[0].api_key.as_deref(), Some("sk-legacy-1234"));
     }
 
     #[test]
