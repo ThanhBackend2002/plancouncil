@@ -1,6 +1,7 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { diffLines, diffWords, type ChangeObject } from "diff";
 import { ChevronDown, ChevronRight } from "lucide-react";
+import { headingNumber, numbersMatch } from "../lib/sectionStatus";
 import { pairSections, type SectionPair, type SectionStatus } from "../lib/sections";
 import { Badge, cx } from "./ui";
 
@@ -17,17 +18,47 @@ const STATUS: Record<SectionStatus, { label: string; tone: "success" | "danger" 
   unchanged: { label: "Không đổi", tone: "neutral" },
 };
 
-export function DiffView({ sources }: { sources: DiffSource[] }) {
+export function DiffView({
+  sources,
+  initialPair,
+  focusNumber,
+}: {
+  sources: DiffSource[];
+  /** Cặp version mở sẵn (id nguồn, vd "v1" → "v2"); mặc định "trước → mới nhất". */
+  initialPair?: { a: string; b: string };
+  /** Số hiệu section cần cuộn tới (vd "3.3"); `###` rơi về section `##` cha. */
+  focusNumber?: string;
+}) {
   const versions = sources.filter((s) => s.id !== "final");
-  const [aId, setAId] = useState(() => versions.at(-2)?.id ?? sources[0]?.id ?? "");
-  const [bId, setBId] = useState(() => versions.at(-1)?.id ?? sources.at(-1)?.id ?? "");
-  const [onlyChanged, setOnlyChanged] = useState(true);
+  const has = (id?: string) => !!id && sources.some((s) => s.id === id);
+  const [aId, setAId] = useState(() =>
+    has(initialPair?.a) ? initialPair!.a : (versions.at(-2)?.id ?? sources[0]?.id ?? ""),
+  );
+  const [bId, setBId] = useState(() =>
+    has(initialPair?.b) ? initialPair!.b : (versions.at(-1)?.id ?? sources.at(-1)?.id ?? ""),
+  );
+  const [onlyChanged, setOnlyChanged] = useState(!focusNumber);
+  const listRef = useRef<HTMLDivElement>(null);
 
   const a = sources.find((s) => s.id === aId) ?? sources[0];
   const b = sources.find((s) => s.id === bId) ?? sources.at(-1);
   const pairs = useMemo(() => (a && b ? pairSections(a.markdown, b.markdown) : []), [a, b]);
 
+  // Cuộn tới section được yêu cầu (hook phải đứng trước mọi return sớm).
+  useEffect(() => {
+    if (!focusNumber) return;
+    const target = listRef.current?.querySelector<HTMLElement>("[data-diff-focus]");
+    target?.scrollIntoView({ block: "start" });
+  }, [focusNumber, pairs]);
+
   if (!a || !b) return <p className="p-6 text-sm text-fg-subtle">Cần ít nhất 2 version để so sánh.</p>;
+  // Section `##` cha của số hiệu cần xem (pairSections chỉ tách theo `##`).
+  const focusKey = focusNumber
+    ? pairs.find((p) => {
+        const n = headingNumber(p.titleB ?? p.titleA ?? "");
+        return !!n && numbersMatch(n, focusNumber) && (n.split(".").length <= focusNumber.split(".").length || n === focusNumber);
+      })?.key
+    : undefined;
 
   const counts = pairs.reduce<Record<SectionStatus, number>>(
     (acc, p) => ({ ...acc, [p.status]: acc[p.status] + 1 }),
@@ -51,11 +82,13 @@ export function DiffView({ sources }: { sources: DiffSource[] }) {
           Chỉ xem section thay đổi
         </label>
       </div>
-      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
+      <div ref={listRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4">
         {a.id === b.id && <p className="text-sm text-fg-subtle">Hai bên đang chọn cùng một version.</p>}
         {shown.length === 0 && a.id !== b.id && <p className="text-sm text-fg-subtle">Không có section nào thay đổi.</p>}
         {shown.map((p) => (
-          <SectionDiff key={p.key} pair={p} />
+          <div key={p.key} data-diff-focus={p.key === focusKey ? "" : undefined}>
+            <SectionDiff pair={p} />
+          </div>
         ))}
       </div>
     </div>

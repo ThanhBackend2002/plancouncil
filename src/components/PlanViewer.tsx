@@ -1,15 +1,17 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Coins, Copy, Download, FileText, GitCompareArrows, KeyRound, LoaderCircle, Sparkles } from "lucide-react";
 import { formatTokens, type RoleResolver } from "../lib/agents";
 import { activeOf, useActive, useActiveShallow, useCouncil, usePlanText } from "../store/council";
 import { ipc } from "../lib/ipc";
-import { planText, type PlanView, type ScopeState, type SessionState } from "../store/session";
+import { pairSections } from "../lib/sections";
+import { changedNumbers, deriveSectionStatus, headingNumbers } from "../lib/sectionStatus";
+import { planText, type PlanView, type RoundView, type ScopeState, type SessionState } from "../store/session";
 import { providerOf, useConfig } from "../store/config";
 import { useUi } from "../store/ui";
 import { toast, toastError } from "../store/toast";
 import { DiffView, type DiffSource } from "./DiffView";
 import { UsagePanel } from "./UsagePanel";
-import { PlanMarkdown } from "./Markdown";
+import { PlanMarkdown, type BadgeMap, type SectionActions } from "./Markdown";
 import { Button, Panel, StatusBadge, cx } from "./ui";
 
 type Selection = "auto" | "final" | "diff" | "usage" | number;
@@ -25,6 +27,8 @@ function contentOf(s: SessionState, scopeId: string, resolved: Resolved, plan: P
 export const PlanViewer = memo(function PlanViewer({ scope, resolve }: { scope: ScopeState; resolve: RoleResolver }) {
   const [sel, setSel] = useState<Selection>("auto");
   const [exporting, setExporting] = useState(false);
+  /** Mở Diff ở cặp version / section cụ thể (từ nút "So sánh với version trước"). */
+  const [diffFocus, setDiffFocus] = useState<{ a: string; b: string; number: string; nonce: number } | null>(null);
   const planFocus = useUi((s) => s.planFocus);
   const session = useActiveShallow((s) => ({ id: s.id, status: s.status, total: s.usage.total }));
 
@@ -54,6 +58,29 @@ export const PlanViewer = memo(function PlanViewer({ scope, resolve }: { scope: 
     if (scope.final) list.push({ id: "final", label: "Final", markdown: scope.final.markdown });
     return list;
   }, [scope.plans, scope.final]);
+
+  // Version đang xem để suy trạng thái section: bản plan, hoặc bản mà Final dựa vào.
+  const viewVersion = typeof resolved === "number" ? resolved : resolved === "final" ? (scope.final?.version ?? null) : null;
+  const prevPlan = useMemo(
+    () => (viewVersion == null ? undefined : scope.plans.filter((p) => p.complete && p.version < viewVersion).at(-1)),
+    [scope.plans, viewVersion],
+  );
+  const prevVersion = prevPlan?.version;
+  const onCompare = useCallback(
+    (number: string) => {
+      if (viewVersion == null || prevVersion == null) return;
+      setDiffFocus({ a: `v${prevVersion}`, b: `v${viewVersion}`, number, nonce: Date.now() });
+      setSel("diff");
+    },
+    [viewVersion, prevVersion],
+  );
+  const actions = useMemo<SectionActions>(
+    () => ({
+      onFilter: (n) => useUi.getState().setSectionFilter(n),
+      onCompare: prevVersion != null ? onCompare : undefined,
+    }),
+    [onCompare, prevVersion],
+  );
 
   const label = resolved === "final" ? "final" : typeof resolved === "number" ? `v${resolved}` : "";
   const canAct = resolved !== "diff" && resolved !== "usage" && hasContent && !streaming;
@@ -114,7 +141,10 @@ export const PlanViewer = memo(function PlanViewer({ scope, resolve }: { scope: 
                 type="button"
                 role="tab"
                 aria-selected={active}
-                onClick={() => setSel(t.key)}
+                onClick={() => {
+                  if (t.key === "diff") setDiffFocus(null);
+                  setSel(t.key);
+                }}
                 className={cx(
                   "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-control px-2.5 text-xs font-medium transition-colors",
                   active ? "bg-surface-2 text-fg" : "text-fg-muted hover:bg-surface hover:text-fg-soft",
@@ -152,7 +182,12 @@ export const PlanViewer = memo(function PlanViewer({ scope, resolve }: { scope: 
       ) : resolved === "diff" ? (
         <div className="min-h-0 flex-1">
           {/* key theo số version → khi có version mới, mặc định lại "trước → mới nhất". */}
-          <DiffView key={`${session.id ?? "none"}-${scope.id}-${diffSources.length}`} sources={diffSources} />
+          <DiffView
+            key={`${session.id ?? "none"}-${scope.id}-${diffSources.length}-${diffFocus?.nonce ?? 0}`}
+            sources={diffSources}
+            initialPair={diffFocus ? { a: diffFocus.a, b: diffFocus.b } : undefined}
+            focusNumber={diffFocus?.number}
+          />
         </div>
       ) : (
         <PlanBody
@@ -163,6 +198,10 @@ export const PlanViewer = memo(function PlanViewer({ scope, resolve }: { scope: 
           streaming={streaming}
           running={running}
           label={label}
+          rounds={scope.rounds}
+          viewVersion={viewVersion}
+          prevMarkdown={prevPlan?.markdown ?? null}
+          actions={actions}
         />
       )}
     </Panel>
@@ -178,6 +217,10 @@ const PlanBody = memo(function PlanBody({
   streaming,
   running,
   label,
+  rounds,
+  viewVersion,
+  prevMarkdown,
+  actions,
 }: {
   scopeId: string;
   resolved: Resolved;
@@ -186,11 +229,25 @@ const PlanBody = memo(function PlanBody({
   streaming: boolean;
   running: boolean;
   label: string;
+  rounds: RoundView[];
+  viewVersion: number | null;
+  prevMarkdown: string | null;
+  actions: SectionActions;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const draft = usePlanText(scopeId, plan);
   const content = resolved === "final" ? finalMd : draft;
+
+  // Badge theo section. Bản đang stream (nháp) KHÔNG có badge: chưa có round nào review nó.
+  const badges = useMemo<BadgeMap | undefined>(() => {
+    if (streaming || viewVersion == null || content === "") return undefined;
+    const map = deriveSectionStatus(rounds, viewVersion, headingNumbers(content));
+    if (prevMarkdown != null) {
+      for (const n of changedNumbers(pairSections(prevMarkdown, content))) if (map[n]) map[n] = { ...map[n]!, changed: true };
+    }
+    return map;
+  }, [streaming, viewVersion, content, rounds, prevMarkdown]);
 
   // Tự cuộn theo nội dung khi stream; dừng nếu người dùng cuộn lên.
   useLayoutEffect(() => {
@@ -224,7 +281,7 @@ const PlanBody = memo(function PlanBody({
               Version này chưa viết xong (phiên đã dừng/lỗi giữa chừng).
             </p>
           )}
-          <PlanMarkdown markdown={content} streaming={streaming} />
+          <PlanMarkdown markdown={content} streaming={streaming} badges={badges} actions={actions} />
         </article>
       )}
     </div>

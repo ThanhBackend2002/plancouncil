@@ -19,6 +19,8 @@ import {
   type TokenUsage,
   type TruncatedReason,
   type FallbackReason,
+  type ConsistencyConflict,
+  type ConsistencyResult,
   type UsageReport,
 } from "../lib/contracts";
 
@@ -132,6 +134,12 @@ export interface SessionState {
   staffing: StaffingInfo | null;
   /** Ảnh chụp ngân sách token mới nhất (chỉ có khi phiên đặt giới hạn). */
   budget?: BudgetSnapshot;
+  /** Lần cắt output gần nhất KHÔNG nối tiếp được (cho banner trạng thái). */
+  lastTruncated?: { scope: string; reason: TruncatedReason };
+  /** Kết quả kiểm tra nhất quán gần nhất (cho banner `unresolved`). */
+  consistency?: { scope: string; result: ConsistencyResult; conflicts: ConsistencyConflict[] };
+  /** Số lần revise-theo-section bị loại LIÊN TIẾP gần nhất (cho banner gợi ý revise_mode=full). */
+  fallbackStreak?: number;
   /** Thứ tự hiển thị: "main" trước, rồi các phòng ban. */
   scopeOrder: string[];
   scopes: Record<string, ScopeState>;
@@ -531,7 +539,8 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
       const text = env.recovered
         ? `${what} bị cắt (${why}) — đã viết tiếp và ghép lại.`
         : `${what} bị cắt (${why}) — không dùng được.`;
-      return patchScope(s, env.scope, (sc) => ({
+      const base = env.recovered ? s : { ...s, lastTruncated: { scope: env.scope, reason: env.reason } };
+      return patchScope(base, env.scope, (sc) => ({
         ...sc,
         notices: [
           ...(sc.notices ?? []),
@@ -542,6 +551,7 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
 
     case "revise_fallback": {
       const why = FALLBACK_REASON[env.reason] ?? env.reason;
+      s = { ...s, fallbackStreak: env.consecutive };
       const text =
         `Không sửa theo section được (${why}) — viết lại toàn bộ plan.` +
         (env.consecutive >= 2 ? ` ${env.consecutive} lần liên tiếp → các vòng sau luôn viết lại toàn bộ.` : "");
@@ -555,6 +565,7 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
     }
 
     case "consistency": {
+      s = { ...s, consistency: { scope: env.scope, result: env.result, conflicts: env.conflicts } };
       const list = env.conflicts.map((c) => `[${c.sections.join(", ")}] ${c.text}`).join("; ");
       const text =
         env.result === "ok"

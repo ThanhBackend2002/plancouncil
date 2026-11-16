@@ -6,8 +6,10 @@ import { initialSession, mainOf, type ScopeState } from "../store/session";
 import { MeetingRoom } from "./MeetingRoom";
 import { MemberControls } from "./MemberControls";
 import { PlanViewer } from "./PlanViewer";
+import { ProgressBar } from "./ProgressBar";
 import { PromptPanel } from "./PromptPanel";
 import { ScopeBar } from "./ScopeBar";
+import { StateBanner } from "./StateBanner";
 import { Timeline } from "./Timeline";
 
 /** Split View: trái 40% (prompt + phòng họp pixel + hội thoại), phải 60% (Plan Viewer). */
@@ -39,6 +41,7 @@ export function CouncilView() {
   return (
     <div className="grid h-full grid-cols-[minmax(440px,2fr)_3fr] gap-3 p-3">
       <div className="flex min-h-0 min-w-0 flex-col gap-3 overflow-y-auto">
+        <StateBanner />
         <PromptPanel />
         <ScopeBar active={scope.id} />
         {/* data-scene: đánh dấu cảnh pixel (luôn tối, dùng palette Tailwind gốc, không dùng token). */}
@@ -51,6 +54,7 @@ export function CouncilView() {
           />
         </div>
         <MemberControls scope={scope} resolve={resolve} />
+        <ProgressBar />
         <Timeline scope={scope} resolve={resolve} />
       </div>
       <div className="min-h-0 min-w-0">

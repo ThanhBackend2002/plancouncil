@@ -11,7 +11,7 @@ import { useAppHotkeys } from "./lib/useHotkeys";
 export default function App() {
   const tab = useUi((s) => s.tab);
   const motion = useUi((s) => s.reducedMotion);
-  useAppHotkeys(); // Ctrl/Cmd+K → Lịch sử + focus ô tìm
+  useAppHotkeys(); // Ctrl/Cmd+K → Lịch sử; Ctrl/Cmd+Enter → bắt đầu họp; Esc → dừng họp
   return (
     <MotionConfig reducedMotion={motion === "on" ? "always" : motion === "off" ? "never" : "user"}>
       <div className="flex h-full flex-col bg-canvas text-fg">
