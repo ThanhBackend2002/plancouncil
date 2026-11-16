@@ -28,7 +28,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage", "msi", "nsis"],
+    "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "Phòng họp multi-agent lập kế hoạch",
+    "macOS": { "minimumSystemVersion": "11.0" },
+    "windows": { "nsis": { "installMode": "currentUser" } },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

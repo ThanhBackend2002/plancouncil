@@ -10,7 +10,11 @@
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run",
     "verify": "cargo test --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && vitest run && tsc -b --noEmit",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:mac": "tauri build --bundles app,dmg",
+    "build:mac:universal": "tauri build --target universal-apple-darwin --bundles app,dmg",
+    "build:win": "tauri build --bundles nsis,msi",
+    "build:linux": "tauri build --bundles deb,rpm,appimage"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
