@@ -145,6 +145,8 @@ export interface DepartmentRecord {
 export interface TokenUsage {
   prompt_tokens: number;
   completion_tokens: number;
+  /** Phần prompt đọc từ cache (bản ghi cũ / FE cũ: thiếu). */
+  cached_tokens?: number;
   calls: number;
   /** Số lần provider không trả `usage` → token được ước lượng theo độ dài văn bản. */
   estimated_calls: number;
@@ -157,6 +159,8 @@ export interface UsageReport {
   by_role: Record<RoleId, TokenUsage>;
   by_scope: Record<string, TokenUsage>;
   by_kind: Record<string, TokenUsage>;
+  /** Theo tên model. Bản ghi rất cũ (không có `calls`): rỗng / thiếu. */
+  by_model?: Record<string, TokenUsage>;
   /** Token tiết kiệm nhờ review theo section + giữ nguyên APPROVE. */
   saved_tokens?: number;
   carried_reviews?: number;
@@ -177,6 +181,14 @@ export interface SessionInfo {
   workspace: string | null;
   web_search: boolean;
   company_context: boolean;
+  /** Nơi khởi tạo: thiếu = app desktop, "mcp" = Claude Code qua MCP. */
+  origin?: string | null;
+}
+
+/** Thông tin người yêu cầu bổ sung giữa cuộc họp (send_council_message qua MCP). */
+export interface UserNote {
+  ts: string;
+  text: string;
 }
 
 export interface SessionRecord {
@@ -249,6 +261,8 @@ export type CouncilEvent =
       scope: string;
       agent: RoleId;
       kind: UsageKind;
+      /** Model đã gọi (backend cũ: thiếu). */
+      model?: string;
       prompt_tokens: number;
       completion_tokens: number;
       estimated: boolean;
@@ -579,6 +593,7 @@ export interface SessionRecord {
   /** null = phiên mới / bản ghi cũ. */
   parent?: ParentRef | null;
   calls?: CallUsage[];
+  user_notes?: UserNote[];
 }
 
 export interface SessionSummary {

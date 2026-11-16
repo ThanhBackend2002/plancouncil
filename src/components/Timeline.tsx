@@ -1,16 +1,18 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { X, ChevronDown, ChevronRight, FileText, FolderTree, Globe, Link, LoaderCircle, Search, TriangleExclamationPoint, UserMinus, UserPlus, Wrench } from "lucide-react";
+import { X, Maximize2, ChevronDown, ChevronRight, FileText, FolderTree, Globe, Link, LoaderCircle, Search, TriangleExclamationPoint, UserMinus, UserPlus, Wrench } from "lucide-react";
 import { STATUS_META, type RoleResolver } from "../lib/agents";
 import { reviewMentions } from "../lib/sectionStatus";
-import type { MembershipChange, RoleId, ToolActivity } from "../lib/contracts";
+import type { MembershipChange, RoleId, ToolActivity, UserNote } from "../lib/contracts";
 import { useActiveShallow } from "../store/council";
 import type { RoundView, ScopeState, SlotView } from "../store/session";
 import { useUi } from "../store/ui";
+import { Dialog } from "./Dialog";
 import { PixelPortrait } from "./PixelCharacter";
 import { Badge, Panel, VerdictBadge, cx } from "./ui";
 
 type Msg =
   | { key: string; kind: "task"; text: string }
+  | { key: string; kind: "system"; text: string }
   | { key: string; kind: "plan"; agentId: RoleId; version: number; complete: boolean }
   | { key: string; kind: "review"; agentId: RoleId; round: number; slot: SlotView }
   | { key: string; kind: "round"; round: RoundView }
@@ -19,9 +21,14 @@ type Msg =
   | { key: string; kind: "notice"; agentId: RoleId; text: string }
   | { key: string; kind: "outcome" };
 
-function buildMessages(scope: ScopeState, running: boolean): Msg[] {
+function buildMessages(scope: ScopeState, running: boolean, userNotes: UserNote[] = [], fromMcp = false): Msg[] {
   const out: Msg[] = [];
   if (scope.task) out.push({ key: "task", kind: "task", text: scope.task });
+  if (scope.kind === "main") {
+    if (fromMcp) out.push({ key: "origin", kind: "system", text: "Phiên được gửi từ Claude Code (MCP)" });
+    // Thông tin bổ sung giữa cuộc họp: áp cho mọi lần gọi model sau khi nhận (không gắn với 1 vòng cụ thể).
+    userNotes.forEach((n, i) => out.push({ key: `un${i}`, kind: "system", text: `Thông tin bổ sung #${i + 1}: ${n.text}` }));
+  }
   const tools = (phase: "author" | "review", step: number, agent: RoleId) =>
     scope.activities
       .map((a, i) => ({ a, i }))
@@ -70,6 +77,8 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
     seqGap: s.seqGap,
     readOnly: s.readOnly,
     resumed: s.resumed,
+    userNotes: s.userNotes,
+    fromMcp: s.options?.origin === "mcp",
   }));
   const running = scope.status === "running" && session.status === "running";
   const filter = useUi((s) => s.sectionFilter);
@@ -77,23 +86,17 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
   // Đổi phiên / nơi họp → bỏ lọc (số hiệu section chỉ có nghĩa trong 1 plan).
   useEffect(() => setFilter(null), [scope.id, session.id, setFilter]);
   const msgs = useMemo(() => {
-    const all = buildMessages(scope, running);
+    const all = buildMessages(scope, running, session.userNotes, session.fromMcp);
     // Lọc phản hồi: chỉ giữ review nhắc tới section (## phủ ### và ngược lại); các dòng khác giữ nguyên.
     return filter ? all.filter((m) => m.kind !== "review" || reviewMentions(m.slot.review, filter)) : all;
-  }, [scope, running, filter]);
-  const ref = useRef<HTMLDivElement>(null);
-  const stick = useRef(true);
-
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [msgs]);
-  useLayoutEffect(() => {
-    stick.current = true;
-  }, [scope.id, session.id]);
+  }, [scope, running, filter, session.userNotes, session.fromMcp]);
+  const [expanded, setExpanded] = useState(false);
+  const list = (big: boolean) => (
+    <MessageList msgs={msgs} scope={scope} resolve={resolve} session={session} running={running} filter={filter} big={big} />
+  );
 
   return (
-    <Panel className="flex min-h-[140px] flex-1 flex-col overflow-hidden">
+    <Panel className="flex min-h-[360px] flex-1 flex-col overflow-hidden">
       <LiveAnnouncer scope={scope} resolve={resolve} sessionKey={session.id} />
       <div className="flex items-center gap-2 border-b border-line px-3 py-2 text-xs font-medium text-fg-muted">
         Hội thoại · {scope.name}
@@ -114,62 +117,118 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
         <span className="ml-auto font-normal text-fg-subtle">
           {scope.rounds.length} round · {scope.reviewerIds.length} reviewer
         </span>
+        <button
+          type="button"
+          onClick={() => setExpanded(true)}
+          aria-label="Phóng to hội thoại"
+          title="Phóng to"
+          className="rounded p-0.5 text-fg-subtle hover:bg-surface-2 hover:text-fg"
+        >
+          <Maximize2 className="size-3.5" aria-hidden />
+        </button>
       </div>
-      <div
-        ref={ref}
-        onScroll={() => {
-          const el = ref.current;
-          if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-        }}
-        className="min-h-0 flex-1 space-y-2.5 overflow-y-auto p-3"
+      {list(false)}
+      <Dialog
+        open={expanded}
+        onClose={() => setExpanded(false)}
+        title={`Hội thoại · ${scope.name} — ${scope.rounds.length} round · ${scope.reviewerIds.length} reviewer`}
+        className="flex h-[88vh] max-w-5xl flex-col"
       >
-        {session.seqGap && !session.readOnly && (
-          <Notice>Có event bị lỡ. Dữ liệu đầy đủ sẽ được nạp lại từ lịch sử khi phiên kết thúc.</Notice>
-        )}
-        {session.resumed && session.status === "running" && (
-          <Notice>Webview vừa reload: chỉ hiển thị hội thoại từ thời điểm kết nối lại.</Notice>
-        )}
-        {msgs.length === 0 && (
-          <p className="px-2 py-6 text-center text-xs text-fg-subtle">
-            {filter ? `Không có phản hồi nào nhắc tới mục ${filter}.` : running ? `${resolve(scope.authorId).name || "Người viết"} đang chuẩn bị bản nháp…` : "Chưa có hội thoại nào."}
-          </p>
-        )}
-        {msgs.map((m) => {
-          switch (m.kind) {
-            case "task":
-              return <SystemLine key={m.key} text={`Nhiệm vụ được giao: ${m.text}`} />;
-            // Props là giá trị nguyên thuỷ hoặc tham chiếu có sẵn trong state (slot, round, activity…),
-            // không truyền object `m` dựng lại mỗi lần buildMessages → memo con mới có tác dụng.
-            case "plan":
-              return <PlanMsg key={m.key} agentId={m.agentId} version={m.version} complete={m.complete} resolve={resolve} />;
-            case "review":
-              return <ReviewMsg key={m.key} agentId={m.agentId} slot={m.slot} resolve={resolve} />;
-            case "round":
-              return <RoundLine key={m.key} round={m.round} />;
-            case "tool":
-              return <ToolLine key={m.key} activity={m.activity} resolve={resolve} />;
-            case "member":
-              return <MemberLine key={m.key} change={m.change} resolve={resolve} />;
-            case "notice":
-              return <SystemLine key={m.key} text={`${resolve(m.agentId).name}: ${m.text}`} />;
-            case "outcome":
-              return (
-                <Outcome
-                  key={m.key}
-                  status={scope.status}
-                  dept={scope.kind === "department"}
-                  reviewers={scope.reviewerIds.length}
-                  rounds={scope.rounds.length}
-                  maxRounds={scope.maxRounds}
-                  error={scope.error}
-                />
-              );
-          }
-        })}
-      </div>
+        {list(true)}
+      </Dialog>
     </Panel>
   );
 });
+
+type SessionFlags = { status: string; id: string | null; seqGap: boolean; readOnly: boolean; resumed: boolean; userNotes?: UserNote[]; fromMcp: boolean };
+
+/** Danh sách tin nhắn cuộn được; mỗi instance (khung nhỏ / popup) tự giữ trạng thái bám đáy. */
+function MessageList({
+  msgs,
+  scope,
+  resolve,
+  session,
+  running,
+  filter,
+  big,
+}: {
+  msgs: Msg[];
+  scope: ScopeState;
+  resolve: RoleResolver;
+  session: SessionFlags;
+  running: boolean;
+  filter: string | null;
+  big: boolean;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
+  }, [msgs]);
+  useLayoutEffect(() => {
+    stick.current = true;
+  }, [scope.id, session.id]);
+
+  return (
+    <div
+      ref={ref}
+      onScroll={() => {
+        const el = ref.current;
+        if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+      }}
+      // Popup: chữ to hơn ~20% cho dễ đọc (zoom giữ nguyên tỉ lệ của mọi cỡ chữ/icon bên trong).
+      className={cx("min-h-0 flex-1 space-y-2.5 overflow-y-auto", big ? "-mx-2 px-2 [zoom:1.2]" : "p-3")}
+    >
+      {session.seqGap && !session.readOnly && (
+        <Notice>Có event bị lỡ. Dữ liệu đầy đủ sẽ được nạp lại từ lịch sử khi phiên kết thúc.</Notice>
+      )}
+      {session.resumed && session.status === "running" && (
+        <Notice>Webview vừa reload: chỉ hiển thị hội thoại từ thời điểm kết nối lại.</Notice>
+      )}
+      {msgs.length === 0 && (
+        <p className="px-2 py-6 text-center text-xs text-fg-subtle">
+          {filter ? `Không có phản hồi nào nhắc tới mục ${filter}.` : running ? `${resolve(scope.authorId).name || "Người viết"} đang chuẩn bị bản nháp…` : "Chưa có hội thoại nào."}
+        </p>
+      )}
+      {msgs.map((m) => {
+        switch (m.kind) {
+          case "task":
+            return <SystemLine key={m.key} text={`Nhiệm vụ được giao: ${m.text}`} />;
+          case "system":
+            return <SystemLine key={m.key} text={m.text} />;
+          // Props là giá trị nguyên thuỷ hoặc tham chiếu có sẵn trong state (slot, round, activity…),
+          // không truyền object `m` dựng lại mỗi lần buildMessages → memo con mới có tác dụng.
+          case "plan":
+            return <PlanMsg key={m.key} agentId={m.agentId} version={m.version} complete={m.complete} resolve={resolve} />;
+          case "review":
+            return <ReviewMsg key={m.key} agentId={m.agentId} slot={m.slot} resolve={resolve} />;
+          case "round":
+            return <RoundLine key={m.key} round={m.round} />;
+          case "tool":
+            return <ToolLine key={m.key} activity={m.activity} resolve={resolve} />;
+          case "member":
+            return <MemberLine key={m.key} change={m.change} resolve={resolve} />;
+          case "notice":
+            return <SystemLine key={m.key} text={`${resolve(m.agentId).name}: ${m.text}`} />;
+          case "outcome":
+            return (
+              <Outcome
+                key={m.key}
+                status={scope.status}
+                dept={scope.kind === "department"}
+                reviewers={scope.reviewerIds.length}
+                rounds={scope.rounds.length}
+                maxRounds={scope.maxRounds}
+                error={scope.error}
+              />
+            );
+        }
+      })}
+    </div>
+  );
+}
 
 const Notice = memo(function Notice({ children }: { children: React.ReactNode }) {
   return (

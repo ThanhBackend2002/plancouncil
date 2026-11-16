@@ -32,10 +32,12 @@ pub enum Verdict {
 impl<'de> Deserialize<'de> for Verdict {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = String::deserialize(d)?;
-        let norm = raw.trim().to_ascii_uppercase();
-        if norm.starts_with("APPROV") {
+        let norm = raw.trim().to_ascii_uppercase().replace([' ', '-'], "_");
+        // Ý "cần sửa" (needs_revision, request_changes, revise…) = REJECT: plan chưa đạt.
+        const REJECT_LIKE: [&str; 6] = ["REJECT", "NEED", "REVIS", "REQUEST_CHANGE", "CHANGES_REQUESTED", "DENY"];
+        if norm.starts_with("APPROV") || norm == "ACCEPT" || norm == "ACCEPTED" || norm == "LGTM" {
             Ok(Verdict::Approve)
-        } else if norm.starts_with("REJECT") {
+        } else if REJECT_LIKE.iter().any(|p| norm.starts_with(p)) {
             Ok(Verdict::Reject)
         } else if norm.starts_with("ABSTAIN") || norm.starts_with("NOT_RELEVANT") || norm == "SKIP" {
             Ok(Verdict::Abstain)
@@ -450,6 +452,8 @@ pub struct UsageReport {
     pub by_scope: std::collections::BTreeMap<String, TokenUsage>,
     /// "assign" | "research" | "plan" | "review" | "staffing"
     pub by_kind: std::collections::BTreeMap<String, TokenUsage>,
+    /// Theo tên model (đúng chuỗi `model` của role). Bản ghi cũ: rỗng → dựng lại từ `calls` khi nạp.
+    pub by_model: std::collections::BTreeMap<String, TokenUsage>,
     /// Token ước lượng tiết kiệm được nhờ review theo section + giữ nguyên APPROVE.
     pub saved_tokens: u64,
     /// Số lượt review không cần gọi model (phần phụ trách không đổi).
@@ -538,6 +542,16 @@ pub struct SessionInfo {
     pub workspace: Option<String>,
     pub web_search: bool,
     pub company_context: bool,
+    /// Nơi khởi tạo phiên: None = app desktop, "mcp" = Claude Code qua MCP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+/// Thông tin người yêu cầu bổ sung giữa cuộc họp (vd. `send_council_message` qua MCP).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserNote {
+    pub ts: DateTime<Utc>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -573,6 +587,9 @@ pub struct SessionRecord {
     /// Token từng lần gọi (tối đa `MAX_CALL_RECORDS`). Bản ghi cũ: rỗng.
     #[serde(default)]
     pub calls: Vec<CallUsage>,
+    /// Thông tin bổ sung giữa cuộc họp, theo thứ tự nhận.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_notes: Vec<UserNote>,
     /// Plan + round của cuộc họp chính.
     pub plans: Vec<PlanVersion>,
     pub rounds: Vec<RoundRecord>,
@@ -604,6 +621,7 @@ impl SessionRecord {
             staffing: None,
             parent: None,
             calls: vec![],
+            user_notes: vec![],
             plans: vec![],
             rounds: vec![],
             final_markdown: None,
@@ -667,6 +685,8 @@ pub enum CouncilEvent {
         scope: String,
         agent: RoleId,
         kind: String,
+        /// Model đã gọi (đúng chuỗi `model` của role).
+        model: String,
         prompt_tokens: u64,
         completion_tokens: u64,
         /// Phần prompt đọc từ cache của lần gọi này.
@@ -883,6 +903,12 @@ mod tests {
             ("\"approved\"", Verdict::Approve),
             ("\" Reject \"", Verdict::Reject),
             ("\"REJECTED\"", Verdict::Reject),
+            ("\"needs_revision\"", Verdict::Reject),
+            ("\"needs revision\"", Verdict::Reject),
+            ("\"request-changes\"", Verdict::Reject),
+            ("\"CHANGES_REQUESTED\"", Verdict::Reject),
+            ("\"revise\"", Verdict::Reject),
+            ("\"accept\"", Verdict::Approve),
         ] {
             assert_eq!(serde_json::from_str::<Verdict>(s).unwrap(), v);
         }
