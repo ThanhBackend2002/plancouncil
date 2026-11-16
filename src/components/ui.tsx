@@ -12,10 +12,10 @@ export function cx(...parts: (string | false | null | undefined)[]): string {
 type Variant = "primary" | "danger" | "ghost" | "outline";
 
 const VARIANT: Record<Variant, string> = {
-  primary: "bg-violet-500 text-white hover:bg-violet-400 disabled:bg-violet-500/40",
-  danger: "bg-red-500/90 text-white hover:bg-red-500 disabled:bg-red-500/40",
-  ghost: "text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100",
-  outline: "border border-neutral-700 text-neutral-200 hover:bg-neutral-800 hover:border-neutral-600",
+  primary: "bg-accent text-on-accent hover:bg-accent-hover disabled:bg-accent/40",
+  danger: "bg-danger-solid text-on-accent hover:brightness-110 disabled:bg-danger-solid/40",
+  ghost: "text-fg-soft hover:bg-surface-2 hover:text-fg",
+  outline: "border border-line-strong text-fg-soft hover:bg-surface-2 hover:border-line-heavy",
 };
 
 export function Button({
@@ -26,6 +26,7 @@ export function Button({
   className,
   children,
   disabled,
+  title,
   ...rest
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: Variant;
@@ -33,20 +34,51 @@ export function Button({
   loading?: boolean;
   icon?: ReactNode;
 }) {
+  // Nút chỉ có icon: lấy `title` làm tên cho trình đọc màn hình nếu chưa có aria-label.
+  const iconOnly = children == null || children === false;
   return (
     <button
       type="button"
       disabled={disabled || loading}
+      title={title}
+      aria-label={rest["aria-label"] ?? (iconOnly ? title : undefined)}
+      aria-busy={loading || undefined}
       className={cx(
-        "inline-flex shrink-0 items-center justify-center gap-1.5 rounded-md font-medium transition-colors select-none",
+        "inline-flex shrink-0 items-center justify-center gap-1.5 rounded-control font-medium transition-colors select-none",
+        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent",
         "disabled:cursor-not-allowed disabled:opacity-60",
-        size === "sm" ? "h-7 px-2.5 text-xs" : "h-9 px-3.5 text-sm",
+        size === "sm" ? (iconOnly ? "size-7" : "h-7 px-2.5 text-xs") : iconOnly ? "size-9" : "h-9 px-3.5 text-sm",
         VARIANT[variant],
         className,
       )}
       {...rest}
     >
-      {loading ? <LoaderCircle className="size-4 animate-spin" /> : icon}
+      {loading ? <LoaderCircle className="size-4 animate-spin" aria-hidden /> : icon}
+      {children}
+    </button>
+  );
+}
+
+/** Nút chỉ có icon: bắt buộc `label` (vừa là aria-label vừa là tooltip). */
+export function IconButton({
+  label,
+  className,
+  children,
+  ...rest
+}: Omit<ButtonHTMLAttributes<HTMLButtonElement>, "aria-label" | "title"> & { label: string; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      className={cx(
+        "inline-flex shrink-0 items-center justify-center rounded-control text-fg-subtle transition-colors hover:bg-surface-2 hover:text-fg",
+        "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent",
+        "disabled:cursor-not-allowed disabled:opacity-60",
+        className,
+      )}
+      {...rest}
+    >
       {children}
     </button>
   );
@@ -70,7 +102,7 @@ export function StatusBadge({ status }: { status: Phase }) {
   const m = STATUS_META[status];
   return (
     <Badge tone={m.tone}>
-      {status === "running" && <span className="size-1.5 animate-pulse rounded-full bg-sky-400" />}
+      {status === "running" && <span className="size-1.5 animate-pulse rounded-full bg-info-solid" aria-hidden />}
       {m.label}
     </Badge>
   );
@@ -87,5 +119,5 @@ export function VerdictBadge({ verdict, carried }: { verdict: "APPROVE" | "REJEC
 }
 
 export function Panel({ className, children }: { className?: string; children: ReactNode }) {
-  return <section className={cx("rounded-xl border border-neutral-800 bg-neutral-900/40", className)}>{children}</section>;
+  return <section className={cx("rounded-panel border border-line bg-panel", className)}>{children}</section>;
 }

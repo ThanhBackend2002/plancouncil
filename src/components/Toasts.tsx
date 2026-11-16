@@ -4,10 +4,10 @@ import { useToast, type ToastTone } from "../store/toast";
 import { cx } from "./ui";
 
 const TONE: Record<ToastTone, { icon: typeof Info; cls: string }> = {
-  info: { icon: Info, cls: "text-sky-300" },
-  success: { icon: CircleCheck, cls: "text-emerald-300" },
-  warning: { icon: TriangleExclamationPoint, cls: "text-amber-300" },
-  error: { icon: CircleX, cls: "text-red-300" },
+  info: { icon: Info, cls: "text-info" },
+  success: { icon: CircleCheck, cls: "text-success" },
+  warning: { icon: TriangleExclamationPoint, cls: "text-warn" },
+  error: { icon: CircleX, cls: "text-danger" },
 };
 
 export function Toasts() {
@@ -25,20 +25,20 @@ export function Toasts() {
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, x: 24 }}
               transition={{ duration: 0.18 }}
-              className="pointer-events-auto flex gap-3 rounded-lg border border-neutral-800 bg-neutral-900/95 p-3 shadow-xl shadow-black/40 backdrop-blur"
+              className="pointer-events-auto flex gap-3 rounded-lg border border-line bg-surface/95 p-3 shadow-xl shadow-black/15 backdrop-blur dark:shadow-black/40"
               role={t.tone === "error" ? "alert" : "status"}
             >
               <Icon className={cx("mt-0.5 size-4 shrink-0", cls)} />
               <div className="min-w-0 flex-1">
-                <div className="text-sm font-medium text-neutral-100">{t.title}</div>
+                <div className="text-sm font-medium text-fg">{t.title}</div>
                 {t.message && (
-                  <div className="mt-0.5 line-clamp-4 text-xs break-words text-neutral-400">{t.message}</div>
+                  <div className="mt-0.5 line-clamp-4 text-xs break-words text-fg-muted">{t.message}</div>
                 )}
               </div>
               <button
                 type="button"
                 onClick={() => dismiss(t.id)}
-                className="shrink-0 self-start rounded p-0.5 text-neutral-500 hover:text-neutral-200"
+                className="shrink-0 self-start rounded p-0.5 text-fg-subtle hover:text-fg-soft"
                 aria-label="Đóng thông báo"
               >
                 <X className="size-3.5" />

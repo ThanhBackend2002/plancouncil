@@ -1,12 +1,216 @@
 @import "tailwindcss";
 
-@theme {
-  --font-sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Noto Sans", Ubuntu, sans-serif;
-  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, "Ubuntu Mono", ui-monospace, monospace;
+/* `dark:` theo theme của app (data-theme trên <html>), không theo hệ điều hành. */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* ───────────── Design tokens ─────────────
+ * Giá trị thật nằm ở biến CSS thô (--canvas, --fg…) trên <html>, đổi theo [data-theme].
+ * `@theme inline` sinh utility trỏ thẳng vào biến thô (bg-surface → var(--surface)), nên đổi theme
+ * không cần build lại CSS; modifier độ mờ (bg-surface/40) vẫn chạy nhờ color-mix.
+ * Tương phản WCAG AA đã kiểm cho fg/canvas, fg-muted/surface và từng màu ngữ nghĩa trên nền -subtle. */
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  /* Nền khung Panel: trong suốt nhẹ trên canvas ở dark, trắng đặc ở light. */
+  --color-panel: var(--panel);
+
+  --color-fg: var(--fg);
+  --color-fg-soft: var(--fg-soft);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-fg-faint: var(--fg-faint);
+
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-line-heavy: var(--line-heavy);
+
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-subtle: var(--accent-subtle);
+  --color-on-accent: var(--on-accent);
+
+  --color-success: var(--success);
+  --color-success-solid: var(--success-solid);
+  --color-success-subtle: var(--success-subtle);
+  --color-success-line: var(--success-line);
+  --color-warn: var(--warn);
+  --color-warn-solid: var(--warn-solid);
+  --color-warn-subtle: var(--warn-subtle);
+  --color-warn-line: var(--warn-line);
+  --color-danger: var(--danger);
+  --color-danger-solid: var(--danger-solid);
+  --color-danger-subtle: var(--danger-subtle);
+  --color-danger-line: var(--danger-line);
+  --color-info: var(--info);
+  --color-info-solid: var(--info-solid);
+  --color-info-subtle: var(--info-subtle);
+  --color-info-line: var(--info-line);
+
+  /* font-ui / font-code; font-sans / font-mono của Tailwind trỏ về cùng bộ font. */
+  --font-ui: var(--font-ui-stack);
+  --font-code: var(--font-code-stack);
+  --font-sans: var(--font-ui-stack);
+  --font-mono: var(--font-code-stack);
 }
 
+@theme {
+  /* rounded-control: nút, ô nhập, chip · rounded-panel: khung lớn. */
+  --radius-control: 0.375rem;
+  --radius-panel: 0.75rem;
+}
+
+/* Dark (mặc định): giữ nguyên giao diện cũ (palette neutral/violet của Tailwind). */
 :root {
   color-scheme: dark;
+  --font-ui-stack: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Noto Sans", Ubuntu, sans-serif;
+  --font-code-stack: "JetBrains Mono", "Cascadia Code", Consolas, "Ubuntu Mono", ui-monospace, monospace;
+
+  --canvas: #0a0a0a;
+  --surface: #171717;
+  --surface-2: #262626;
+  --surface-3: #404040;
+  --panel: rgb(23 23 23 / 0.4);
+
+  --fg: #f5f5f5;
+  --fg-soft: #d4d4d4;
+  --fg-muted: #a1a1a1;
+  /* Sáng hơn neutral-500 một chút để đạt AA (4.5:1) cả trên canvas lẫn surface. */
+  --fg-subtle: #808080;
+  /* Chỉ cho placeholder / chữ trang trí / trạng thái tắt. */
+  --fg-faint: #525252;
+
+  --line: #262626;
+  --line-strong: #404040;
+  --line-heavy: #525252;
+
+  /* Tối hơn violet-500 một chút để chữ trắng trên nút chính đạt AA. */
+  --accent: #8647f7;
+  --accent-hover: #8e51ff;
+  --accent-fg: #c4b4ff;
+  --accent-subtle: rgb(142 81 255 / 0.15);
+  --on-accent: #ffffff;
+
+  --success: #5ee9b5;
+  --success-solid: #00bc7d;
+  --success-subtle: rgb(0 188 125 / 0.12);
+  --success-line: rgb(0 188 125 / 0.3);
+  --warn: #ffd230;
+  --warn-solid: #fe9a00;
+  --warn-subtle: rgb(254 154 0 / 0.12);
+  --warn-line: rgb(254 154 0 / 0.3);
+  --danger: #ffa2a2;
+  --danger-solid: #e7000b;
+  --danger-subtle: rgb(251 44 54 / 0.12);
+  --danger-line: rgb(251 44 54 / 0.3);
+  --info: #74d4ff;
+  --info-solid: #00a6f4;
+  --info-subtle: rgb(0 166 244 / 0.12);
+  --info-line: rgb(0 166 244 / 0.3);
+
+  --selection: rgb(139 92 246 / 0.35);
+  --scrollbar: #3f3f46;
+  --code-bg: #0f0f12;
+  --inline-code-fg: #e9d5ff;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --canvas: #f5f5f5;
+  --surface: #ffffff;
+  --surface-2: #ececec;
+  --surface-3: #dcdcdc;
+  --panel: #ffffff;
+
+  --fg: #171717;
+  --fg-soft: #333333;
+  --fg-muted: #525252;
+  --fg-subtle: #6b6b6b;
+  --fg-faint: #a1a1a1;
+
+  --line: #e5e5e5;
+  --line-strong: #d4d4d4;
+  --line-heavy: #a3a3a3;
+
+  --accent: #7f22fe;
+  --accent-hover: #7008e7;
+  --accent-fg: #7008e7;
+  --accent-subtle: rgb(127 34 254 / 0.1);
+  --on-accent: #ffffff;
+
+  --success: #006c4c;
+  --success-solid: #009966;
+  --success-subtle: rgb(0 153 102 / 0.12);
+  --success-line: rgb(0 153 102 / 0.35);
+  --warn: #973c00;
+  --warn-solid: #e17100;
+  --warn-subtle: rgb(254 154 0 / 0.16);
+  --warn-line: rgb(225 113 0 / 0.4);
+  --danger: #c10007;
+  --danger-solid: #e7000b;
+  --danger-subtle: rgb(231 0 11 / 0.1);
+  --danger-line: rgb(231 0 11 / 0.3);
+  --info: #0069a8;
+  --info-solid: #0084d1;
+  --info-subtle: rgb(0 132 209 / 0.12);
+  --info-line: rgb(0 132 209 / 0.35);
+
+  --selection: rgb(127 34 254 / 0.2);
+  --scrollbar: #c4c4c4;
+  --code-bg: #f7f7f8;
+  --inline-code-fg: #6b21a8;
+}
+
+/* ── Lớp tương thích tạm thời (light theme) ──
+ * Các file chưa chuyển sang token (fields, ProvidersTab, ContextToolsTab, HistoryView,
+ * AppearanceEditor…) vẫn dùng neutral-* / màu 100–400 viết cho nền tối. Ở light theme ta đảo
+ * palette đó để chúng vẫn đọc được. Xoá khối này khi mọi file đã dùng token. */
+:root[data-theme="light"] {
+  --color-neutral-50: #0a0a0a;
+  --color-neutral-100: #171717;
+  --color-neutral-200: #333333;
+  --color-neutral-300: #404040;
+  --color-neutral-400: #525252;
+  --color-neutral-500: #6b6b6b;
+  --color-neutral-600: #a3a3a3;
+  --color-neutral-700: #d4d4d4;
+  --color-neutral-800: #e8e8e8;
+  --color-neutral-900: #fafafa;
+  --color-neutral-950: #ffffff;
+  --color-violet-200: var(--accent-fg);
+  --color-violet-300: var(--accent-fg);
+  --color-violet-400: var(--accent-fg);
+  --color-emerald-200: var(--success);
+  --color-emerald-300: var(--success);
+  --color-emerald-400: var(--success);
+  --color-amber-200: var(--warn);
+  --color-amber-300: var(--warn);
+  --color-amber-400: var(--warn);
+  --color-red-200: var(--danger);
+  --color-red-300: var(--danger);
+  --color-red-400: var(--danger);
+  --color-sky-300: var(--info);
+  --color-sky-400: var(--info);
+}
+/* Phòng họp pixel luôn là "căn phòng" tối: trả palette gốc cho cảnh (bọc bằng [data-scene]). */
+:root[data-theme="light"] [data-scene] {
+  --color-neutral-50: oklch(98.5% 0 0);
+  --color-neutral-100: oklch(97% 0 0);
+  --color-neutral-200: oklch(92.2% 0 0);
+  --color-neutral-300: oklch(87% 0 0);
+  --color-neutral-400: oklch(70.8% 0 0);
+  --color-neutral-500: oklch(55.6% 0 0);
+  --color-neutral-600: oklch(43.9% 0 0);
+  --color-neutral-700: oklch(37.1% 0 0);
+  --color-neutral-800: oklch(26.9% 0 0);
+  --color-neutral-900: oklch(20.5% 0 0);
+  --color-neutral-950: oklch(14.5% 0 0);
+  --color-emerald-400: oklch(76.5% 0.177 163.223);
+  --color-amber-400: oklch(82.8% 0.189 84.429);
+  --color-red-400: oklch(70.4% 0.191 22.216);
 }
 
 html,
@@ -17,21 +221,25 @@ body,
 
 body {
   overflow: hidden;
-  font-family: var(--font-sans);
+  font-family: var(--font-ui-stack);
   font-size: 14px;
+  background: var(--canvas);
+  color: var(--fg);
 }
 
 ::selection {
-  background: rgb(139 92 246 / 0.35);
+  background: var(--selection);
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: #3f3f46 transparent;
+  scrollbar-color: var(--scrollbar) transparent;
 }
 
+/* Vòng focus chung (≥3:1 trên canvas/surface ở cả hai theme). Không nằm trong @layer nên
+ * thắng cả `focus:outline-none` của utility → mọi phần tử tương tác đều có focus nhìn thấy được. */
 :focus-visible {
-  outline: 2px solid rgb(167 139 250 / 0.7);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -43,7 +251,7 @@ body {
 .stream-caret::after {
   content: "▍";
   margin-left: 2px;
-  color: #a78bfa;
+  color: var(--accent-fg);
   animation: caret-blink 1s steps(1) infinite;
 }
 
@@ -134,21 +342,40 @@ body {
   animation: px-pop 0.18s steps(3) both;
 }
 
+/* Giảm chuyển động: theo lựa chọn trong Cài đặt → Giao diện (data-motion trên <html>);
+ * media query chỉ là dự phòng trước khi JS gắn data-motion. */
+:root[data-motion="reduce"] *,
+:root[data-motion="reduce"] ::before,
+:root[data-motion="reduce"] ::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+/* Không để nhân vật kẹt ở khung "nhắm mắt" khi tắt animation. */
+:root[data-motion="reduce"] .px-blink {
+  animation: none !important;
+  opacity: 0;
+}
+:root[data-motion="reduce"] .px-talk,
+:root[data-motion="reduce"] .px-dot {
+  animation: none !important;
+  opacity: 1;
+}
 @media (prefers-reduced-motion: reduce) {
-  *,
-  ::before,
-  ::after {
+  :root:not([data-motion]) *,
+  :root:not([data-motion]) ::before,
+  :root:not([data-motion]) ::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
-  /* Không để nhân vật kẹt ở khung "nhắm mắt" khi tắt animation. */
-  .px-blink {
+  :root:not([data-motion]) .px-blink {
     animation: none !important;
     opacity: 0;
   }
-  .px-talk,
-  .px-dot {
+  :root:not([data-motion]) .px-talk,
+  :root:not([data-motion]) .px-dot {
     animation: none !important;
     opacity: 1;
   }
@@ -157,7 +384,7 @@ body {
 /* ───────────── Markdown của plan ───────────── */
 .plan-md {
   line-height: 1.7;
-  color: #d4d4d8;
+  color: var(--fg-soft);
   overflow-wrap: anywhere;
 }
 .plan-md > * + * {
@@ -166,7 +393,7 @@ body {
 .plan-md h1 {
   font-size: 1.6rem;
   font-weight: 650;
-  color: #fafafa;
+  color: var(--fg);
   letter-spacing: -0.01em;
 }
 .plan-md h2 {
@@ -174,8 +401,8 @@ body {
   padding-bottom: 0.35em;
   font-size: 1.25rem;
   font-weight: 620;
-  color: #fafafa;
-  border-bottom: 1px solid #27272a;
+  color: var(--fg);
+  border-bottom: 1px solid var(--line);
 }
 .plan-md h2:first-child {
   margin-top: 0;
@@ -184,19 +411,19 @@ body {
   margin-top: 1.5em;
   font-size: 1.05rem;
   font-weight: 600;
-  color: #e4e4e7;
+  color: var(--fg);
 }
 .plan-md h4 {
   margin-top: 1.2em;
   font-weight: 600;
-  color: #e4e4e7;
+  color: var(--fg);
 }
 .plan-md strong {
-  color: #fafafa;
+  color: var(--fg);
   font-weight: 600;
 }
 .plan-md a {
-  color: #a78bfa;
+  color: var(--accent-fg);
   text-decoration: underline;
   text-underline-offset: 2px;
 }
@@ -218,34 +445,34 @@ body {
   margin-top: 0.25em;
 }
 .plan-md li::marker {
-  color: #71717a;
+  color: var(--fg-subtle);
 }
 .plan-md blockquote {
-  border-left: 3px solid #3f3f46;
+  border-left: 3px solid var(--line-strong);
   padding-left: 1em;
-  color: #a1a1aa;
+  color: var(--fg-muted);
 }
 .plan-md hr {
   border: 0;
-  border-top: 1px solid #27272a;
+  border-top: 1px solid var(--line);
   margin: 2em 0;
 }
 .plan-md :not(pre) > code {
-  font-family: var(--font-mono);
+  font-family: var(--font-code-stack);
   font-size: 0.85em;
   padding: 0.15em 0.4em;
   border-radius: 4px;
-  background: #27272a;
-  color: #e9d5ff;
+  background: var(--surface-2);
+  color: var(--inline-code-fg);
 }
 .plan-md pre {
-  font-family: var(--font-mono);
+  font-family: var(--font-code-stack);
   font-size: 0.82rem;
   line-height: 1.6;
   padding: 0.9em 1em;
   border-radius: 8px;
-  background: #0f0f12;
-  border: 1px solid #27272a;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
   overflow-x: auto;
 }
 .plan-md table {
@@ -258,19 +485,20 @@ body {
 }
 .plan-md th,
 .plan-md td {
-  border: 1px solid #27272a;
+  border: 1px solid var(--line);
   padding: 0.45em 0.75em;
   text-align: left;
   vertical-align: top;
 }
 .plan-md th {
-  background: #18181b;
-  color: #fafafa;
+  background: var(--surface);
+  color: var(--fg);
   font-weight: 600;
 }
 .plan-md tr:nth-child(even) td {
-  background: rgb(24 24 27 / 0.5);
+  background: color-mix(in srgb, var(--surface) 50%, transparent);
 }
 .plan-md input[type="checkbox"] {
   margin-right: 0.4em;
+  accent-color: var(--accent);
 }

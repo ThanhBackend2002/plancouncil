@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
   Activity,
@@ -62,18 +62,43 @@ export function PromptPanel() {
   const [proposing, setProposing] = useState(false);
   const running = liveStatus === "running";
   const mode = config?.meeting.staffing ?? "manual";
+  /** Hàm bắt đầu mới nhất cho phím tắt toàn cục (gán lại mỗi lần render bên dưới). */
+  const startRef = useRef<() => void>(() => {});
+
+  // Phím tắt ở tab Phòng họp (tạm đặt tại đây; sẽ chuyển sang lib/useHotkeys.ts):
+  // Ctrl/⌘+Enter = bắt đầu họp từ bất kỳ đâu · Esc = dừng phiên đang chạy (có xác nhận).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing || useUi.getState().tab !== "council") return;
+      const st = useCouncil.getState();
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        if (st.viewing || st.live.status === "running") return;
+        e.preventDefault();
+        startRef.current();
+      } else if (e.key === "Escape") {
+        if (st.viewing || st.live.status !== "running" || st.stopping) return;
+        // Esc trong hộp thoại / dropdown để chúng tự xử lý (đóng), không dừng họp.
+        const t = e.target instanceof Element ? e.target : null;
+        if (t?.closest('[role="dialog"],[role="listbox"],[role="combobox"],[aria-expanded="true"]')) return;
+        e.preventDefault();
+        if (window.confirm("Dừng cuộc họp đang chạy? Các vòng đang dở sẽ bị huỷ.")) void st.stop();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   if (viewing) {
     return (
       <Panel className="shrink-0 p-3">
-        <div className="mb-2 flex items-center gap-2 text-xs text-amber-300">
+        <div className="mb-2 flex items-center gap-2 text-xs text-warn">
           <Eye className="size-4" />
           <span>Đang xem phiên cũ ({formatDate(viewing.createdAt)}), chỉ xem</span>
           <span className="ml-auto">
             <StatusBadge status={viewing.status} />
           </span>
         </div>
-        <p className="max-h-24 overflow-y-auto rounded-md bg-neutral-950/60 p-2.5 text-sm whitespace-pre-wrap text-neutral-300">
+        <p className="max-h-24 overflow-y-auto rounded-control bg-canvas/60 p-2.5 text-sm whitespace-pre-wrap text-fg-soft">
           {viewing.prompt}
         </p>
         <div className="mt-2 flex gap-2">
@@ -140,10 +165,11 @@ export function PromptPanel() {
       void launch();
     }
   };
+  startRef.current = onStart;
 
   return (
     <Panel className="shrink-0 p-3">
-      <label htmlFor="prompt" className="mb-1.5 block text-xs font-medium text-neutral-400">
+      <label htmlFor="prompt" className="mb-1.5 block text-xs font-medium text-fg-muted">
         Yêu cầu
       </label>
       <textarea
@@ -159,7 +185,7 @@ export function PromptPanel() {
         }}
         rows={3}
         placeholder="Ví dụ: Thiết kế hệ thống leaderboard realtime cho game 1 triệu người chơi đồng thời, có quảng cáo thưởng và IAP…"
-        className="w-full resize-none rounded-md border border-neutral-800 bg-neutral-950/70 px-3 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-violet-500/60 focus:outline-none read-only:text-neutral-400"
+        className="w-full resize-none rounded-control border border-line bg-canvas/70 px-3 py-2 text-sm text-fg placeholder:text-fg-subtle focus:border-accent/60 focus:outline-none read-only:text-fg-muted"
       />
       <div className="mt-2 flex items-center gap-2">
         {running ? (
@@ -185,11 +211,11 @@ export function PromptPanel() {
           </Button>
         )}
         {!running && (
-          <span className="hidden items-center gap-1 text-[11px] text-neutral-600 xl:inline-flex">
+          <span className="hidden items-center gap-1 text-[11px] text-fg-subtle xl:inline-flex">
             <CornerDownLeft className="size-3" /> Ctrl+Enter
           </span>
         )}
-        <span className={`ml-auto text-[11px] tabular-nums ${tooLong ? "text-red-400" : "text-neutral-600"}`}>
+        <span className={`ml-auto text-[11px] tabular-nums ${tooLong ? "text-danger" : "text-fg-subtle"}`}>
           {value.length.toLocaleString("vi-VN")}/{MAX_PROMPT_CHARS.toLocaleString("vi-VN")}
         </span>
       </div>
@@ -205,7 +231,7 @@ export function PromptPanel() {
       )}
       <QuickConfig disabled={running} />
       {liveStatus === "failed" && liveError && (
-        <p className="mt-2 rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs break-words text-red-300">
+        <p className="mt-2 rounded-control border border-danger-line bg-danger-subtle p-2 text-xs break-words text-danger">
           {liveError}
         </p>
       )}
@@ -242,35 +268,35 @@ function StaffingPanel({
   const chosen = reviewers.filter((id) => id !== chair);
 
   return (
-    <div className="mt-3 rounded-lg border border-violet-500/30 bg-violet-500/5 p-3 text-xs">
+    <div className="mt-3 rounded-lg border border-accent/30 bg-accent/5 p-3 text-xs">
       <div className="mb-2 flex items-center gap-2">
-        <WandSparkles className="size-4 text-violet-300" />
-        <span className="font-medium text-neutral-100">Thành phần họp đề xuất</span>
-        <span className="text-neutral-500">· tốn ~{formatTokens(proposal.tokens)} token</span>
+        <WandSparkles className="size-4 text-accent-fg" />
+        <span className="font-medium text-fg">Thành phần họp đề xuất</span>
+        <span className="text-fg-subtle">· tốn ~{formatTokens(proposal.tokens)} token</span>
       </div>
-      {(s.fallback || s.note) && <p className="mb-2 text-amber-300">{s.note || "Dùng thành phần mặc định."}</p>}
+      {(s.fallback || s.note) && <p className="mb-2 text-warn">{s.note || "Dùng thành phần mặc định."}</p>}
 
       <div className="mb-2 flex items-center gap-2">
-        <span className="w-20 shrink-0 text-neutral-500">Chủ trì</span>
+        <span className="w-20 shrink-0 text-fg-subtle">Chủ trì</span>
         <PixelPortrait meta={resolve(chair)} size={20} />
         <span className="w-48">
           <RoleSelect roles={usable} value={chair} onChange={setChair} />
         </span>
-        {s.reasons[chair] && <span className="truncate text-neutral-500">{s.reasons[chair]}</span>}
+        {s.reasons[chair] && <span className="truncate text-fg-subtle">{s.reasons[chair]}</span>}
       </div>
 
       <div className="mb-2 flex items-start gap-2">
-        <span className="w-20 shrink-0 pt-1 text-neutral-500">Reviewer</span>
+        <span className="w-20 shrink-0 pt-1 text-fg-subtle">Reviewer</span>
         <div className="min-w-0 flex-1 space-y-1">
           {all.map((id) => {
             const on = reviewers.includes(id);
             const m = resolve(id);
             return (
               <label key={id} className={cx("flex cursor-pointer items-center gap-2", !on && "opacity-50")}>
-                <input type="checkbox" checked={on} onChange={() => toggle(id)} className="accent-violet-500" />
+                <input type="checkbox" checked={on} onChange={() => toggle(id)} className="accent-accent" />
                 <PixelPortrait meta={m} size={18} />
                 <b style={{ color: m.color }}>{m.name}</b>
-                <span className="truncate text-neutral-500">{s.reasons[id] ?? (extra.includes(id) ? "bạn thêm" : "")}</span>
+                <span className="truncate text-fg-subtle">{s.reasons[id] ?? (extra.includes(id) ? "bạn thêm" : "")}</span>
               </label>
             );
           })}
@@ -291,7 +317,7 @@ function StaffingPanel({
 
       {config.departments.length > 0 && (
         <div className="mb-3 flex items-start gap-2">
-          <span className="w-20 shrink-0 pt-0.5 text-neutral-500">Phòng ban</span>
+          <span className="w-20 shrink-0 pt-0.5 text-fg-subtle">Phòng ban</span>
           <div className="flex flex-wrap gap-1">
             {config.departments.map((d) => {
               const on = depts.includes(d.id);
@@ -304,14 +330,14 @@ function StaffingPanel({
                   onClick={() => setDepts((x) => (on ? x.filter((y) => y !== d.id) : config.departments.map((z) => z.id).filter((z) => z === d.id || x.includes(z))))}
                   className={cx(
                     "rounded-full border px-2 py-0.5",
-                    on ? "border-violet-500/60 bg-violet-500/15 text-violet-200" : "border-neutral-700 text-neutral-500 hover:text-neutral-300",
+                    on ? "border-accent/60 bg-accent-subtle text-accent-fg" : "border-line-strong text-fg-subtle hover:text-fg-soft",
                   )}
                 >
                   {d.name}
                 </button>
               );
             })}
-            {depts.length === 0 && <span className="text-neutral-600">không cần phòng ban nào họp trước</span>}
+            {depts.length === 0 && <span className="text-fg-subtle">không cần phòng ban nào họp trước</span>}
           </div>
         </div>
       )}
@@ -362,7 +388,7 @@ function MeetingHealth({ roleIds, disabled }: { roleIds: RoleId[]; disabled: boo
         Kiểm tra model ({roleIds.length} role)
       </Button>
       {!busy && results.length > 0 && bad.length === 0 && (
-        <span className="inline-flex items-center gap-1 text-emerald-300">
+        <span className="inline-flex items-center gap-1 text-success">
           <CircleCheck className="size-3.5" /> {results.length}/{roleIds.length} role sẵn sàng
         </span>
       )}
@@ -372,7 +398,7 @@ function MeetingHealth({ roleIds, disabled }: { roleIds: RoleId[]; disabled: boo
             key={id}
             type="button"
             onClick={() => setTab("settings")}
-            className="inline-flex items-center gap-1 rounded-full border border-red-500/30 bg-red-500/10 py-0.5 pr-2 pl-0.5 text-red-200 hover:bg-red-500/15"
+            className="inline-flex items-center gap-1 rounded-full border border-danger-line bg-danger-subtle py-0.5 pr-2 pl-0.5 text-danger hover:bg-danger-subtle"
             title={`${HEALTH_META[h.status].hint}\n${h.message}`}
           >
             <PixelPortrait meta={resolve(id)} size={16} />
@@ -397,14 +423,14 @@ function SessionOptionsRow({ disabled }: { disabled: boolean }) {
   const toolsOff = config.tool_policy === "off";
 
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-neutral-400">
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-fg-muted">
       <label className="inline-flex items-center gap-1.5" title="Cho các role đọc code của dự án (chỉ đọc) để plan bám sát dự án thật">
         <FolderOpen className="size-3.5" />
         <select
           value={opts.workspace_id ?? ""}
           disabled={disabled}
           onChange={(e) => set({ workspace_id: e.target.value || null })}
-          className="max-w-[180px] rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 text-neutral-200"
+          className="max-w-[180px] rounded border border-line-strong bg-surface px-1.5 py-0.5 text-fg-soft"
         >
           <option value="">Không dùng workspace</option>
           {config.workspaces.map((w) => (
@@ -414,7 +440,7 @@ function SessionOptionsRow({ disabled }: { disabled: boolean }) {
           ))}
         </select>
         {config.workspaces.length === 0 && (
-          <button type="button" onClick={() => setTab("settings")} className="text-sky-400 hover:text-sky-300">
+          <button type="button" onClick={() => setTab("settings")} className="text-info hover:text-info">
             + thêm
           </button>
         )}
@@ -425,7 +451,7 @@ function SessionOptionsRow({ disabled }: { disabled: boolean }) {
           checked={opts.web_search}
           disabled={disabled}
           onChange={(e) => set({ web_search: e.target.checked })}
-          className="accent-violet-500"
+          className="accent-accent"
         />
         <Globe className="size-3.5" /> Tìm web
       </label>
@@ -442,7 +468,7 @@ function SessionOptionsRow({ disabled }: { disabled: boolean }) {
           checked={hasContext && opts.company_context}
           disabled={disabled || !hasContext}
           onChange={(e) => set({ company_context: e.target.checked })}
-          className="accent-violet-500"
+          className="accent-accent"
         />
         <Building className="size-3.5" /> Bối cảnh công ty
       </label>
@@ -452,7 +478,7 @@ function SessionOptionsRow({ disabled }: { disabled: boolean }) {
           value={opts.plan_depth ?? config.meeting.plan_depth}
           disabled={disabled}
           onChange={(e) => set({ plan_depth: e.target.value as PlanDepth })}
-          className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 text-neutral-200"
+          className="rounded border border-line-strong bg-surface px-1.5 py-0.5 text-fg-soft"
         >
           <option value="mvp">MVP</option>
           <option value="standard">Vừa đủ</option>
@@ -460,10 +486,10 @@ function SessionOptionsRow({ disabled }: { disabled: boolean }) {
         </select>
       </label>
       {(opts.workspace_id || opts.web_search) && toolsOff && (
-        <span className="text-amber-400">Công cụ đang tắt (Cài đặt → Bối cảnh & Công cụ), role chỉ thấy tổng quan workspace.</span>
+        <span className="text-warn">Công cụ đang tắt (Cài đặt → Bối cảnh & Công cụ), role chỉ thấy tổng quan workspace.</span>
       )}
       {nextOptions && (
-        <button type="button" onClick={() => setNextOptions(null)} className="text-sky-400 hover:text-sky-300">
+        <button type="button" onClick={() => setNextOptions(null)} className="text-info hover:text-info">
           về mặc định
         </button>
       )}
@@ -496,11 +522,11 @@ function QuickConfig({ disabled }: { disabled: boolean }) {
   const chair = resolve(config.meeting.chair_id);
 
   return (
-    <div className="mt-3 space-y-2.5 border-t border-neutral-800 pt-2.5">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-neutral-400">
+    <div className="mt-3 space-y-2.5 border-t border-line pt-2.5">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-fg-muted">
         <span className="inline-flex min-w-0 items-center gap-1.5" title={`Chủ trì: ${chair.name} · ${chair.model}`}>
           <PixelPortrait meta={chair} size={18} />
-          Chủ trì <b className="truncate text-neutral-200">{chair.name}</b>
+          Chủ trì <b className="truncate text-fg-soft">{chair.name}</b>
           <span className="flex -space-x-1">
             {config.meeting.reviewer_ids.slice(0, 6).map((id) => (
               <span key={id} title={resolve(id).name}>
@@ -508,7 +534,7 @@ function QuickConfig({ disabled }: { disabled: boolean }) {
               </span>
             ))}
           </span>
-          <span className="text-neutral-500">{config.meeting.reviewer_ids.length} reviewer</span>
+          <span className="text-fg-subtle">{config.meeting.reviewer_ids.length} reviewer</span>
         </span>
         <label className="inline-flex items-center gap-1.5">
           Số vòng
@@ -516,7 +542,7 @@ function QuickConfig({ disabled }: { disabled: boolean }) {
             value={config.max_rounds}
             disabled={saving || disabled}
             onChange={(e) => void update({ max_rounds: Number(e.target.value) })}
-            className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 text-neutral-200"
+            className="rounded border border-line-strong bg-surface px-1.5 py-0.5 text-fg-soft"
           >
             {Array.from({ length: 10 }, (_, i) => i + 1).map((n) => (
               <option key={n} value={n}>
@@ -531,14 +557,14 @@ function QuickConfig({ disabled }: { disabled: boolean }) {
             checked={config.stream_plans}
             disabled={saving || disabled}
             onChange={(e) => void update({ stream_plans: e.target.checked })}
-            className="accent-violet-500"
+            className="accent-accent"
           />
           Stream plan
         </label>
         <button
           type="button"
           onClick={() => setTab("settings")}
-          className="ml-auto inline-flex items-center gap-1 text-neutral-400 hover:text-neutral-100"
+          className="ml-auto inline-flex items-center gap-1 text-fg-muted hover:text-fg"
         >
           <Settings className="size-3.5" /> Cài đặt
         </button>
@@ -548,11 +574,11 @@ function QuickConfig({ disabled }: { disabled: boolean }) {
 
       {config.departments.length > 0 && (
         <div>
-          <div className="mb-1 flex items-center gap-1.5 text-[11px] text-neutral-500">
+          <div className="mb-1 flex items-center gap-1.5 text-[11px] text-fg-subtle">
             <Network className="size-3.5" />
             Phòng ban họp trước ({selected.length}/{config.departments.length})
             {nextDepartments && (
-              <button type="button" onClick={() => setNextDepartments(null)} className="ml-1 text-sky-400 hover:text-sky-300">
+              <button type="button" onClick={() => setNextDepartments(null)} className="ml-1 text-info hover:text-info">
                 về mặc định
               </button>
             )}
@@ -571,8 +597,8 @@ function QuickConfig({ disabled }: { disabled: boolean }) {
                   className={cx(
                     "rounded-full border px-2 py-0.5 text-[11px] transition-colors disabled:opacity-50",
                     on
-                      ? "border-violet-500/60 bg-violet-500/15 text-violet-200"
-                      : "border-neutral-700 text-neutral-400 hover:border-neutral-600 hover:text-neutral-200",
+                      ? "border-accent/60 bg-accent-subtle text-accent-fg"
+                      : "border-line-strong text-fg-muted hover:border-line-heavy hover:text-fg-soft",
                   )}
                 >
                   {d.name}
@@ -589,7 +615,7 @@ function QuickConfig({ disabled }: { disabled: boolean }) {
         <button
           type="button"
           onClick={() => setTab("settings")}
-          className="flex w-full items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-left text-xs text-amber-200 hover:bg-amber-500/15"
+          className="flex w-full items-center gap-2 rounded-control border border-warn-line bg-warn-subtle px-2.5 py-1.5 text-left text-xs text-warn hover:bg-warn-subtle"
         >
           <KeyRound className="size-3.5 shrink-0" />
           Có role tham gia chưa có provider, model hoặc API key. Bấm để mở Cài đặt.
