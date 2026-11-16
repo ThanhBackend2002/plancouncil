@@ -1,5 +1,5 @@
 import { memo, useMemo } from "react";
-import { makeSprite, SPRITE_W, type Rect } from "../lib/pixel";
+import { makeSprite, resolveLook, SPRITE_W, type Rect } from "../lib/pixel";
 import type { RoleMeta } from "../lib/agents";
 import type { AgentStatus } from "../store/session";
 
@@ -21,7 +21,10 @@ const delayOf = (id: string) => {
 
 export type Marker = "approve" | "reject" | "error" | null;
 
-/** Nhân vật trong cảnh SVG. (x, y) = góc trên-trái sprite, đơn vị pixel logic của cảnh. */
+/**
+ * Nhân vật trong cảnh SVG. (x, y) = góc trên-trái sprite, đơn vị pixel logic của cảnh.
+ * Vị trí đặt bằng CSS transform + transition → đổi (x, y) là nhân vật "đi bộ" tới chỗ mới.
+ */
 export const PixelCharacter = memo(function PixelCharacter({
   meta,
   x,
@@ -30,6 +33,9 @@ export const PixelCharacter = memo(function PixelCharacter({
   speaking,
   marker,
   dimmed,
+  walking,
+  celebrating,
+  typing,
 }: {
   meta: RoleMeta;
   x: number;
@@ -38,20 +44,35 @@ export const PixelCharacter = memo(function PixelCharacter({
   speaking: boolean;
   marker: Marker;
   dimmed?: boolean;
+  /** Đang đi (bước nhanh, không hiện dấu trên đầu). */
+  walking?: boolean;
+  /** Ăn mừng: nhảy lên, giơ hai tay. */
+  celebrating?: boolean;
+  /** Đang viết plan: laptop trước mặt. */
+  typing?: boolean;
 }) {
   const sprite = useMemo(
     () => makeSprite({ id: meta.id, color: meta.color, level: meta.level, icon: meta.iconKey, appearance: meta.appearance }),
     [meta.id, meta.color, meta.level, meta.iconKey, meta.appearance],
   );
+  const look = useMemo(
+    () => resolveLook({ id: meta.id, color: meta.color, level: meta.level, icon: meta.iconKey, appearance: meta.appearance }),
+    [meta.id, meta.color, meta.level, meta.iconKey, meta.appearance],
+  );
   const thinking = status === "thinking";
   const delay = delayOf(meta.id);
+  const bob = celebrating ? "px-jump" : thinking || walking ? "px-bob-fast" : "px-bob";
+  // REJECT = giơ tay phát biểu; ăn mừng = giơ cả hai tay.
+  const raise = celebrating ? "both" : !thinking && !walking && marker === "reject" ? "right" : null;
 
   return (
-    <g transform={`translate(${x} ${y})`} opacity={dimmed ? 0.55 : 1}>
+    <g className="px-move" style={{ transform: `translate(${x}px, ${y}px)` }} opacity={dimmed ? 0.55 : 1}>
       {/* bóng dưới chân */}
       <rect x={3} y={23} width={10} height={1} fill="#000" opacity={0.25} />
-      <g className={thinking ? "px-bob-fast" : "px-bob"} style={{ animationDelay: delay }}>
+      <g className={bob} style={{ animationDelay: celebrating ? `${Math.abs(parseInt(delay)) % 300}ms` : delay }}>
         <Rects rects={sprite.body} />
+        {raise && <RaisedArm skin={look.skin} sleeve={look.outfitColor} side="right" />}
+        {raise === "both" && <RaisedArm skin={look.skin} sleeve={look.outfitColor} side="left" />}
         <g className="px-blink" style={{ animationDelay: delay }}>
           <Rects rects={sprite.blink} />
         </g>
@@ -60,12 +81,37 @@ export const PixelCharacter = memo(function PixelCharacter({
             <Rects rects={sprite.mouthOpen} />
           </g>
         )}
-        {thinking && <ThinkingCloud />}
-        {!thinking && marker && <MarkerIcon marker={marker} />}
+        {thinking && !typing && <ThinkingCloud />}
+        {!thinking && !walking && !celebrating && marker && <MarkerIcon marker={marker} />}
       </g>
+      {typing && <Laptop />}
     </g>
   );
 });
+
+/** Cánh tay giơ lên cạnh vai (sprite rộng 16: thân ~x 3..12). */
+function RaisedArm({ skin, sleeve, side }: { skin: string; sleeve: string; side: "left" | "right" }) {
+  const x = side === "right" ? 13 : 1;
+  return (
+    <g className="px-wave">
+      <rect x={x} y={9} width={2} height={5} fill={sleeve} />
+      <rect x={x} y={6} width={2} height={3} fill={skin} />
+      <rect x={x} y={5} width={2} height={1} fill={skin} opacity={0.85} />
+    </g>
+  );
+}
+
+/** Laptop đặt trước người viết plan: màn hình nhấp nháy như đang gõ. */
+function Laptop() {
+  return (
+    <g transform="translate(12 13)">
+      <rect x={0} y={0} width={9} height={6} fill="#334155" />
+      <rect x={1} y={1} width={7} height={4} fill="#38bdf8" />
+      <rect x={2} y={2} width={4} height={1} fill="#e0f2fe" className="px-dot" />
+      <rect x={-1} y={6} width={11} height={1} fill="#1e293b" />
+    </g>
+  );
+}
 
 /** Đám mây "..." phía trên đầu khi đang suy nghĩ. */
 function ThinkingCloud() {

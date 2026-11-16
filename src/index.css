@@ -293,6 +293,89 @@ body {
   animation: px-pop 0.18s steps(3) both;
 }
 
+/* Đi lại trong cảnh: vị trí đặt bằng CSS transform (đơn vị = pixel logic của viewBox) → đổi chỗ là "đi bộ". */
+.px-move {
+  transition: transform 1.4s steps(14, end);
+}
+.px-move-slow {
+  transition: transform 1.6s steps(16, end);
+}
+@keyframes px-jump {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  30% {
+    transform: translateY(-4px);
+  }
+  60% {
+    transform: translateY(-1px);
+  }
+}
+.px-jump {
+  animation: px-jump 0.6s steps(3) infinite;
+}
+@keyframes px-wave {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-1px);
+  }
+}
+.px-wave {
+  animation: px-wave 0.5s steps(1) infinite;
+}
+/* Pháo giấy khi hội tụ: mỗi mảnh rơi từ trên xuống, xoay theo bậc. */
+@keyframes px-confetti {
+  from {
+    transform: translateY(-10%) rotate(0deg);
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  to {
+    transform: translateY(110%) rotate(540deg);
+    opacity: 0;
+  }
+}
+.px-confetti {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  pointer-events: none;
+}
+.px-confetti > i {
+  display: block;
+  width: 5px;
+  height: 5px;
+  animation: px-confetti 2.4s steps(24) both;
+}
+@keyframes px-banner {
+  0% {
+    scale: 0.6;
+    opacity: 0;
+  }
+  15%,
+  85% {
+    scale: 1;
+    opacity: 1;
+  }
+  100% {
+    scale: 1;
+    opacity: 0;
+  }
+}
+.px-banner {
+  animation: px-banner 3.6s steps(18) both;
+}
+.px-room:hover .px-room-hl,
+.px-room:focus-visible .px-room-hl {
+  opacity: 1;
+}
+
 /* Giảm chuyển động: theo lựa chọn trong Cài đặt → Giao diện (data-motion trên <html>);
  * media query chỉ là dự phòng trước khi JS gắn data-motion. */
 :root[data-motion="reduce"] *,
@@ -313,6 +396,13 @@ body {
   animation: none !important;
   opacity: 1;
 }
+/* Băng rôn "HỘI TỤ" vẫn hiện (tĩnh); pháo giấy thì tắt hẳn. */
+:root[data-motion="reduce"] .px-banner {
+  animation: none !important;
+}
+:root[data-motion="reduce"] .px-confetti {
+  display: none;
+}
 @media (prefers-reduced-motion: reduce) {
   :root:not([data-motion]) *,
   :root:not([data-motion]) ::before,
@@ -329,6 +419,12 @@ body {
   :root:not([data-motion]) .px-dot {
     animation: none !important;
     opacity: 1;
+  }
+  :root:not([data-motion]) .px-banner {
+    animation: none !important;
+  }
+  :root:not([data-motion]) .px-confetti {
+    display: none;
   }
 }
 
