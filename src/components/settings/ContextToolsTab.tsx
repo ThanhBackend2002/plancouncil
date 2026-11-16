@@ -225,9 +225,29 @@ export function ContextToolsTab({
             </button>
           ))}
         </div>
-        <div className="mt-3 w-60">
-          <Field label="Số lần gọi công cụ tối đa / lần nghiên cứu" error={errors["context.max_tool_steps"]} hint="1–12">
-            <NumberInput value={draft.max_tool_steps} onChange={(v) => set({ max_tool_steps: v ?? Number.NaN })} />
+        <div className="mt-3 w-72">
+          <Field
+            label="Số lần gọi công cụ tối đa / lần nghiên cứu"
+            error={errors["context.max_tool_steps"]}
+            hint={draft.max_tool_steps === 0 ? "Không giới hạn — chặn an toàn ở 50 lượt" : "1–12"}
+          >
+            <div className="flex items-center gap-3">
+              {draft.max_tool_steps === 0 ? (
+                <div className="flex-1 rounded-md border border-line px-2.5 py-1.5 text-sm text-fg-muted">Không giới hạn</div>
+              ) : (
+                <div className="flex-1">
+                  <NumberInput value={draft.max_tool_steps} onChange={(v) => set({ max_tool_steps: v ?? Number.NaN })} />
+                </div>
+              )}
+              <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-xs text-fg-muted">
+                <input
+                  type="checkbox"
+                  checked={draft.max_tool_steps === 0}
+                  onChange={(e) => set({ max_tool_steps: e.target.checked ? 0 : 6 })}
+                />
+                Không giới hạn
+              </label>
+            </div>
           </Field>
         </div>
         <p className="mt-2 text-[11px] text-fg-subtle">

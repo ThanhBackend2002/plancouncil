@@ -451,7 +451,8 @@ pub struct AppConfig {
     pub workspaces: Vec<Workspace>,
     pub web_search: WebSearchConfig,
     pub tool_policy: ToolPolicy,
-    /// Số lượt gọi công cụ tối đa mỗi lần nghiên cứu.
+    /// Số lượt gọi công cụ tối đa mỗi lần nghiên cứu (1..=12); 0 = không giới hạn
+    /// (vẫn dừng khi model tự viết ghi chú, hết ngân sách token, bị dừng, hoặc chạm chặn an toàn).
     pub max_tool_steps: u32,
     /// Bảng giá model để ước tính chi phí (mặc định rỗng → chi phí `null`).
     pub pricing: Pricing,
@@ -623,8 +624,8 @@ impl AppConfig {
         if self.max_tokens == Some(0) {
             errs.push("max_tokens phải ≥ 1 hoặc để trống".to_owned());
         }
-        if !(1..=12).contains(&self.max_tool_steps) {
-            errs.push("max_tool_steps phải trong khoảng 1..=12".to_owned());
+        if self.max_tool_steps != 0 && !(1..=12).contains(&self.max_tool_steps) {
+            errs.push("max_tool_steps phải trong khoảng 1..=12 hoặc 0 (không giới hạn)".to_owned());
         }
         if !(1..=10).contains(&self.web_search.max_results) {
             errs.push("web_search.max_results phải trong khoảng 1..=10".to_owned());
@@ -1209,6 +1210,15 @@ pub(crate) mod tests {
         cto.provider_id = "or".into();
         cto.model = "anthropic/claude-big".into();
         c
+    }
+
+    #[test]
+    fn max_tool_steps_zero_means_unlimited() {
+        let mut c = AppConfig::default();
+        c.max_tool_steps = 0;
+        c.validate().unwrap();
+        c.max_tool_steps = 13;
+        assert!(c.validate().unwrap_err().contains("max_tool_steps"));
     }
 
     #[test]

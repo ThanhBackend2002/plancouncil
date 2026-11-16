@@ -49,6 +49,8 @@ use crate::tools::Toolbox;
 
 /// Số lần thử nối tiếp tối đa khi plan bị cắt do `max_tokens`.
 const MAX_CONTINUATIONS: u32 = 2;
+/// Chặn an toàn khi `max_tool_steps = 0` (không giới hạn): tránh model gọi công cụ vô tận.
+pub const UNLIMITED_TOOL_STEPS_CAP: u32 = 50;
 
 /// Ước lượng để giữ chỗ ngân sách: token prompt (×1.1 bù sai số tokenizer) + trần output.
 fn budget_estimate(prompt_tokens: usize, max_tokens: Option<u32>) -> u64 {
@@ -768,7 +770,9 @@ impl Council {
         }
         let tb = &self.extras.toolbox;
         let tools = tb.definitions();
-        let max_steps = self.cfg.max_tool_steps.clamp(1, 12);
+        // 0 = không giới hạn: prompt không nêu con số, vòng lặp vẫn có chặn an toàn chống model gọi mãi.
+        let configured = if self.cfg.max_tool_steps == 0 { 0 } else { self.cfg.max_tool_steps.clamp(1, 12) };
+        let max_steps = if configured == 0 { UNLIMITED_TOOL_STEPS_CAP } else { configured };
         let mut msgs: Vec<Value> = prompts::research_messages(
             role,
             purpose,
@@ -778,7 +782,7 @@ impl Council {
             self.extras.overview.as_deref(),
             tb.workspace.is_some(),
             tb.web.is_some(),
-            max_steps,
+            configured,
             &self.extras.company,
         );
         let chars = |m: &[Value]| m.iter().map(|x| x.to_string().len()).sum::<usize>();
@@ -1373,6 +1377,7 @@ impl Council {
                         first_review: !reviewed_once.contains(&r.id),
                         invited: invited.contains(&r.id),
                         routed: false,
+                        final_round: round > 1 && round == spec.max_rounds,
                         available: &available,
                     };
                     self.prepare_review(spec, r, rc, request, &plan, previous.get(&r.id))
@@ -2340,6 +2345,36 @@ mod tests {
         assert_eq!(rec.usage.by_kind["research"].calls, 2);
         assert!(sink.types().contains(&"tool_used".to_owned()));
         assert_eq!(rec.options.workspace.as_deref(), Some("game"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unlimited_tool_steps_go_past_twelve() {
+        let dir = temp_workspace();
+        let fs = crate::tools::WorkspaceFs::open("game", dir.to_str().unwrap()).unwrap();
+        let extras = SessionExtras {
+            toolbox: Toolbox { workspace: Some(Arc::new(fs)), web: None },
+            ..SessionExtras::default()
+        };
+        let base = standard_router(false);
+        let handler: Handler = Arc::new(move |body: &Value| {
+            let sys = system_of(body);
+            if sys.contains("[RESEARCH]") {
+                assert!(sys.contains("as many tool calls as you really need") && !sys.contains("at most 0"), "{sys}");
+                let used = body["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").count();
+                return if used < 20 {
+                    tool_call("read_file", json!({"path":"src/score.go"}))
+                } else {
+                    completion("- src/score.go: hàm Submit")
+                };
+            }
+            base(body)
+        });
+        let (rec, _) = run_with_extras(handler, |c| c.max_tool_steps = 0, None, extras).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert_eq!(rec.activities.len(), 20, "không giới hạn → vượt mức 12 cũ");
+        assert!(rec.activities.iter().all(|a| a.ok));
+        assert!(UNLIMITED_TOOL_STEPS_CAP > 20);
         std::fs::remove_dir_all(dir).ok();
     }
 

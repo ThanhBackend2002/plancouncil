@@ -74,7 +74,7 @@ function validate(c: AppConfig): Errors {
     range(`dept.${d.id}.max_rounds`, d.max_rounds, 1, 5);
   }
 
-  range("context.max_tool_steps", c.max_tool_steps, 1, 12);
+  if (c.max_tool_steps !== 0) range("context.max_tool_steps", c.max_tool_steps, 1, 12);
   range("context.max_results", c.web_search.max_results, 1, 10);
   if (c.company_context.text.length > 20_000) e["context.text"] = "Tối đa 20.000 ký tự";
   if (c.web_search.provider === "searxng" && c.web_search.base_url.trim() && !isUrl(c.web_search.base_url)) {
