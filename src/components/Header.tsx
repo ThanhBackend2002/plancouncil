@@ -1,6 +1,7 @@
 import { Clock, Coins, Settings, Users } from "lucide-react";
 import { formatTokens } from "../lib/agents";
 import { MAIN_SCOPE } from "../lib/contracts";
+import { useShallow } from "zustand/react/shallow";
 import { useCouncil } from "../store/council";
 import { mainOf } from "../store/session";
 import { useUi, type Tab } from "../store/ui";
@@ -13,12 +14,25 @@ const TABS: { id: Tab; label: string; icon: typeof Users }[] = [
 ];
 
 export function Header() {
-  const { tab, setTab } = useUi();
-  const live = useCouncil((s) => s.live);
-  const running = live.status === "running";
-  const main = mainOf(live);
-  const depts = live.scopeOrder.filter((id) => id !== MAIN_SCOPE).map((id) => live.scopes[id]!);
-  const deptsDone = depts.filter((d) => d.status !== "running").length;
+  const { tab, setTab } = useUi(useShallow((s) => ({ tab: s.tab, setTab: s.setTab })));
+  // Chỉ lấy giá trị nguyên thuỷ + `usage.total` → không re-render theo từng plan_delta.
+  const { status, round, maxRounds, hasPlan, deptCount, deptsDone, total } = useCouncil(
+    useShallow((s) => {
+      const live = s.live;
+      const main = mainOf(live);
+      const depts = live.scopeOrder.filter((id) => id !== MAIN_SCOPE).map((id) => live.scopes[id]!);
+      return {
+        status: live.status,
+        round: main.currentRound,
+        maxRounds: main.maxRounds,
+        hasPlan: main.plans.length > 0,
+        deptCount: depts.length,
+        deptsDone: depts.filter((d) => d.status !== "running").length,
+        total: live.usage.total,
+      };
+    }),
+  );
+  const running = status === "running";
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-6 border-b border-neutral-800 bg-neutral-950 px-4">
@@ -50,25 +64,25 @@ export function Header() {
       <div className="ml-auto flex items-center gap-3 text-xs text-neutral-400">
         {running && (
           <span>
-            {main.currentRound > 0
-              ? `Họp chính · Round ${main.currentRound}/${main.maxRounds || "?"}`
-              : main.plans.length > 0
+            {round > 0
+              ? `Họp chính · Round ${round}/${maxRounds || "?"}`
+              : hasPlan
                 ? "Chủ trì đang viết plan tổng…"
-                : depts.length > 0
-                  ? `Phòng ban đang họp (${deptsDone}/${depts.length} xong)`
+                : deptCount > 0
+                  ? `Phòng ban đang họp (${deptsDone}/${deptCount} xong)`
                   : "Đang khởi động…"}
           </span>
         )}
-        {live.usage.total.calls > 0 && (
+        {total.calls > 0 && (
           <span
             className="inline-flex items-center gap-1 rounded-full bg-neutral-900 px-2 py-0.5 tabular-nums ring-1 ring-neutral-800"
-            title={`Input ${live.usage.total.prompt_tokens.toLocaleString("vi-VN")} · Output ${live.usage.total.completion_tokens.toLocaleString("vi-VN")} · ${live.usage.total.calls} lần gọi`}
+            title={`Input ${total.prompt_tokens.toLocaleString("vi-VN")} · Output ${total.completion_tokens.toLocaleString("vi-VN")} · ${total.calls} lần gọi`}
           >
             <Coins className="size-3.5 text-amber-300" />
-            {formatTokens(live.usage.total.prompt_tokens + live.usage.total.completion_tokens)} token
+            {formatTokens(total.prompt_tokens + total.completion_tokens)} token
           </span>
         )}
-        <StatusBadge status={live.status} />
+        <StatusBadge status={status} />
       </div>
     </header>
   );

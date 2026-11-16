@@ -1,14 +1,16 @@
+import { memo } from "react";
 import { Coins, Info, Scissors } from "lucide-react";
 import { USAGE_KIND_LABEL, formatTokens, type RoleResolver } from "../lib/agents";
 import { MAIN_SCOPE, type TokenUsage } from "../lib/contracts";
-import type { SessionState } from "../store/session";
+import { useActiveShallow } from "../store/council";
 import { PixelPortrait } from "./PixelCharacter";
 
 const total = (u: TokenUsage) => u.prompt_tokens + u.completion_tokens;
 
 /** Bảng token tiêu thụ của phiên: tổng, theo loại việc, theo role, theo nơi họp. */
-export function UsagePanel({ session, resolve }: { session: SessionState; resolve: RoleResolver }) {
-  const u = session.usage;
+export const UsagePanel = memo(function UsagePanel({ resolve }: { resolve: RoleResolver }) {
+  // `usage` chỉ đổi khi có usage_updated / tokens_saved; `scopes` giữ tham chiếu khi plan_delta.
+  const { usage: u, scopes: allScopes } = useActiveShallow((s) => ({ usage: s.usage, scopes: s.scopes }));
   const sum = total(u.total);
   if (u.total.calls === 0) {
     return (
@@ -21,7 +23,7 @@ export function UsagePanel({ session, resolve }: { session: SessionState; resolv
   const roles = Object.entries(u.by_role).sort((a, b) => total(b[1]) - total(a[1]));
   const kinds = Object.entries(u.by_kind).sort((a, b) => total(b[1]) - total(a[1]));
   const scopes = Object.entries(u.by_scope).sort((a, b) => total(b[1]) - total(a[1]));
-  const scopeName = (id: string) => (id === MAIN_SCOPE ? "Họp chính" : (session.scopes[id]?.name ?? id));
+  const scopeName = (id: string) => (id === MAIN_SCOPE ? "Họp chính" : (allScopes[id]?.name ?? id));
 
   return (
     <div className="mx-auto max-w-[860px] space-y-5 px-8 py-6">
@@ -73,7 +75,7 @@ export function UsagePanel({ session, resolve }: { session: SessionState; resolv
       </p>
     </div>
   );
-}
+});
 
 function Stat({ label, value, strong }: { label: string; value: string; strong?: boolean }) {
   return (

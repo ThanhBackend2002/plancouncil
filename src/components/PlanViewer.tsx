@@ -1,9 +1,9 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Coins, Copy, Download, FileText, GitCompareArrows, LoaderCircle, Sparkles } from "lucide-react";
-import { formatTokens } from "../lib/agents";
-import { useResolver } from "../store/config";
+import { formatTokens, type RoleResolver } from "../lib/agents";
+import { activeOf, useActive, useActiveShallow, useCouncil, usePlanText } from "../store/council";
 import { ipc } from "../lib/ipc";
-import type { ScopeState, SessionState } from "../store/session";
+import { planText, type PlanView, type ScopeState, type SessionState } from "../store/session";
 import { useUi } from "../store/ui";
 import { toast, toastError } from "../store/toast";
 import { DiffView, type DiffSource } from "./DiffView";
@@ -12,13 +12,20 @@ import { PlanMarkdown } from "./Markdown";
 import { Button, Panel, StatusBadge, cx } from "./ui";
 
 type Selection = "auto" | "final" | "diff" | "usage" | number;
+type Resolved = Exclude<Selection, "auto"> | null;
 
-export function PlanViewer({ session, scope }: { session: SessionState; scope: ScopeState }) {
+/** Text đang hiển thị (đọc cả bản nháp đang stream). Dùng cho selector và lúc bấm Copy/Export. */
+function contentOf(s: SessionState, scopeId: string, resolved: Resolved, plan: PlanView | undefined, final: string): string {
+  return resolved === "final" ? final : plan ? planText(s, scopeId, plan) : "";
+}
+
+// PlanViewer KHÔNG đọc text stream (chỉ đọc cờ "có nội dung chưa") → thanh tab/nút không re-render
+// theo từng plan_delta; chỉ `PlanBody` bên dưới subscribe vào text.
+export const PlanViewer = memo(function PlanViewer({ scope, resolve }: { scope: ScopeState; resolve: RoleResolver }) {
   const [sel, setSel] = useState<Selection>("auto");
   const [exporting, setExporting] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const stick = useRef(true);
   const planFocus = useUi((s) => s.planFocus);
+  const session = useActiveShallow((s) => ({ id: s.id, status: s.status, total: s.usage.total }));
 
   // Phiên mới / đổi phòng ban → quay về chế độ tự theo dõi.
   useEffect(() => setSel("auto"), [session.id, scope.id]);
@@ -28,13 +35,16 @@ export function PlanViewer({ session, scope }: { session: SessionState; scope: S
   }, [planFocus]);
 
   const latest = scope.plans.at(-1);
-  const resolved: Exclude<Selection, "auto"> | null =
-    sel === "auto" ? (scope.final ? "final" : (latest?.version ?? null)) : sel;
+  const resolved: Resolved = sel === "auto" ? (scope.final ? "final" : (latest?.version ?? null)) : sel;
 
   const plan = typeof resolved === "number" ? scope.plans.find((p) => p.version === resolved) : undefined;
   const running = scope.status === "running" && session.status === "running";
   const streaming = !!plan && !plan.complete && running;
-  const content = resolved === "final" ? (scope.final?.markdown ?? "") : (plan?.markdown ?? "");
+  const finalMd = scope.final?.markdown ?? "";
+  // Boolean → chỉ đổi 1 lần khi text bắt đầu có nội dung, không theo từng delta.
+  const hasContent = useActive((s) => contentOf(s, scope.id, resolved, plan, finalMd).trim() !== "");
+  /** Đọc text lúc cần (Copy/Export) thay vì subscribe. */
+  const readContent = () => contentOf(activeOf(useCouncil.getState()), scope.id, resolved, plan, finalMd);
 
   const diffSources = useMemo<DiffSource[]>(() => {
     const list: DiffSource[] = scope.plans
@@ -44,31 +54,13 @@ export function PlanViewer({ session, scope }: { session: SessionState; scope: S
     return list;
   }, [scope.plans, scope.final]);
 
-  // Tự cuộn theo nội dung khi stream; dừng nếu người dùng cuộn lên.
-  useLayoutEffect(() => {
-    const el = scrollRef.current;
-    if (el && streaming && stick.current) el.scrollTop = el.scrollHeight;
-  }, [content, streaming]);
-
-  useLayoutEffect(() => {
-    stick.current = true;
-    const el = scrollRef.current;
-    if (el) el.scrollTop = 0;
-  }, [resolved]);
-
-  const onScroll = () => {
-    const el = scrollRef.current;
-    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
-  };
-
   const label = resolved === "final" ? "final" : typeof resolved === "number" ? `v${resolved}` : "";
-  const canAct = resolved !== "diff" && resolved !== "usage" && content.trim() !== "" && !streaming;
-  const resolve = useResolver(session.cast);
-  const tokens = session.usage.total.prompt_tokens + session.usage.total.completion_tokens;
+  const canAct = resolved !== "diff" && resolved !== "usage" && hasContent && !streaming;
+  const tokens = session.total.prompt_tokens + session.total.completion_tokens;
 
   const copy = async () => {
     try {
-      await navigator.clipboard.writeText(content);
+      await navigator.clipboard.writeText(readContent());
       toast("success", "Đã copy plan", `${label} → clipboard`);
     } catch (e) {
       toastError(e, "Không copy được");
@@ -78,7 +70,7 @@ export function PlanViewer({ session, scope }: { session: SessionState; scope: S
   const exportMd = async () => {
     setExporting(true);
     try {
-      const path = await ipc.exportMarkdown(content, `plancouncil-${(session.id ?? "plan").slice(0, 8)}-${scope.kind === "main" ? "" : `${scope.id}-`}${label}.md`);
+      const path = await ipc.exportMarkdown(readContent(), `plancouncil-${(session.id ?? "plan").slice(0, 8)}-${scope.kind === "main" ? "" : `${scope.id}-`}${label}.md`);
       if (path) toast("success", "Đã export", path);
     } catch (e) {
       toastError(e, "Export thất bại");
@@ -103,7 +95,7 @@ export function PlanViewer({ session, scope }: { session: SessionState; scope: S
     ...(diffSources.length >= 2
       ? [{ key: "diff" as Selection, label: (<><GitCompareArrows className="size-3.5" />Diff</>) }]
       : []),
-    ...(session.usage.total.calls > 0
+    ...(session.total.calls > 0
       ? [{ key: "usage" as Selection, label: (<><Coins className="size-3.5" />Token {formatTokens(tokens)}</>) }]
       : []),
   ];
@@ -154,7 +146,7 @@ export function PlanViewer({ session, scope }: { session: SessionState; scope: S
 
       {resolved === "usage" ? (
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <UsagePanel session={session} resolve={resolve} />
+          <UsagePanel resolve={resolve} />
         </div>
       ) : resolved === "diff" ? (
         <div className="min-h-0 flex-1">
@@ -162,28 +154,81 @@ export function PlanViewer({ session, scope }: { session: SessionState; scope: S
           <DiffView key={`${session.id ?? "none"}-${scope.id}-${diffSources.length}`} sources={diffSources} />
         </div>
       ) : (
-        <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
-          {resolved === null ? (
-            <EmptyState running={running} />
-          ) : content === "" && streaming ? (
-            <div className="flex items-center gap-2 p-8 text-sm text-neutral-500">
-              <LoaderCircle className="size-4 animate-spin" /> Architect đang viết {label}…
-            </div>
-          ) : (
-            <article className="mx-auto max-w-[860px] px-8 py-6">
-              {plan && !plan.complete && !running && (
-                <p className="mb-4 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-                  Version này chưa viết xong (phiên đã dừng/lỗi giữa chừng).
-                </p>
-              )}
-              <PlanMarkdown markdown={content} streaming={streaming} />
-            </article>
-          )}
-        </div>
+        <PlanBody
+          scopeId={scope.id}
+          resolved={resolved}
+          plan={plan}
+          finalMd={finalMd}
+          streaming={streaming}
+          running={running}
+          label={label}
+        />
       )}
     </Panel>
   );
-}
+});
+
+/** Vùng hiển thị text plan — component DUY NHẤT re-render theo từng plan_delta. */
+const PlanBody = memo(function PlanBody({
+  scopeId,
+  resolved,
+  plan,
+  finalMd,
+  streaming,
+  running,
+  label,
+}: {
+  scopeId: string;
+  resolved: Resolved;
+  plan: PlanView | undefined;
+  finalMd: string;
+  streaming: boolean;
+  running: boolean;
+  label: string;
+}) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const stick = useRef(true);
+  const draft = usePlanText(scopeId, plan);
+  const content = resolved === "final" ? finalMd : draft;
+
+  // Tự cuộn theo nội dung khi stream; dừng nếu người dùng cuộn lên.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el && streaming && stick.current) el.scrollTop = el.scrollHeight;
+  }, [content, streaming]);
+
+  useLayoutEffect(() => {
+    stick.current = true;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = 0;
+  }, [resolved]);
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48;
+  };
+
+  return (
+    <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
+      {resolved === null ? (
+        <EmptyState running={running} />
+      ) : content === "" && streaming ? (
+        <div className="flex items-center gap-2 p-8 text-sm text-neutral-500">
+          <LoaderCircle className="size-4 animate-spin" /> Architect đang viết {label}…
+        </div>
+      ) : (
+        <article className="mx-auto max-w-[860px] px-8 py-6">
+          {plan && !plan.complete && !running && (
+            <p className="mb-4 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              Version này chưa viết xong (phiên đã dừng/lỗi giữa chừng).
+            </p>
+          )}
+          <PlanMarkdown markdown={content} streaming={streaming} />
+        </article>
+      )}
+    </div>
+  );
+});
 
 function EmptyState({ running }: { running: boolean }) {
   if (running) {

@@ -1,8 +1,9 @@
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, FileText, FolderTree, Globe, Link, LoaderCircle, Search, TriangleExclamationPoint, UserMinus, UserPlus, Wrench } from "lucide-react";
 import { STATUS_META, type RoleResolver } from "../lib/agents";
 import type { MembershipChange, RoleId, ToolActivity } from "../lib/contracts";
-import type { RoundView, ScopeState, SessionState, SlotView } from "../store/session";
+import { useActiveShallow } from "../store/council";
+import type { RoundView, ScopeState, SlotView } from "../store/session";
 import { useUi } from "../store/ui";
 import { PixelPortrait } from "./PixelCharacter";
 import { Badge, Panel, VerdictBadge, cx } from "./ui";
@@ -52,7 +53,15 @@ function buildMessages(scope: ScopeState, running: boolean): Msg[] {
   return out;
 }
 
-export function Timeline({ session, scope, resolve }: { session: SessionState; scope: ScopeState; resolve: RoleResolver }) {
+export const Timeline = memo(function Timeline({ scope, resolve }: { scope: ScopeState; resolve: RoleResolver }) {
+  // Chỉ lấy cờ nguyên thuỷ của phiên; `scope` giữ tham chiếu khi plan_delta → không rebuild hội thoại theo delta.
+  const session = useActiveShallow((s) => ({
+    status: s.status,
+    id: s.id,
+    seqGap: s.seqGap,
+    readOnly: s.readOnly,
+    resumed: s.resumed,
+  }));
   const running = scope.status === "running" && session.status === "running";
   const msgs = useMemo(() => buildMessages(scope, running), [scope, running]);
   const ref = useRef<HTMLDivElement>(null);
@@ -97,10 +106,12 @@ export function Timeline({ session, scope, resolve }: { session: SessionState; s
           switch (m.kind) {
             case "task":
               return <SystemLine key={m.key} text={`Nhiệm vụ được giao: ${m.text}`} />;
+            // Props là giá trị nguyên thuỷ hoặc tham chiếu có sẵn trong state (slot, round, activity…),
+            // không truyền object `m` dựng lại mỗi lần buildMessages → memo con mới có tác dụng.
             case "plan":
-              return <PlanMsg key={m.key} msg={m} resolve={resolve} first={m.version === 1} />;
+              return <PlanMsg key={m.key} agentId={m.agentId} version={m.version} complete={m.complete} resolve={resolve} />;
             case "review":
-              return <ReviewMsg key={m.key} msg={m} resolve={resolve} />;
+              return <ReviewMsg key={m.key} agentId={m.agentId} slot={m.slot} resolve={resolve} />;
             case "round":
               return <RoundLine key={m.key} round={m.round} />;
             case "tool":
@@ -108,24 +119,34 @@ export function Timeline({ session, scope, resolve }: { session: SessionState; s
             case "member":
               return <MemberLine key={m.key} change={m.change} resolve={resolve} />;
             case "outcome":
-              return <Outcome key={m.key} scope={scope} />;
+              return (
+                <Outcome
+                  key={m.key}
+                  status={scope.status}
+                  dept={scope.kind === "department"}
+                  reviewers={scope.reviewerIds.length}
+                  rounds={scope.rounds.length}
+                  maxRounds={scope.maxRounds}
+                  error={scope.error}
+                />
+              );
           }
         })}
       </div>
     </Panel>
   );
-}
+});
 
-function Notice({ children }: { children: React.ReactNode }) {
+const Notice = memo(function Notice({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex items-start gap-2 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-200">
       <TriangleExclamationPoint className="mt-px size-3.5 shrink-0" />
       {children}
     </div>
   );
-}
+});
 
-function SystemLine({ text }: { text: string }) {
+const SystemLine = memo(function SystemLine({ text }: { text: string }) {
   return (
     <div className="flex items-center gap-2 text-[11px] text-neutral-500">
       <span className="h-px flex-1 bg-neutral-800" />
@@ -133,7 +154,7 @@ function SystemLine({ text }: { text: string }) {
       <span className="h-px flex-1 bg-neutral-800" />
     </div>
   );
-}
+});
 
 function Bubble({
   agentId,
@@ -168,40 +189,42 @@ function Bubble({
   );
 }
 
-function PlanMsg({
-  msg,
+const PlanMsg = memo(function PlanMsg({
+  agentId,
+  version,
+  complete,
   resolve,
-  first,
 }: {
-  msg: Extract<Msg, { kind: "plan" }>;
+  agentId: RoleId;
+  version: number;
+  complete: boolean;
   resolve: RoleResolver;
-  first: boolean;
 }) {
   const focus = useUi((s) => s.focusPlan);
+  const first = version === 1;
   return (
-    <Bubble agentId={msg.agentId} resolve={resolve}>
-      {msg.complete ? (
+    <Bubble agentId={agentId} resolve={resolve}>
+      {complete ? (
         <span className="flex items-center gap-2">
           <FileText className="size-3.5 shrink-0 text-violet-400" />
           <span className="flex-1">
-            {first ? "Đây là bản nháp Plan v1, mời mọi người góp ý." : `Đã chỉnh sửa theo góp ý → Plan v${msg.version}.`}
+            {first ? "Đây là bản nháp Plan v1, mời mọi người góp ý." : `Đã chỉnh sửa theo góp ý → Plan v${version}.`}
           </span>
-          <button type="button" onClick={() => focus(msg.version)} className="shrink-0 text-[11px] text-violet-300 hover:text-violet-200">
-            Xem v{msg.version} →
+          <button type="button" onClick={() => focus(version)} className="shrink-0 text-[11px] text-violet-300 hover:text-violet-200">
+            Xem v{version} →
           </button>
         </span>
       ) : (
         <span className="inline-flex items-center gap-1.5 text-neutral-400">
-          <LoaderCircle className="size-3 animate-spin" /> Đang viết Plan v{msg.version}…
+          <LoaderCircle className="size-3 animate-spin" /> Đang viết Plan v{version}…
         </span>
       )}
     </Bubble>
   );
-}
+});
 
-function ReviewMsg({ msg, resolve }: { msg: Extract<Msg, { kind: "review" }>; resolve: RoleResolver }) {
+const ReviewMsg = memo(function ReviewMsg({ agentId, slot, resolve }: { agentId: RoleId; slot: SlotView; resolve: RoleResolver }) {
   const [open, setOpen] = useState(false);
-  const { slot } = msg;
   const r = slot.review;
   const accent = r ? (r.verdict === "APPROVE" ? "#16a34a66" : "#dc262666") : slot.error ? "#d9770666" : undefined;
   const expandable =
@@ -213,7 +236,7 @@ function ReviewMsg({ msg, resolve }: { msg: Extract<Msg, { kind: "review" }>; re
       (r.invites?.length ?? 0) > 0);
 
   return (
-    <Bubble agentId={msg.agentId} resolve={resolve} accent={accent}>
+    <Bubble agentId={agentId} resolve={resolve} accent={accent}>
       {slot.pending ? (
         <span className="inline-flex items-center gap-1.5 text-neutral-500">
           <LoaderCircle className="size-3 animate-spin" /> đang đọc plan…
@@ -298,7 +321,7 @@ function ReviewMsg({ msg, resolve }: { msg: Extract<Msg, { kind: "review" }>; re
       ) : null}
     </Bubble>
   );
-}
+});
 
 const TOOL_ICON: Record<string, typeof FileText> = {
   read_file: FileText,
@@ -308,7 +331,7 @@ const TOOL_ICON: Record<string, typeof FileText> = {
   fetch_url: Link,
 };
 
-function ToolLine({ activity: a, resolve }: { activity: ToolActivity; resolve: RoleResolver }) {
+const ToolLine = memo(function ToolLine({ activity: a, resolve }: { activity: ToolActivity; resolve: RoleResolver }) {
   const m = resolve(a.agent);
   const Icon = TOOL_ICON[a.tool] ?? Wrench;
   return (
@@ -319,9 +342,9 @@ function ToolLine({ activity: a, resolve }: { activity: ToolActivity; resolve: R
       </span>
     </div>
   );
-}
+});
 
-function MemberLine({ change: c, resolve }: { change: MembershipChange; resolve: RoleResolver }) {
+const MemberLine = memo(function MemberLine({ change: c, resolve }: { change: MembershipChange; resolve: RoleResolver }) {
   const m = resolve(c.agent);
   const by = c.by === "user" ? "bạn" : c.by === "self" ? "" : resolve(c.by).name;
   const text =
@@ -341,9 +364,9 @@ function MemberLine({ change: c, resolve }: { change: MembershipChange; resolve:
       </span>
     </div>
   );
-}
+});
 
-function RoundLine({ round }: { round: RoundView }) {
+const RoundLine = memo(function RoundLine({ round }: { round: RoundView }) {
   const failed = Object.values(round.slots).filter((s) => s.error).length;
   return (
     <div className="flex items-center justify-center gap-1.5 text-[11px] text-neutral-500">
@@ -356,26 +379,39 @@ function RoundLine({ round }: { round: RoundView }) {
       <span className="h-px flex-1 bg-neutral-800" />
     </div>
   );
-}
+});
 
-function Outcome({ scope }: { scope: ScopeState }) {
-  const meta = STATUS_META[scope.status];
-  const dept = scope.kind === "department";
+const Outcome = memo(function Outcome({
+  status,
+  dept,
+  reviewers,
+  rounds,
+  maxRounds,
+  error,
+}: {
+  status: ScopeState["status"];
+  dept: boolean;
+  reviewers: number;
+  rounds: number;
+  maxRounds: number;
+  error: string | null;
+}) {
+  const meta = STATUS_META[status];
   const text: Record<string, string> = {
     converged: dept
-      ? scope.reviewerIds.length
-        ? `Phòng ban đã thống nhất ở round ${scope.rounds.length}. Plan được gửi lên cuộc họp chính.`
+      ? reviewers
+        ? `Phòng ban đã thống nhất ở round ${rounds}. Plan được gửi lên cuộc họp chính.`
         : "Plan của trưởng phòng được gửi lên cuộc họp chính."
-      : `Tất cả reviewer đã APPROVE ở round ${scope.rounds.length}.`,
+      : `Tất cả reviewer đã APPROVE ở round ${rounds}.`,
     partially_approved: "Các reviewer còn hoạt động đã APPROVE, nhưng có reviewer không review được.",
-    max_rounds_reached: `Hết ${scope.maxRounds} vòng mà vẫn còn REJECT. Final có kèm mục Open Issues.`,
+    max_rounds_reached: `Hết ${maxRounds} vòng mà vẫn còn REJECT. Final có kèm mục Open Issues.`,
     cancelled: "Phiên đã bị dừng.",
-    failed: scope.error ?? "Gặp lỗi.",
+    failed: error ?? "Gặp lỗi.",
   };
   return (
     <div className={cx("flex items-start gap-2 rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2 text-xs text-neutral-300")}>
       <Badge tone={meta.tone}>{meta.label}</Badge>
-      <span className="break-words">{text[scope.status]}</span>
+      <span className="break-words">{text[status]}</span>
     </div>
   );
-}
+});

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import type { RoleId } from "../lib/contracts";
 import type { RoleResolver } from "../lib/agents";
 import { SPRITE_W } from "../lib/pixel";
@@ -46,7 +46,8 @@ const TONE_BORDER: Record<Speech["tone"], string> = {
   error: "#d97706",
 };
 
-export function MeetingRoom({
+// memo: props (scope, resolve, chuỗi) giữ tham chiếu khi plan_delta → không vẽ lại cảnh theo từng delta.
+export const MeetingRoom = memo(function MeetingRoom({
   scope,
   resolve,
   title,
@@ -202,9 +203,9 @@ export function MeetingRoom({
       )}
     </section>
   );
-}
+});
 
-function SpeechBubble({ speech, name, x, y }: { speech: Speech; name: string; x: number; y: number }) {
+const SpeechBubble = memo(function SpeechBubble({ speech, name, x, y }: { speech: Speech; name: string; x: number; y: number }) {
   // Giữ bong bóng trong khung: neo theo % và kẹp 18%–82%.
   const left = Math.min(82, Math.max(18, (x / W) * 100));
   return (
@@ -224,10 +225,10 @@ function SpeechBubble({ speech, name, x, y }: { speech: Speech; name: string; x:
       <div className="mx-auto mt-[2px] h-[6px] w-[6px] bg-[#fdfdf8]" style={{ boxShadow: `0 2px 0 0 ${TONE_BORDER[speech.tone]}` }} />
     </div>
   );
-}
+});
 
-/** Tường, sàn, bảng trắng, cửa sổ, cây — vẽ bằng rect. */
-function Office({ title, version, writing }: { title: string; version: number; writing: boolean }) {
+/** Tường, sàn, bảng trắng, cửa sổ, cây — vẽ bằng rect. memo: props nguyên thuỷ, khỏi dựng lại ~100 ô sàn. */
+const Office = memo(function Office({ title, version, writing }: { title: string; version: number; writing: boolean }) {
   const tiles = [];
   for (let y = 48; y < H; y += 12) {
     for (let x = 0; x < W; x += 12) {
@@ -294,9 +295,9 @@ function Office({ title, version, writing }: { title: string; version: number; w
       <rect x={9} y={108} width={4} height={5} fill="#22c55e" />
     </g>
   );
-}
+});
 
-function Table() {
+const Table = memo(function Table() {
   const { x, y, w } = TABLE;
   return (
     <g>
@@ -316,4 +317,4 @@ function Table() {
       <rect x={x + 40} y={y + 1} width={3} height={1} fill="#7c2d12" />
     </g>
   );
-}
+});

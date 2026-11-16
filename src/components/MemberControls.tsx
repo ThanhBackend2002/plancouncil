@@ -1,17 +1,19 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { UserPlus, X } from "lucide-react";
 import type { RoleResolver } from "../lib/agents";
 import { ipc } from "../lib/ipc";
+import { useActiveShallow } from "../store/council";
 import { providerOf, useConfig } from "../store/config";
-import type { ScopeState, SessionState } from "../store/session";
+import type { ScopeState } from "../store/session";
 import { toast, toastError } from "../store/toast";
 import { PixelPortrait } from "./PixelCharacter";
 import { RoleSelect } from "./settings/fields";
 import { Button, Panel } from "./ui";
 
 /** Mời thêm / mời ra trong lúc họp — áp dụng từ vòng review kế tiếp của nơi họp đang xem. */
-export function MemberControls({ session, scope, resolve }: { session: SessionState; scope: ScopeState; resolve: RoleResolver }) {
+export const MemberControls = memo(function MemberControls({ scope, resolve }: { scope: ScopeState; resolve: RoleResolver }) {
   const config = useConfig((s) => s.config);
+  const session = useActiveShallow((s) => ({ readOnly: s.readOnly, status: s.status, id: s.id }));
   const [pick, setPick] = useState("");
   const [busy, setBusy] = useState(false);
   if (!config || session.readOnly || session.status !== "running" || !session.id || scope.status !== "running") return null;
@@ -71,4 +73,4 @@ export function MemberControls({ session, scope, resolve }: { session: SessionSt
       </span>
     </Panel>
   );
-}
+});

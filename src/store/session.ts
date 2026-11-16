@@ -110,6 +110,14 @@ export interface SessionState {
   resumed: boolean;
   readOnly: boolean;
   createdAt: string | null;
+  /**
+   * Text plan đang stream, tách khỏi `scopes` để mỗi `plan_delta` chỉ thay map nhỏ này
+   * (không copy plans/scope/scopes) → component nào không hiển thị text stream sẽ không re-render.
+   * Key = `draftKey(scope, version)`. Bất biến: chỉ có key cho plan đã tồn tại và CHƯA complete;
+   * khi có key thì đây là markdown hiện hành của plan đó (thay cho `PlanView.markdown`).
+   * Đọc qua `planText()`, đừng đọc `PlanView.markdown` trực tiếp cho plan chưa complete.
+   */
+  drafts: Record<string, string>;
 }
 
 const idleAgent = (): AgentView => ({ status: "idle", round: 0, planVersion: 0, review: null, error: null });
@@ -193,6 +201,7 @@ export function initialSession(): SessionState {
     resumed: false,
     readOnly: false,
     createdAt: null,
+    drafts: {},
   };
 }
 
@@ -200,6 +209,23 @@ export const isTerminal = (p: Phase): boolean => p !== "idle" && p !== "running"
 
 export function mainOf(s: SessionState): ScopeState {
   return s.scopes[MAIN_SCOPE] ?? mainScope("", [], 0, s.status);
+}
+
+// ───────────────────────── text plan đang stream ─────────────────────────
+
+export const draftKey = (scope: string, version: number): string => `${scope}#${version}`;
+
+/** Markdown hiện hành của 1 plan: bản nháp đang stream (nếu có) hoặc text đã lưu trong PlanView. */
+export function planText(s: SessionState, scope: string, p: PlanView): string {
+  return p.complete ? p.markdown : (s.drafts[draftKey(scope, p.version)] ?? p.markdown);
+}
+
+/** Bỏ bản nháp của 1 plan (plan bị reset / đã xong). Không có key → trả nguyên state, không copy. */
+function dropDraft(s: SessionState, scope: string, version: number): SessionState {
+  const key = draftKey(scope, version);
+  if (!(key in s.drafts)) return s;
+  const { [key]: _gone, ...rest } = s.drafts;
+  return { ...s, drafts: rest };
 }
 
 // ───────────────────────── helpers bất biến ─────────────────────────
@@ -345,8 +371,8 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
       return next;
     }
 
-    case "agent_thinking":
-      return patchScope(s, env.scope, (sc0) => {
+    case "agent_thinking": {
+      const next = patchScope(s, env.scope, (sc0) => {
         let sc = sc0;
         if (!sc.authorId && env.plan_version > 0 && !sc.reviewerIds.includes(env.agent) && sc.rounds.length === 0) {
           sc = { ...sc, authorId: env.agent }; // scope tạm: call đầu tiên là của người viết
@@ -379,21 +405,41 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
           })),
         };
       });
+      // Nhánh người viết ở trên đã reset markdown của plan → bỏ luôn bản nháp cũ (nếu có).
+      // authorId sau patch đúng bằng authorId mà nhánh trên dùng để chọn nhánh.
+      return env.plan_version > 0 && env.agent === next.scopes[env.scope]?.authorId
+        ? dropDraft(next, env.scope, env.plan_version)
+        : next;
+    }
 
     case "plan_stream_reset":
-      return patchScope(s, env.scope, (sc) => ({
-        ...sc,
-        plans: upsertPlan(sc.plans, env.version, (p) => ({ ...p, markdown: "", complete: false })),
-      }));
+      return dropDraft(
+        patchScope(s, env.scope, (sc) => ({
+          ...sc,
+          plans: upsertPlan(sc.plans, env.version, (p) => ({ ...p, markdown: "", complete: false })),
+        })),
+        env.scope,
+        env.version,
+      );
 
-    case "plan_delta":
+    case "plan_delta": {
+      // Đường nhanh: plan đã có và đang viết dở → chỉ nối vào `drafts`, giữ nguyên tham chiếu
+      // `scopes` / `plans` (Timeline, phòng họp… không re-render). `planText()` cho ra đúng
+      // chuỗi như cách cũ `p.markdown + delta`.
+      const plan = s.scopes[env.scope]?.plans.find((p) => p.version === env.version);
+      if (plan && !plan.complete) {
+        const key = draftKey(env.scope, env.version);
+        return { ...s, drafts: { ...s.drafts, [key]: (s.drafts[key] ?? plan.markdown) + env.delta } };
+      }
+      // Plan chưa có (vd. khôi phục sau reload) hoặc đã complete → giữ nguyên logic cũ.
       return patchScope(s, env.scope, (sc) => ({
         ...sc,
         plans: upsertPlan(sc.plans, env.version, (p) => ({ ...p, markdown: p.markdown + env.delta })),
       }));
+    }
 
-    case "plan_ready":
-      return patchScope(s, env.scope, (sc) => ({
+    case "plan_ready": {
+      const next = patchScope(s, env.scope, (sc) => ({
         ...sc,
         plans: upsertPlan(sc.plans, env.version, () => ({ version: env.version, markdown: env.markdown, complete: true })),
         agents: sc.authorId ? setAgent(sc, sc.authorId, { status: "done", planVersion: env.version, error: null }) : sc.agents,
@@ -410,6 +456,9 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
             )
           : sc.speech,
       }));
+      // plan_ready thay toàn bộ text → bản nháp không còn dùng nữa.
+      return dropDraft(next, env.scope, env.version);
+    }
 
     case "review_ready":
       return patchScope(s, env.scope, (sc0) => {
