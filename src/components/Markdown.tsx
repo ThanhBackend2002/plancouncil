@@ -72,11 +72,76 @@ function stripWrappingFence(md: string): string {
   return m ? md.slice(m[0].length) : md;
 }
 
-const Rendered = memo(function Rendered({ markdown }: { markdown: string }) {
+const remarkPlugins = [remarkGfm];
+
+/** 1 khối markdown → React. memo theo chuỗi: khối không đổi thì không parse lại. */
+const Section = memo(function Section({ markdown }: { markdown: string }) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+    <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
       {markdown}
     </ReactMarkdown>
+  );
+});
+
+const H2_LINE = /^##(?:[ \t]|$)/;
+/** Định nghĩa link tham chiếu / footnote (`[x]: url`, `[^1]: …`) — có thể được dùng ở section khác. */
+const DEFINITION = /^ {0,3}\[[^\]\n]+\]:/m;
+/** Dòng mở HTML block (`<div>`, `<!-- … -->`…): HTML block có thể nuốt cả dòng `## ` phía sau. */
+const HTML_BLOCK = /^ {0,3}<[A-Za-z!?/]/m;
+
+/**
+ * Cắt markdown thành các khối, mỗi khối bắt đầu ở 1 dòng `## ` (cột 0, ngoài code fence; giữ
+ * nguyên dòng heading trong khối). Không dùng `splitSections` của lib/sections vì hàm đó chuẩn
+ * hoá title/body cho Diff View, còn ở đây cần chuỗi gốc để render y hệt.
+ *
+ * Heading ATX ở cột 0 luôn kết thúc đoạn văn / list / blockquote / bảng trước nó, nên render
+ * từng khối riêng ra cùng DOM như render cả tài liệu (react-markdown 10 không bọc thẻ ngoài).
+ * Ngoại lệ: có định nghĩa link tham chiếu / footnote (dùng xuyên khối) hoặc HTML block
+ * → không cắt, render nguyên tài liệu như cũ.
+ */
+export function splitBlocks(md: string): string[] {
+  if (DEFINITION.test(md) || HTML_BLOCK.test(md)) return [md];
+  const lines = md.split("\n");
+  const out: string[] = [];
+  let start = 0;
+  let inFence = false;
+  let char = "";
+  let len = 0;
+  lines.forEach((line, i) => {
+    const m = FENCE.exec(line);
+    const marker = m?.[1];
+    if (marker) {
+      if (!inFence) {
+        inFence = true;
+        char = marker[0]!;
+        len = marker.length;
+      } else if (marker[0] === char && marker.length >= len && (m[2] ?? "").trim() === "") {
+        inFence = false;
+      }
+      return;
+    }
+    if (!inFence && i > start && H2_LINE.test(line)) {
+      out.push(lines.slice(start, i).join("\n"));
+      start = i;
+    }
+  });
+  out.push(lines.slice(start).join("\n"));
+  return out;
+}
+
+/**
+ * Render theo từng section `##`, mỗi section là 1 `Section` memo (key = vị trí, so sánh theo nội
+ * dung). Lúc stream chỉ section cuối đổi → chỉ section đó parse lại, các section trước giữ nguyên
+ * (kể cả Mermaid đã vẽ, vì key theo vị trí nên không bị remount).
+ */
+const Rendered = memo(function Rendered({ markdown }: { markdown: string }) {
+  const blocks = useMemo(() => splitBlocks(markdown), [markdown]);
+  return (
+    <>
+      {blocks.map((b, i) => (
+        <Section key={i} markdown={b} />
+      ))}
+    </>
   );
 });
 

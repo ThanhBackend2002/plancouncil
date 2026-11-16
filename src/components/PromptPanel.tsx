@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import {
   Activity,
   ArrowLeft,
@@ -40,12 +41,26 @@ function defaultOptions(config: AppConfig): SessionOptions {
 }
 
 export function PromptPanel() {
-  const { live, viewing, starting, stopping, start, stop, closeView, nextOptions } = useCouncil();
+  // Chỉ lấy field cần dùng (không lấy cả `live`) → không re-render theo từng event / plan_delta.
+  const { liveStatus, livePrompt, liveError, viewing, starting, stopping, start, stop, closeView, nextOptions } = useCouncil(
+    useShallow((s) => ({
+      liveStatus: s.live.status,
+      livePrompt: s.live.prompt,
+      liveError: s.live.error,
+      viewing: s.viewing,
+      starting: s.starting,
+      stopping: s.stopping,
+      start: s.start,
+      stop: s.stop,
+      closeView: s.closeView,
+      nextOptions: s.nextOptions,
+    })),
+  );
   const config = useConfig((s) => s.config);
   const [text, setText] = useState("");
   const [proposal, setProposal] = useState<StaffingProposal | null>(null);
   const [proposing, setProposing] = useState(false);
-  const running = live.status === "running";
+  const running = liveStatus === "running";
   const mode = config?.meeting.staffing ?? "manual";
 
   if (viewing) {
@@ -81,7 +96,7 @@ export function PromptPanel() {
     );
   }
 
-  const value = running ? live.prompt : text;
+  const value = running ? livePrompt : text;
   const tooLong = text.length > MAX_PROMPT_CHARS;
   const canStart = !running && !starting && !proposing && text.trim() !== "" && !tooLong && !!config;
 
@@ -189,9 +204,9 @@ export function PromptPanel() {
         />
       )}
       <QuickConfig disabled={running} />
-      {live.status === "failed" && live.error && (
+      {liveStatus === "failed" && liveError && (
         <p className="mt-2 rounded-md border border-red-500/30 bg-red-500/10 p-2 text-xs break-words text-red-300">
-          {live.error}
+          {liveError}
         </p>
       )}
     </Panel>
@@ -371,7 +386,9 @@ function MeetingHealth({ roleIds, disabled }: { roleIds: RoleId[]; disabled: boo
 /** Workspace (đọc code dự án) · Web search · Bối cảnh công ty — riêng cho phiên kế tiếp. */
 function SessionOptionsRow({ disabled }: { disabled: boolean }) {
   const config = useConfig((s) => s.config);
-  const { nextOptions, setNextOptions } = useCouncil();
+  const { nextOptions, setNextOptions } = useCouncil(
+    useShallow((s) => ({ nextOptions: s.nextOptions, setNextOptions: s.setNextOptions })),
+  );
   const setTab = useUi((s) => s.setTab);
   if (!config) return null;
   const opts: SessionOptions = nextOptions ?? defaultOptions(config);
@@ -456,7 +473,9 @@ function SessionOptionsRow({ disabled }: { disabled: boolean }) {
 
 function QuickConfig({ disabled }: { disabled: boolean }) {
   const { config, save, saving } = useConfig();
-  const { nextDepartments, setNextDepartments } = useCouncil();
+  const { nextDepartments, setNextDepartments } = useCouncil(
+    useShallow((s) => ({ nextDepartments: s.nextDepartments, setNextDepartments: s.setNextDepartments })),
+  );
   const setTab = useUi((s) => s.setTab);
   const resolve = useResolver();
   if (!config) return null;

@@ -1,18 +1,25 @@
 import { CircleCheck, CircleX, LoaderCircle, Network, Users } from "lucide-react";
 import { MAIN_SCOPE } from "../lib/contracts";
-import type { SessionState } from "../store/session";
-import { useCouncil } from "../store/council";
+import { memo } from "react";
+import { useShallow } from "zustand/react/shallow";
+import { activeOf, useCouncil } from "../store/council";
 import { cx } from "./ui";
 
 /** Chọn xem cuộc họp chính hay phòng ban nào. Chỉ hiện khi phiên có phòng ban. */
-export function ScopeBar({ session, active }: { session: SessionState; active: string }) {
-  const { scope: sel, setScope } = useCouncil();
-  if (session.scopeOrder.length <= 1) return null;
+export const ScopeBar = memo(function ScopeBar({ active }: { active: string }) {
+  // `scopes` giữ nguyên tham chiếu khi plan_delta (text stream nằm ở `drafts`) → không re-render theo delta.
+  const { sel, setScope, scopeOrder, scopes } = useCouncil(
+    useShallow((s) => {
+      const a = activeOf(s);
+      return { sel: s.scope, setScope: s.setScope, scopeOrder: a.scopeOrder, scopes: a.scopes };
+    }),
+  );
+  if (scopeOrder.length <= 1) return null;
 
   return (
     <div className="flex shrink-0 items-center gap-1 overflow-x-auto rounded-xl border border-neutral-800 bg-neutral-900/40 p-1">
-      {session.scopeOrder.map((id) => {
-        const sc = session.scopes[id];
+      {scopeOrder.map((id) => {
+        const sc = scopes[id];
         if (!sc) return null;
         const isMain = id === MAIN_SCOPE;
         const thinking = Object.values(sc.agents).some((a) => a.status === "thinking");
@@ -62,4 +69,4 @@ export function ScopeBar({ session, active }: { session: SessionState; active: s
       </button>
     </div>
   );
-}
+});
