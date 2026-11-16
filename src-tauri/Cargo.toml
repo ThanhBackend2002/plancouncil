@@ -42,8 +42,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 blake3 = "1"                             # hash nội dung section (section revise)
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 
+# Index tìm kiếm (rebuild được) cho lịch sử phiên. `bundled` = tự build SQLite, có sẵn FTS5.
+rusqlite = { version = "0.37", features = ["bundled"] }
+unicode-normalization = "0.1"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1
