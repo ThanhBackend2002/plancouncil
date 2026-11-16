@@ -27,6 +27,8 @@ pub const DEFAULT_PROVIDER_ID: &str = "default";
 const DEFAULT_MODEL: &str = "gpt-4.1-mini";
 const DEFAULT_TEMPERATURE: f32 = 0.4;
 pub const MAX_REVIEWERS: usize = 12;
+/// Ngân sách token tối thiểu khi người dùng đặt `meeting.max_total_tokens`.
+pub const MIN_TOTAL_TOKENS: u64 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +233,10 @@ pub struct MeetingConfig {
     pub max_invites: u32,
     /// Người viết gắn tag reviewer cho từng section → reviewer chỉ đọc phần của mình.
     pub section_routing: bool,
+    /// Ngân sách token MỀM cho cả phiên (None = không giới hạn; nếu đặt thì ≥ 1000).
+    /// Hết chỗ giữ trước lần gọi kế tiếp → vòng họp dừng với `BudgetExhausted`.
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
 }
 
 impl Default for MeetingConfig {
@@ -642,6 +648,9 @@ impl AppConfig {
         }
         if m.max_invites > 6 {
             errs.push("số người được mời thêm tối đa 6".to_owned());
+        }
+        if m.max_total_tokens.is_some_and(|t| t < MIN_TOTAL_TOKENS) {
+            errs.push(format!("ngân sách token của phiên phải ≥ {MIN_TOTAL_TOKENS} hoặc để trống"));
         }
 
         if errs.is_empty() {
@@ -1175,6 +1184,19 @@ pub(crate) mod tests {
         ] {
             assert!(e.contains(needle), "thiếu lỗi '{needle}' trong: {e}");
         }
+    }
+
+    #[test]
+    fn max_total_tokens_defaults_to_none_and_must_be_at_least_1000() {
+        let c = with_default_provider("sk-x", "m");
+        assert_eq!(c.meeting.max_total_tokens, None);
+        let m: MeetingConfig = serde_json::from_str(r#"{"chair_id":"cto"}"#).unwrap();
+        assert_eq!(m.max_total_tokens, None, "config cũ không có field → None");
+        let mut c2 = c.clone();
+        c2.meeting.max_total_tokens = Some(999);
+        assert!(c2.validate().unwrap_err().contains("ngân sách token"));
+        c2.meeting.max_total_tokens = Some(1000);
+        c2.validate().unwrap();
     }
 
     #[test]

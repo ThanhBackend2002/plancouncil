@@ -151,6 +151,10 @@ export const STATUS_META: Record<SessionStatus | "idle", { label: string; tone: 
   converged: { label: "Hội tụ", tone: "success" },
   partially_approved: { label: "Duyệt một phần", tone: "warning" },
   max_rounds_reached: { label: "Hết số vòng", tone: "warning" },
+  truncated: { label: "Bị cắt", tone: "warning" },
+  budget_exhausted: { label: "Hết ngân sách", tone: "warning" },
+  unresolved: { label: "Chưa giải quyết", tone: "warning" },
+  interrupted: { label: "Bị gián đoạn", tone: "neutral" },
   cancelled: { label: "Đã dừng", tone: "neutral" },
   failed: { label: "Lỗi", tone: "danger" },
 };

@@ -13,7 +13,7 @@
 
 use crate::config::{AppConfig, Department, PlanDepth, RoleDef};
 use crate::llm_client::ChatMessage;
-use crate::models::{truncate_chars, PlanVersion, Review, RoundRecord, Verdict};
+use crate::models::{truncate_chars, PlanVersion, Review, RoundRecord, SessionStatus, Verdict};
 
 /// Giới hạn mỗi báo cáo phòng ban khi đưa vào context của chủ trì.
 const MAX_REPORT_CHARS: usize = 12_000;
@@ -211,6 +211,23 @@ pub fn author_refine_messages(
             fb = format_feedback(round),
         )),
     ]
+}
+
+/// Dấu hiệu nhận biết lần gọi nối tiếp (dùng cả trong test).
+pub const CONTINUE_MARKER: &str = "Continue the document, starting EXACTLY with this line:";
+
+/// Plan bị cắt do giới hạn output: hội thoại gốc + phần đã giữ lại (bỏ section dở dang),
+/// yêu cầu viết tiếp đúng từ dòng heading của section bị cắt.
+pub fn author_continue_messages(original: &[ChatMessage], kept: &str, heading_line: &str) -> Vec<ChatMessage> {
+    let mut msgs = original.to_vec();
+    msgs.push(ChatMessage::assistant(kept));
+    msgs.push(ChatMessage::user(format!(
+        "Your previous reply was cut off by the output token limit. The text above is everything kept so far \
+(the unfinished last section was removed).\n{CONTINUE_MARKER}\n{heading_line}\n\
+Output only the continuation: start with that exact line, then finish that section and every remaining section \
+of the document. Do NOT repeat earlier sections, no preamble, no code fence around the output. Keep it concise."
+    )));
+    msgs
 }
 
 /// Chủ trì chia việc cho các phòng ban — CHỈ chia nhỏ yêu cầu, không thêm yêu cầu mới.
@@ -567,10 +584,44 @@ pub fn open_issues_appendix(round: &RoundRecord, name_of: impl Fn(&str) -> Strin
     out
 }
 
+/// Phụ lục ngắn giải thích vì sao phiên dừng sớm (Truncated / BudgetExhausted).
+/// `version` = phiên bản plan được giữ làm Final.
+pub fn stop_appendix(status: SessionStatus, version: u32) -> String {
+    let why = match status {
+        SessionStatus::Truncated => format!(
+            "Bản plan kế tiếp bị cắt do giới hạn token đầu ra và không nối tiếp được một cách an toàn. \
+Final giữ phiên bản hợp lệ gần nhất (v{version})."
+        ),
+        SessionStatus::BudgetExhausted => format!(
+            "Đã chạm ngân sách token của phiên (giới hạn mềm) trước lần gọi kế tiếp. \
+Final giữ phiên bản gần nhất (v{version})."
+        ),
+        _ => return String::new(),
+    };
+    format!("\n\n---\n\n## ⚠️ Phiên dừng sớm\n\n{why}\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{RawReview, ReviewSlot};
+
+    #[test]
+    fn continue_messages_keep_history_and_name_the_heading() {
+        let orig = vec![ChatMessage::system("sys"), ChatMessage::user("req")];
+        let m = author_continue_messages(&orig, "## 1. A\nx\n", "## 2. B");
+        assert_eq!(m.len(), 4);
+        assert_eq!(m[2].role, "assistant");
+        assert_eq!(m[2].content, "## 1. A\nx\n");
+        assert!(m[3].content.contains(&format!("{CONTINUE_MARKER}\n## 2. B\n")));
+    }
+
+    #[test]
+    fn stop_appendix_explains_only_early_stops() {
+        assert!(stop_appendix(SessionStatus::Truncated, 2).contains("v2"));
+        assert!(stop_appendix(SessionStatus::BudgetExhausted, 1).contains("ngân sách"));
+        assert!(stop_appendix(SessionStatus::Converged, 1).is_empty());
+    }
 
     fn review(json: &str) -> Review {
         let raw: RawReview = serde_json::from_str(json).unwrap();

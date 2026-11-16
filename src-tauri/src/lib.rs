@@ -1,5 +1,6 @@
 //! Tauri glue: state, commands, event sink. Business logic nằm ở `orchestrator`.
 
+mod budget;
 mod config;
 #[allow(dead_code)]
 mod context_builder;

@@ -9,8 +9,30 @@ export type SessionStatus =
   | "converged"
   | "max_rounds_reached"
   | "partially_approved"
+  /** Output người viết bị cắt, không nối tiếp được → giữ phiên bản hợp lệ gần nhất. */
+  | "truncated"
+  /** Hết ngân sách token (giới hạn mềm) → giữ phiên bản gần nhất. */
+  | "budget_exhausted"
+  /** Dành cho wave sau. */
+  | "unresolved"
+  /** Dành cho wave sau. */
+  | "interrupted"
   | "cancelled"
   | "failed";
+
+export type TruncatedCallKind = "plan" | "review" | "consistency";
+export type TruncatedReason = "length" | "max_tokens_cap" | "budget" | "stream_error";
+export type BudgetState = "ok" | "warn" | "exhausted";
+
+/** Ảnh chụp ngân sách token mới nhất (event `budget`). */
+export interface BudgetSnapshot {
+  used: number;
+  reserved: number;
+  limit: number;
+  estimated: boolean;
+  soft: boolean;
+  state: BudgetState;
+}
 
 /** Scope của cuộc họp chính; phòng ban dùng id phòng ban. */
 export const MAIN_SCOPE = "main";
@@ -220,6 +242,15 @@ export type CouncilEvent =
   | { type: "review_ready"; scope: string; round: number; review: Review }
   | { type: "review_failed"; scope: string; round: number; agent: RoleId; error: string }
   | {
+      type: "truncated";
+      scope: string;
+      agent: RoleId;
+      call_kind: TruncatedCallKind;
+      recovered: boolean;
+      reason: TruncatedReason;
+    }
+  | ({ type: "budget" } & BudgetSnapshot)
+  | {
       type: "round_completed";
       scope: string;
       round: number;
@@ -301,6 +332,8 @@ export interface MeetingConfig {
   dynamic_membership: boolean;
   max_invites: number;
   section_routing: boolean;
+  /** Ngân sách token mềm cho cả phiên; null = không giới hạn (nếu đặt thì ≥ 1000). */
+  max_total_tokens?: number | null;
 }
 
 /** Thư mục dự án được cấp quyền ĐỌC. */
