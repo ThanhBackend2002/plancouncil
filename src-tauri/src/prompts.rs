@@ -81,6 +81,7 @@ const REVIEW_SCHEMA: &str = r#"{
   "verdict": "APPROVE" | "REJECT" | "ABSTAIN",
   "summary_bubble": "<one punchy sentence, MAX 15 words, shown in a speech bubble>",
   "critical_issues": ["<problem WITHIN the request's scope: what, where in the plan, concrete impact>"],
+  "sections": ["<heading numbers your critical_issues refer to, e.g. \"3.3\"; empty if APPROVE>"],
   "suggestions": ["<actionable fix, tied to an issue where possible>"],
   "out_of_scope": ["<ideas beyond the request — never a reason to REJECT>"]INVITE_FIELD
 }"#;
@@ -326,7 +327,8 @@ Feature ideas, extra platforms or future scale beyond the request go to `out_of_
 ABSTAIN: if the plan has essentially nothing in your area of expertise, reply verdict \"ABSTAIN\" with a one-sentence reason in summary_bubble — \
 you will leave the meeting. Do not abstain if you see a real risk in your area.\n\n\
 {policy}{invite_rules}\n\nOutput format: respond with ONLY a single valid JSON object (no markdown fences, no commentary) matching this schema:\n{}\n\n\
-Write string values in the same natural language as the plan. `critical_issues` must be empty when verdict is APPROVE unless you note residual risks.",
+Write string values in the same natural language as the plan. `critical_issues` must be empty when verdict is APPROVE unless you note residual risks. \
+List in `sections` the heading numbers (e.g. \"3.3\", \"2\") of the plan sections your critical issues are about.",
         persona(reviewer),
         REVIEW_SCHEMA.replace("INVITE_FIELD", &invite_field),
     );
@@ -507,7 +509,12 @@ pub fn format_feedback(round: &RoundRecord) -> String {
         };
         out.push_str(&format!("### {} — {verdict}\n", r.role));
         if !r.critical_issues.is_empty() {
-            out.push_str("Critical issues:\n");
+            out.push_str("Critical issues");
+            if !r.sections.is_empty() {
+                // Cho người viết biết section nào cần sửa.
+                out.push_str(&format!(" (sections: {})", r.sections.join(", ")));
+            }
+            out.push_str(":\n");
             for (i, it) in r.critical_issues.iter().enumerate() {
                 out.push_str(&format!("{}. {it}\n", i + 1));
             }
@@ -538,7 +545,11 @@ pub fn open_issues_appendix(round: &RoundRecord, name_of: impl Fn(&str) -> Strin
     for slot in &round.slots {
         match (&slot.review, &slot.error) {
             (Some(r), _) if r.verdict == Verdict::Reject => {
-                out.push_str(&format!("### {}\n", r.role));
+                if r.sections.is_empty() {
+                    out.push_str(&format!("### {}\n", r.role));
+                } else {
+                    out.push_str(&format!("### {} (sections: {})\n", r.role, r.sections.join(", ")));
+                }
                 for it in &r.critical_issues {
                     out.push_str(&format!("- {it}\n"));
                 }
@@ -554,4 +565,49 @@ pub fn open_issues_appendix(round: &RoundRecord, name_of: impl Fn(&str) -> Strin
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{RawReview, ReviewSlot};
+
+    fn review(json: &str) -> Review {
+        let raw: RawReview = serde_json::from_str(json).unwrap();
+        Review::from_raw("dba", "DBA", raw)
+    }
+
+    fn round_of(reviews: Vec<Review>) -> RoundRecord {
+        RoundRecord {
+            round: 2,
+            plan_version: 2,
+            slots: reviews
+                .into_iter()
+                .map(|r| ReviewSlot { agent: r.agent.clone(), review: Some(r), error: None })
+                .collect(),
+            approvals: 0,
+            converged: false,
+        }
+    }
+
+    #[test]
+    fn schema_asks_for_sections() {
+        assert!(REVIEW_SCHEMA.contains("\"sections\""));
+    }
+
+    #[test]
+    fn feedback_and_appendix_show_sections() {
+        let with = review(r#"{"verdict":"REJECT","critical_issues":["Thiếu index"],"sections":["§3.3","mục 4.2"]}"#);
+        let mut without = review(r#"{"verdict":"REJECT","critical_issues":["Không rõ owner"]}"#);
+        without.role = "PM".into();
+        let round = round_of(vec![with, without]);
+
+        let fb = format_feedback(&round);
+        assert!(fb.contains("### DBA — REJECT\nCritical issues (sections: 3.3, 4.2):\n1. Thiếu index"), "{fb}");
+        assert!(fb.contains("### PM — REJECT\nCritical issues:\n1. Không rõ owner"), "{fb}");
+
+        let app = open_issues_appendix(&round, |id| id.to_owned());
+        assert!(app.contains("### DBA (sections: 3.3, 4.2)\n- Thiếu index"), "{app}");
+        assert!(app.contains("### PM\n- Không rõ owner"), "{app}");
+    }
 }
