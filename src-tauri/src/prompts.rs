@@ -494,6 +494,8 @@ Feature ideas, extra platforms or future scale beyond the request go to `out_of_
 ABSTAIN: if the plan has essentially nothing in your area of expertise, reply verdict \"ABSTAIN\" with a one-sentence reason in summary_bubble — \
 you will leave the meeting. Do not abstain if you see a real risk in your area.\n\n\
 {policy}{invite_rules}\n\nOutput format: respond with ONLY a single valid JSON object (no markdown fences, no commentary) matching this schema:\n{}\n\n\
+`verdict` MUST be exactly one of the three uppercase English words \"APPROVE\", \"REJECT\" or \"ABSTAIN\" — never a sentence or a translation; \
+put your reasoning in `summary_bubble` and `critical_issues`. \
 Write string values in the same natural language as the plan. `critical_issues` must be empty when verdict is APPROVE unless you note residual risks. \
 List in `sections` the heading numbers (e.g. \"3.3\", \"2\") of the plan sections your critical issues are about.",
         persona(reviewer),
@@ -606,7 +608,7 @@ pub fn research_messages(
     overview: Option<&str>,
     has_workspace: bool,
     has_web: bool,
-    max_steps: u32,
+    max_steps: Option<u32>,
     company: &CompanyMode,
 ) -> Vec<serde_json::Value> {
     let mut tools = Vec::new();
@@ -622,10 +624,20 @@ what is missing, verify it in the actual code/config (search_code, read_file). N
     } else {
         ""
     };
+    // Không giới hạn: nghiên cứu kỹ tới khi đủ, ghi chú được dài hơn.
+    let (budget_rule, words) = match max_steps {
+        Some(n) => (format!("at most {n} tool calls in total"), 300),
+        None => (
+            "no fixed limit on tool calls — research as thoroughly as this plan needs (follow references, check several files/sources), \
+but stop as soon as you have enough: every call costs time and tokens"
+                .to_owned(),
+            600,
+        ),
+    };
     let system = format!(
         "{}\n[RESEARCH] You are about to {purpose}. First gather the facts you need using: {}.{docs_warning}\n\
-Rules: at most {max_steps} tool calls in total; read only what is relevant to the request; never invent file contents. \
-When you have enough, reply WITHOUT calling tools with concise research notes (max 300 words, bullet points, each bullet citing its source as a file path or URL; \
+Rules: {budget_rule}; read only what is relevant to the request; never invent file contents. \
+When you have enough, reply WITHOUT calling tools with concise research notes (max {words} words, bullet points, each bullet citing its source as a file path or URL; \
 list what ALREADY EXISTS separately from what is missing). If no research is needed, reply exactly: {NO_RESEARCH}{}",
         persona(role),
         tools.join("; "),

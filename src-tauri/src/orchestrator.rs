@@ -47,6 +47,10 @@ use crate::sections::Section;
 use crate::{routing, sections, staffing};
 use crate::tools::Toolbox;
 
+/// Độ dài tối đa (ký tự, ~100k token) của hội thoại 1 lần nghiên cứu trước khi buộc model viết ghi chú.
+/// Chốt an toàn cho chế độ "không giới hạn số lượt công cụ".
+const MAX_RESEARCH_CONTEXT_CHARS: usize = 300_000;
+
 /// Số lần thử nối tiếp tối đa khi plan bị cắt do `max_tokens`.
 const MAX_CONTINUATIONS: u32 = 2;
 
@@ -768,7 +772,9 @@ impl Council {
         }
         let tb = &self.extras.toolbox;
         let tools = tb.definitions();
-        let max_steps = self.cfg.max_tool_steps.clamp(1, 12);
+        // None = không giới hạn số lượt (vẫn dừng theo ngân sách token / Stop / giới hạn ngữ cảnh).
+        let max_steps = (self.cfg.max_tool_steps != 0).then(|| self.cfg.max_tool_steps.min(12));
+        let notes_cap = if max_steps.is_some() { 6_000 } else { 12_000 };
         let mut msgs: Vec<Value> = prompts::research_messages(
             role,
             purpose,
@@ -793,7 +799,9 @@ impl Council {
 
         let mut used = 0u32;
         loop {
-            let allow = used < max_steps;
+            // Hội thoại nghiên cứu quá dài → buộc viết ghi chú ngay (vượt cửa sổ ngữ cảnh = mất trắng phần đã đọc).
+            let room = chars(&msgs) < MAX_RESEARCH_CONTEXT_CHARS;
+            let allow = room && max_steps.map_or(true, |m| used < m);
             // Mỗi lượt gọi công cụ giữ chỗ ngân sách riêng; hết ngân sách → bỏ nghiên cứu.
             let Some(hold) = self.hold(estimate_raw_call(&msgs, ep.max_tokens)) else {
                 log::warn!("{}: hết ngân sách token → dừng bước nghiên cứu", role.name);
@@ -822,12 +830,12 @@ impl Council {
             if turn.tool_calls.is_empty() || !allow {
                 let notes = turn.content.unwrap_or_default();
                 let notes = notes.trim();
-                return Ok((!notes.is_empty() && !notes.starts_with(prompts::NO_RESEARCH)).then(|| truncate_chars(notes, 6_000)));
+                return Ok((!notes.is_empty() && !notes.starts_with(prompts::NO_RESEARCH)).then(|| truncate_chars(notes, notes_cap)));
             }
             msgs.push(turn.assistant_message.clone());
             for call in &turn.tool_calls {
                 used += 1;
-                let (result, summary, ok) = if used <= max_steps {
+                let (result, summary, ok) = if max_steps.map_or(true, |m| used <= m) {
                     tb.execute(&call.name, &call.arguments).await
                 } else {
                     ("ERROR: đã hết lượt gọi công cụ, hãy viết ghi chú ngay.".to_owned(), "hết lượt công cụ".to_owned(), false)
@@ -2341,6 +2349,49 @@ mod tests {
         assert!(sink.types().contains(&"tool_used".to_owned()));
         assert_eq!(rec.options.workspace.as_deref(), Some("game"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `max_tool_steps = 0`: không giới hạn số lượt — 20 lượt (> trần 12 cũ) đều được thực thi thật.
+    #[tokio::test]
+    async fn unlimited_tool_steps_let_research_go_past_the_old_cap() {
+        const WANTED: usize = 20;
+        let dir = temp_workspace();
+        let fs = crate::tools::WorkspaceFs::open("game", dir.to_str().unwrap()).unwrap();
+        let extras = SessionExtras { toolbox: Toolbox { workspace: Some(Arc::new(fs)), web: None }, ..SessionExtras::default() };
+        let base = standard_router(false);
+        let handler: Handler = Arc::new(move |body: &Value| {
+            let sys = system_of(body);
+            if sys.contains("[RESEARCH]") && is_author_research(&sys) {
+                assert!(sys.contains("no fixed limit on tool calls") && sys.contains("max 600 words"), "prompt không nêu con số giới hạn");
+                let msgs = body["messages"].as_array().unwrap();
+                let done = msgs.iter().filter(|m| m["role"] == "tool").count();
+                assert!(msgs.iter().filter(|m| m["role"] == "tool").all(|t| !t["content"].as_str().unwrap().contains("hết lượt")));
+                return if done < WANTED { tool_call("read_file", json!({"path":"src/score.go"})) } else { completion("- src/score.go: Submit") };
+            }
+            if sys.contains("[RESEARCH]") {
+                return completion(prompts::NO_RESEARCH);
+            }
+            base(body)
+        });
+        let (rec, _) = run_with_extras(handler, |c| c.max_tool_steps = 0, None, extras).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        let author_reads = rec.activities.iter().filter(|a| a.phase == "author" && a.ok).count();
+        assert_eq!(author_reads, WANTED);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Prompt nghiên cứu của người viết plan (không phải reviewer).
+    fn is_author_research(sys: &str) -> bool {
+        sys.contains("write the plan") || sys.contains("write your department")
+    }
+
+    #[test]
+    fn tool_steps_zero_is_valid_and_thirteen_is_not() {
+        let mut c = crate::config::tests::with_default_provider("k", "m");
+        c.max_tool_steps = 0;
+        assert!(c.validate().is_ok());
+        c.max_tool_steps = 13;
+        assert!(c.validate().unwrap_err().contains("max_tool_steps"));
     }
 
     #[tokio::test]

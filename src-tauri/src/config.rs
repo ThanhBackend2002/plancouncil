@@ -451,7 +451,8 @@ pub struct AppConfig {
     pub workspaces: Vec<Workspace>,
     pub web_search: WebSearchConfig,
     pub tool_policy: ToolPolicy,
-    /// Số lượt gọi công cụ tối đa mỗi lần nghiên cứu.
+    /// Số lượt gọi công cụ tối đa mỗi lần nghiên cứu (1..=12). `0` = không giới hạn: nghiên cứu tới khi
+    /// model tự thấy đủ (vẫn dừng theo ngân sách token / Stop / giới hạn ngữ cảnh).
     pub max_tool_steps: u32,
     /// Bảng giá model để ước tính chi phí (mặc định rỗng → chi phí `null`).
     pub pricing: Pricing,
@@ -623,8 +624,8 @@ impl AppConfig {
         if self.max_tokens == Some(0) {
             errs.push("max_tokens phải ≥ 1 hoặc để trống".to_owned());
         }
-        if !(1..=12).contains(&self.max_tool_steps) {
-            errs.push("max_tool_steps phải trong khoảng 1..=12".to_owned());
+        if self.max_tool_steps > 12 {
+            errs.push("max_tool_steps phải trong khoảng 1..=12 (0 = không giới hạn)".to_owned());
         }
         if !(1..=10).contains(&self.web_search.max_results) {
             errs.push("web_search.max_results phải trong khoảng 1..=10".to_owned());
