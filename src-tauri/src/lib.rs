@@ -4,10 +4,15 @@ mod config;
 mod health;
 mod llm_client;
 mod models;
+// Chưa nối vào command — module index tìm kiếm (SQLite) đang được xây riêng.
+#[allow(dead_code)]
+mod normalize;
 mod orchestrator;
 mod prompts;
 mod roster;
 mod routing;
+#[allow(dead_code)]
+mod search_index;
 mod staffing;
 mod storage;
 mod tools;
