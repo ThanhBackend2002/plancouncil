@@ -4,6 +4,7 @@ mod budget;
 mod config;
 #[allow(dead_code)]
 mod context_builder;
+mod cost;
 mod health;
 mod history;
 mod llm_client;
@@ -11,6 +12,7 @@ mod models;
 mod normalize;
 mod orchestrator;
 mod prompts;
+mod rerun;
 mod roster;
 mod routing;
 mod search_index;
@@ -22,6 +24,7 @@ mod storage;
 #[cfg(test)] pub(crate) mod test_support;
 mod tools;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -33,9 +36,10 @@ use uuid::Uuid;
 
 use config::{api_root, AppConfig, SessionOptions, MASK_PREFIX};
 use llm_client::{ChatMessage, Expect, LlmClient, LlmError};
-use models::{EventEnvelope, SessionRecord, SessionSummary, COUNCIL_EVENT};
-use history::{HistoryError, HistoryIndex};
-use orchestrator::{ControlAction, Council, EventSink, MeetingControl, SessionExtras};
+use models::{EventEnvelope, ParentRef, SessionRecord, SessionSummary, COUNCIL_EVENT};
+use history::{HistoryError, HistoryIndex, SessionWriter};
+use orchestrator::{Checkpoint, ControlAction, Council, EventSink, MeetingControl, Seed, SessionExtras};
+use rerun::{RerunError, RerunOverrides, RerunResult};
 use secrets::{SecretError, Secrets, Target};
 use storage::{Storage, StorageError};
 
@@ -96,6 +100,22 @@ impl EventSink for TauriSink {
     }
 }
 
+/// Checkpoint → ghi file phiên ở `spawn_blocking` (không chặn vòng họp). Thứ tự do `SessionWriter` lo.
+struct CheckpointSink {
+    writer: Arc<SessionWriter>,
+    seq: AtomicU64,
+}
+
+impl Checkpoint for CheckpointSink {
+    fn save(&self, record: SessionRecord) {
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let writer = self.writer.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            writer.write_checkpoint(seq, &record);
+        });
+    }
+}
+
 // ───────────────────────────── Errors ─────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +136,9 @@ pub enum CommandError {
     /// Key chế độ RAM đã mất sau khi khởi động lại (hoặc keyring khoá) → cần nhập lại trước khi họp.
     #[error("Thiếu API key của {label} (chỉ lưu trong RAM hoặc keyring đang khoá) — vào Cài đặt để nhập lại")]
     SecretMissing { target: Target, label: String },
+    /// `no_valid_version` / `missing_roles` / `unsupported_scope` / `invalid` (rerun / restart).
+    #[error(transparent)]
+    Rerun(#[from] RerunError),
     #[error("lỗi nội bộ: {0}")]
     Internal(String),
 }
@@ -128,6 +151,12 @@ impl Serialize for CommandError {
             message: String,
             #[serde(skip_serializing_if = "Option::is_none")]
             target: Option<&'a Target>,
+            /// Chỉ với `no_valid_version`: các phiên bản của scope.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            available_versions: Option<&'a [u32]>,
+            /// Chỉ với `missing_roles`.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            missing_roles: Option<&'a [String]>,
         }
         let target = match self {
             CommandError::SecretMissing { target, .. } => Some(target),
@@ -143,12 +172,20 @@ impl Serialize for CommandError {
             CommandError::Llm(_) => "llm",
             CommandError::History(HistoryError::Unavailable) => "index_unavailable",
             CommandError::History(HistoryError::Index(_)) => "index",
+            CommandError::Rerun(e) => e.code(),
             CommandError::Internal(_) => "internal",
+        };
+        let (available_versions, missing_roles) = match self {
+            CommandError::Rerun(RerunError::NoValidVersion { available, .. }) => (Some(available.as_slice()), None),
+            CommandError::Rerun(RerunError::MissingRoles { roles }) => (None, Some(roles.as_slice())),
+            _ => (None, None),
         };
         Wire {
             kind,
             message: self.to_string(),
             target,
+            available_versions,
+            missing_roles,
         }
         .serialize(s)
     }
@@ -302,25 +339,60 @@ async fn start_council(
     if let Some(depth) = opts.plan_depth {
         cfg.meeting.plan_depth = depth;
     }
+    launch(app, &state, LaunchSpec { prompt, cfg, opts, seed: None, parent: None }).await
+}
+
+/// Thông số đã chuẩn bị để khởi chạy 1 phiên — dùng chung cho start / rerun / restart.
+struct LaunchSpec {
+    prompt: String,
+    /// Snapshot config của riêng phiên này (đã áp thành phần / override).
+    cfg: AppConfig,
+    opts: SessionOptions,
+    seed: Option<Seed>,
+    parent: Option<ParentRef>,
+}
+
+impl From<rerun::RerunPlan> for LaunchSpec {
+    fn from(p: rerun::RerunPlan) -> Self {
+        Self { prompt: p.prompt, cfg: p.cfg, opts: p.options, seed: p.seed, parent: Some(p.parent) }
+    }
+}
+
+/// Chưa có phiên nào chạy (kiểm tra sớm trước khi làm việc nặng; `claim_slot` mới là chốt chặn thật).
+fn ensure_idle(active: &Mutex<Option<ActiveSession>>) -> CmdResult<()> {
+    if lock(active).is_some() {
+        return Err(CommandError::AlreadyRunning);
+    }
+    Ok(())
+}
+
+/// Giữ slot phiên duy nhất; đã có phiên chạy → `already_running`.
+fn claim_slot(active: &Mutex<Option<ActiveSession>>, session: ActiveSession) -> CmdResult<()> {
+    let mut active = lock(active);
+    if active.is_some() {
+        return Err(CommandError::AlreadyRunning);
+    }
+    *active = Some(session);
+    Ok(())
+}
+
+/// Kiểm tra sẵn sàng → giữ slot → chạy hội đồng ở nền; checkpoint + bản ghi cuối qua `SessionWriter`.
+async fn launch(app: AppHandle, state: &AppState, spec: LaunchSpec) -> CmdResult<Uuid> {
+    let LaunchSpec { prompt, cfg, opts, seed, parent } = spec;
     cfg.validate_ready().map_err(CommandError::Invalid)?;
     check_secrets_present(&state.secrets, &cfg, opts.web_search)?;
     let mut extras = build_extras(&cfg, &opts).await?;
     extras.auto_staff = opts.auto_staff;
+    extras.seed = seed;
+    extras.parent = parent;
     let control = extras.control.clone();
 
     let session_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
-    {
-        let mut active = lock(&state.active);
-        if active.is_some() {
-            return Err(CommandError::AlreadyRunning);
-        }
-        *active = Some(ActiveSession {
-            id: session_id,
-            cancel: cancel.clone(),
-            control,
-        });
-    }
+    claim_slot(&state.active, ActiveSession { id: session_id, cancel: cancel.clone(), control })?;
+
+    let writer = Arc::new(SessionWriter::new(state.storage.clone(), state.history.clone()));
+    extras.checkpoint = Some(Arc::new(CheckpointSink { writer: writer.clone(), seq: AtomicU64::new(0) }));
 
     let llm = LlmClient::new(state.http.clone(), &cfg);
     let council = Council::with_extras(
@@ -331,8 +403,6 @@ async fn start_council(
         cancel,
         extras,
     );
-    let storage = state.storage.clone();
-    let history = state.history.clone();
 
     tauri::async_runtime::spawn(async move {
         let guard = ActiveGuard {
@@ -342,7 +412,8 @@ async fn start_council(
         let record = council.run(prompt).await;
         drop(guard); // giải phóng slot ngay khi họp xong, trước khi I/O persist
 
-        let ok = match tauri::async_runtime::spawn_blocking(move || history.save_session(&storage, &record))
+        // Bản ghi cuối chặn mọi checkpoint đến muộn (xem `SessionWriter`).
+        let ok = match tauri::async_runtime::spawn_blocking(move || writer.write_final(&record))
             .await
         {
             Ok(Ok(())) => true,
@@ -362,6 +433,68 @@ async fn start_council(
     });
 
     Ok(session_id)
+}
+
+/// Chạy lại từ 1 phiên bản plan đã lưu → phiên MỚI (bắt đầu bằng review plan đó, kèm issue còn mở).
+/// `dry_run` chỉ kiểm tra và trả `uncovered_sections` / `missing_roles`, không khởi chạy (và không
+/// bị chặn khi đang có phiên chạy). Lỗi: `no_valid_version` (+ `available_versions`), `missing_roles`
+/// (+ `missing_roles`), `unsupported_scope`, `already_running`, `not_found`, `invalid`.
+#[tauri::command(rename_all = "snake_case")]
+async fn rerun_from_version(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: Uuid,
+    scope: String,
+    version_no: u32,
+    dry_run: Option<bool>,
+    overrides: Option<RerunOverrides>,
+) -> CmdResult<RerunResult> {
+    let dry = dry_run.unwrap_or(false);
+    if !dry {
+        ensure_idle(&state.active)?;
+    }
+    let storage = state.storage.clone();
+    let rec = blocking(move || storage.load_session(session_id)).await?;
+    let cur = state.config.read().await.clone();
+    let plan = rerun::plan_rerun(&cur, &rec, scope.trim(), version_no, &overrides.unwrap_or_default())?;
+    if dry {
+        return Ok(plan.preview);
+    }
+    if !plan.blocking.is_empty() {
+        return Err(RerunError::MissingRoles { roles: plan.preview.missing_roles }.into());
+    }
+    let preview = plan.preview.clone();
+    let id = launch(app, &state, plan.into()).await?;
+    log::info!("rerun {session_id} v{version_no} → phiên mới {id}");
+    Ok(RerunResult { new_session_id: Some(id), ..preview })
+}
+
+#[derive(Serialize)]
+struct RestartResult {
+    new_session_id: Uuid,
+}
+
+/// Chạy lại yêu cầu gốc (phiên MỚI) với thành phần + tuỳ chọn đã chụp của phiên cũ — dùng khi
+/// phiên không có phiên bản plan nào. Lỗi như `rerun_from_version` (trừ `no_valid_version`).
+#[tauri::command(rename_all = "snake_case")]
+async fn restart_from_request(app: AppHandle, state: State<'_, AppState>, session_id: Uuid) -> CmdResult<RestartResult> {
+    ensure_idle(&state.active)?;
+    let storage = state.storage.clone();
+    let rec = blocking(move || storage.load_session(session_id)).await?;
+    let cur = state.config.read().await.clone();
+    let plan = rerun::plan_restart(&cur, &rec)?;
+    let id = launch(app, &state, plan.into()).await?;
+    log::info!("restart {session_id} từ yêu cầu → phiên mới {id}");
+    Ok(RestartResult { new_session_id: id })
+}
+
+/// Token + chi phí của 1 phiên. Chi phí tính bằng bảng giá HIỆN TẠI; model chưa có giá → `null`.
+#[tauri::command(rename_all = "snake_case")]
+async fn get_usage(state: State<'_, AppState>, session_id: Uuid) -> CmdResult<cost::UsageBreakdown> {
+    let storage = state.storage.clone();
+    let rec = blocking(move || storage.load_session(session_id)).await?;
+    let pricing = state.config.read().await.pricing.clone();
+    Ok(cost::usage_breakdown(&rec, &pricing))
 }
 
 /// Đề xuất thành phần họp cho yêu cầu (chế độ "Đề xuất rồi duyệt"). Dùng cấu hình đã lưu.
@@ -838,10 +971,20 @@ pub fn run() {
             let history = HistoryIndex::open(&storage);
             {
                 // Đồng bộ index nền — không chặn khởi động; trong lúc chờ, list_sessions quét file.
+                // Trước đó: phiên còn `running` trên đĩa (app tắt giữa chừng) → `interrupted`.
+                // Lúc khởi động chưa thể có phiên đang chạy trong tiến trình này → không loại trừ id nào.
                 let (history, storage) = (history.clone(), storage.clone());
                 tauri::async_runtime::spawn(async move {
                     let t0 = Instant::now();
-                    match tauri::async_runtime::spawn_blocking(move || history.sync(&storage)).await {
+                    match tauri::async_runtime::spawn_blocking(move || {
+                        let fixed = storage.recover_interrupted(None);
+                        if !fixed.is_empty() {
+                            log::warn!("{} phiên bị gián đoạn lần trước → interrupted: {fixed:?}", fixed.len());
+                        }
+                        history.sync(&storage)
+                    })
+                    .await
+                    {
                         Ok(Some(r)) => log::info!(
                             "sync index: {} index lại, {} xoá, {} lỗi ({} ms)",
                             r.indexed,
@@ -901,6 +1044,9 @@ pub fn run() {
             test_web_search,
             check_models,
             suggest_staffing,
+            rerun_from_version,
+            restart_from_request,
+            get_usage,
             invite_member,
             dismiss_member,
             export_markdown,
@@ -928,6 +1074,40 @@ mod tests {
         assert!(v.get("target").is_none());
         let v = serde_json::to_value(CommandError::Secret(SecretError::Locked("cancel".into()))).unwrap();
         assert_eq!(v["kind"], "keyring_locked");
+    }
+
+    #[test]
+    fn rerun_errors_have_stable_codes_and_payloads() {
+        use super::{CommandError, RerunError};
+        let v = serde_json::to_value(CommandError::from(RerunError::NoValidVersion { version: 4, available: vec![1, 2] })).unwrap();
+        assert_eq!(v["kind"], "no_valid_version");
+        assert_eq!(v["available_versions"], serde_json::json!([1, 2]));
+        assert!(v.get("missing_roles").is_none());
+        let v = serde_json::to_value(CommandError::from(RerunError::MissingRoles { roles: vec!["dba".into()] })).unwrap();
+        assert_eq!(v["kind"], "missing_roles");
+        assert_eq!(v["missing_roles"], serde_json::json!(["dba"]));
+        let v = serde_json::to_value(CommandError::from(RerunError::UnsupportedScope("qa".into()))).unwrap();
+        assert_eq!(v["kind"], "unsupported_scope");
+        let v = serde_json::to_value(CommandError::from(RerunError::Invalid("x".into()))).unwrap();
+        assert_eq!(v["kind"], "invalid");
+    }
+
+    #[test]
+    fn rerun_is_rejected_while_a_session_runs() {
+        use super::{claim_slot, ensure_idle, ActiveSession, CommandError};
+        use std::sync::{Arc, Mutex};
+        let active = Mutex::new(None);
+        let mk = || ActiveSession {
+            id: uuid::Uuid::new_v4(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+            control: Arc::default(),
+        };
+        ensure_idle(&active).unwrap();
+        claim_slot(&active, mk()).unwrap();
+        // Cùng lỗi với start_council.
+        assert!(matches!(ensure_idle(&active), Err(CommandError::AlreadyRunning)));
+        assert!(matches!(claim_slot(&active, mk()), Err(CommandError::AlreadyRunning)));
+        assert_eq!(serde_json::to_value(ensure_idle(&active).unwrap_err()).unwrap()["kind"], "already_running");
     }
 
     #[test]

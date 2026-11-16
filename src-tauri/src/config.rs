@@ -386,6 +386,30 @@ pub enum ToolPolicy {
     Off,
 }
 
+/// Giá của 1 model (USD / 1 triệu token). Người dùng tự nhập — không có bảng giá sẵn, không tải từ mạng.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelPrice {
+    pub input_per_m: f64,
+    /// Giá token prompt đọc từ cache.
+    pub cached_per_m: f64,
+    pub output_per_m: f64,
+}
+
+impl ModelPrice {
+    /// Chi phí 1 lần gọi. `prompt` đã gồm phần `cached` (theo quy ước OpenAI).
+    pub fn cost(&self, prompt: u64, cached: u64, completion: u64) -> f64 {
+        let cached = cached.min(prompt);
+        ((prompt - cached) as f64 * self.input_per_m
+            + cached as f64 * self.cached_per_m
+            + completion as f64 * self.output_per_m)
+            / 1_000_000.0
+    }
+}
+
+/// Bảng giá theo tên model (đúng chuỗi `model` của role).
+pub type Pricing = std::collections::BTreeMap<String, ModelPrice>;
+
 /// Tuỳ chọn riêng cho 1 phiên họp (chọn ở màn Phòng họp).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -429,6 +453,8 @@ pub struct AppConfig {
     pub tool_policy: ToolPolicy,
     /// Số lượt gọi công cụ tối đa mỗi lần nghiên cứu.
     pub max_tool_steps: u32,
+    /// Bảng giá model để ước tính chi phí (mặc định rỗng → chi phí `null`).
+    pub pricing: Pricing,
 }
 
 impl Default for AppConfig {
@@ -453,6 +479,7 @@ impl Default for AppConfig {
             web_search: WebSearchConfig::default(),
             tool_policy: ToolPolicy::Authors,
             max_tool_steps: 6,
+            pricing: Pricing::new(),
         }
     }
 }
@@ -601,6 +628,14 @@ impl AppConfig {
         }
         if !(1..=10).contains(&self.web_search.max_results) {
             errs.push("web_search.max_results phải trong khoảng 1..=10".to_owned());
+        }
+        for (model, p) in &self.pricing {
+            if model.trim().is_empty() {
+                errs.push("bảng giá: tên model không được để trống".to_owned());
+            }
+            if [p.input_per_m, p.cached_per_m, p.output_per_m].iter().any(|v| !v.is_finite() || *v < 0.0) {
+                errs.push(format!("bảng giá '{model}': giá phải là số hữu hạn ≥ 0"));
+            }
         }
         if self.company_context.text.chars().count() > 20_000 {
             errs.push("bối cảnh công ty tối đa 20.000 ký tự".to_owned());
@@ -1313,6 +1348,29 @@ pub(crate) mod tests {
         assert!(c2.validate().unwrap_err().contains("ngân sách token"));
         c2.meeting.max_total_tokens = Some(1000);
         c2.validate().unwrap();
+    }
+
+    #[test]
+    fn pricing_defaults_empty_and_is_validated() {
+        let c = with_default_provider("sk-x", "m");
+        assert!(c.pricing.is_empty());
+        // Config cũ không có field `pricing` → rỗng.
+        let old: AppConfig = serde_json::from_str(r#"{"schema_version":3,"max_rounds":3}"#).unwrap();
+        assert!(old.pricing.is_empty());
+        let mut c2 = c.clone();
+        c2.pricing.insert("m".into(), ModelPrice { input_per_m: 2.0, cached_per_m: 0.5, output_per_m: 8.0 });
+        c2.validate().unwrap();
+        // 1M prompt (trong đó 400k cache) + 100k output.
+        let cost = c2.pricing["m"].cost(1_000_000, 400_000, 100_000);
+        assert!((cost - (1.2 + 0.2 + 0.8)).abs() < 1e-9, "{cost}");
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut c3 = c.clone();
+            c3.pricing.insert("m".into(), ModelPrice { input_per_m: 1.0, cached_per_m: bad, output_per_m: 1.0 });
+            assert!(c3.validate().unwrap_err().contains("bảng giá"), "{bad}");
+        }
+        let mut c4 = c.clone();
+        c4.pricing.insert(" ".into(), ModelPrice::default());
+        assert!(c4.validate().is_err());
     }
 
     #[test]

@@ -419,14 +419,17 @@ pub struct DepartmentRecord {
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Phần `prompt_tokens` provider đọc từ cache (bản ghi cũ: 0).
+    pub cached_tokens: u64,
     pub calls: u32,
     /// Số lần gọi mà provider không trả `usage` → token được ước lượng theo độ dài văn bản.
     pub estimated_calls: u32,
 }
 
 impl TokenUsage {
-    pub fn add(&mut self, prompt: u64, completion: u64, estimated: bool) {
+    pub fn add(&mut self, prompt: u64, cached: u64, completion: u64, estimated: bool) {
         self.prompt_tokens += prompt;
+        self.cached_tokens += cached;
         self.completion_tokens += completion;
         self.calls += 1;
         if estimated {
@@ -451,6 +454,41 @@ pub struct UsageReport {
     pub saved_tokens: u64,
     /// Số lượt review không cần gọi model (phần phụ trách không đổi).
     pub carried_reviews: u32,
+}
+
+/// Số bản ghi `CallUsage` tối đa lưu cho 1 phiên (quá thì chỉ còn tổng trong `UsageReport`).
+pub const MAX_CALL_RECORDS: usize = 2000;
+
+/// Token của 1 lần gọi LLM (để tính chi phí lúc đọc theo bảng giá hiện tại).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallUsage {
+    /// Số thứ tự lần gọi trong phiên (0, 1, 2…).
+    pub call_id: u32,
+    pub scope: String,
+    pub agent: RoleId,
+    /// Vòng review mà lần gọi thuộc về (0 = trước vòng 1: chọn thành phần / giao việc / bản nháp).
+    pub round: u32,
+    /// "assign" | "research" | "plan" | "review" | "staffing" | "consistency"
+    pub kind: String,
+    pub model: String,
+    pub prompt: u64,
+    #[serde(default)]
+    pub cached: u64,
+    pub completion: u64,
+    /// true = provider không trả `usage`, token được ước lượng theo độ dài.
+    pub estimated: bool,
+    /// "stop" | "length" | "error" | "tool_calls"
+    pub finish: String,
+    pub latency_ms: u64,
+}
+
+/// Nguồn gốc của phiên chạy lại: phiên cha + nơi họp + phiên bản plan làm điểm xuất phát.
+/// `version_no = 0` = chạy lại từ yêu cầu gốc (`restart_from_request`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentRef {
+    pub session_id: Uuid,
+    pub scope: String,
+    pub version_no: u32,
 }
 
 /// Thay đổi thành viên trong lúc họp.
@@ -529,6 +567,12 @@ pub struct SessionRecord {
     pub membership: Vec<MembershipChange>,
     #[serde(default)]
     pub staffing: Option<StaffingInfo>,
+    /// Phiên chạy lại từ phiên khác (None = phiên mới / bản ghi cũ).
+    #[serde(default)]
+    pub parent: Option<ParentRef>,
+    /// Token từng lần gọi (tối đa `MAX_CALL_RECORDS`). Bản ghi cũ: rỗng.
+    #[serde(default)]
+    pub calls: Vec<CallUsage>,
     /// Plan + round của cuộc họp chính.
     pub plans: Vec<PlanVersion>,
     pub rounds: Vec<RoundRecord>,
@@ -558,6 +602,8 @@ impl SessionRecord {
             options: SessionInfo::default(),
             membership: vec![],
             staffing: None,
+            parent: None,
+            calls: vec![],
             plans: vec![],
             rounds: vec![],
             final_markdown: None,
@@ -575,6 +621,7 @@ impl SessionRecord {
             rounds: self.rounds.len() as u32,
             departments: self.departments.len() as u32,
             total_tokens: self.usage.total.total(),
+            parent: self.parent.clone(),
         }
     }
 }
@@ -591,6 +638,8 @@ pub struct SessionSummary {
     pub departments: u32,
     #[serde(default)]
     pub total_tokens: u64,
+    #[serde(default)]
+    pub parent: Option<ParentRef>,
 }
 
 // ───────────────────────────── Events ─────────────────────────────
@@ -620,8 +669,14 @@ pub enum CouncilEvent {
         kind: String,
         prompt_tokens: u64,
         completion_tokens: u64,
+        /// Phần prompt đọc từ cache của lần gọi này.
+        cached_tokens: u64,
         estimated: bool,
         total: TokenUsage,
+        /// Chi phí cộng dồn của phiên (USD) theo bảng giá lúc bắt đầu phiên;
+        /// None nếu có lần gọi dùng model chưa có giá (xem `unpriced_models`).
+        cost_usd: Option<f64>,
+        unpriced_models: Vec<String>,
     },
     /// Role vừa dùng công cụ (đọc file / tìm web).
     ToolUsed {
@@ -949,6 +1004,20 @@ mod tests {
         let r: SessionRecord = serde_json::from_str(old).unwrap();
         assert_eq!(r.chair_id, "architect");
         assert!(r.departments.is_empty() && r.cast.is_empty());
+        // Chưa có parent / calls / cached_tokens → mặc định.
+        assert!(r.parent.is_none() && r.calls.is_empty());
+        assert_eq!(r.usage.total.cached_tokens, 0);
+        assert!(r.summary().parent.is_none());
+        let old_summary: SessionSummary = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","prompt_preview":"p","created_at":"2026-01-01T00:00:00Z",
+                "status":"interrupted","versions":1,"rounds":1}"#,
+        )
+        .unwrap();
+        assert!(old_summary.parent.is_none());
+        assert_eq!(old_summary.status, SessionStatus::Interrupted);
+        // Interrupted tệ hơn mọi kết quả "đã chốt" nhưng nhẹ hơn huỷ / lỗi.
+        assert_eq!(SessionStatus::BudgetExhausted.worst(SessionStatus::Interrupted), SessionStatus::Interrupted);
+        assert_eq!(SessionStatus::Interrupted.worst(SessionStatus::Failed), SessionStatus::Failed);
         assert_eq!(r.rounds[0].slots[0].agent, "scale_reviewer");
     }
 }

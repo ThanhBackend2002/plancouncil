@@ -138,6 +138,27 @@ pub fn is_tagged(md: &str) -> bool {
     parse(md).iter().any(|b| b.tags.is_some())
 }
 
+/// Section (số tiêu đề; không có số → tên tiêu đề) chỉ được gắn tag cho reviewer KHÔNG có trong
+/// `reviewers` — không ai trong nhóm mới phụ trách. Block không tag / tag `all` không tính.
+/// `###` kế thừa tag của `##` cha nên cũng được liệt kê khi cha bị bỏ trống.
+pub fn uncovered_sections(md: &str, reviewers: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for b in parse(md).iter().filter(|b| b.level > 0) {
+        let Some(tags) = &b.tags else { continue };
+        if tags.iter().any(|t| t.eq_ignore_ascii_case("all") || reviewers.iter().any(|r| r == t)) {
+            continue;
+        }
+        let label = b
+            .number
+            .clone()
+            .unwrap_or_else(|| b.heading.trim().trim_start_matches('#').trim().to_owned());
+        if !out.contains(&label) {
+            out.push(label);
+        }
+    }
+    out
+}
+
 /// Số đầu tiêu đề: "## 3. Data Flow" → "3", "### 3.3 Foo" → "3.3". Không có số → None.
 fn heading_number(heading: &str) -> Option<String> {
     let rest = heading.trim_start().trim_start_matches('#').trim_start();
@@ -354,6 +375,18 @@ fn is_changelog(heading: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncovered_sections_lists_only_sections_without_any_remaining_reviewer() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        // Bỏ frontend_dev: mục 3 chỉ gắn cho họ; mục 5 vẫn còn backend_dev; mục 2 là `all`.
+        assert_eq!(uncovered_sections(PLAN, &s(&["backend_dev"])), s(&["3"]));
+        // Bỏ cả hai → 3, 4, 5 và 5.1 (kế thừa tag của 5).
+        assert_eq!(uncovered_sections(PLAN, &s(&["dba"])), s(&["3", "4", "5", "5.1"]));
+        assert!(uncovered_sections(PLAN, &s(&["frontend_dev", "backend_dev"])).is_empty());
+        // Plan không tag → không có gì bị bỏ trống.
+        assert!(uncovered_sections("## 1. A\nx\n## 2. B\ny\n", &[]).is_empty());
+    }
 
     const PLAN: &str = "## 1. Overview\nTổng quan dùng chung cho mọi người, mô tả mục tiêu.\n\
 ## 2. Architecture\n<!-- reviewers: all -->\nKiến trúc tổng.\n\
