@@ -88,6 +88,7 @@ pub fn classify(err: &LlmError) -> (HealthStatus, String) {
             }
         }
         LlmError::Cancelled => (HealthStatus::Other, "đã huỷ".into()),
+        LlmError::Truncated { .. } => (HealthStatus::Other, err.to_string()),
     }
 }
 
