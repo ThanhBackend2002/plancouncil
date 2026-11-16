@@ -236,15 +236,43 @@ pub enum ControlAction {
     Dismiss { scope: String, role_id: String },
 }
 
-/// Hàng đợi lệnh điều khiển thành viên từ UI → orchestrator (đọc ở đầu mỗi vòng review).
+/// Số thông tin bổ sung tối đa trong 1 phiên và độ dài mỗi cái (giữ prompt trong tầm kiểm soát).
+pub const MAX_USER_NOTES: usize = 20;
+pub const MAX_USER_NOTE_CHARS: usize = 4_000;
+
+/// Hàng đợi lệnh điều khiển thành viên từ UI → orchestrator (đọc ở đầu mỗi vòng review),
+/// cộng thông tin bổ sung của người yêu cầu (áp vào mọi lần gọi model sau khi nhận).
 #[derive(Debug, Default)]
 pub struct MeetingControl {
     pending: Mutex<Vec<ControlAction>>,
+    notes: Mutex<Vec<UserNote>>,
 }
 
 impl MeetingControl {
     pub fn push(&self, a: ControlAction) {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).push(a);
+    }
+
+    /// Thêm thông tin bổ sung. Lỗi khi rỗng / quá dài / đã đủ số lượng.
+    pub fn add_note(&self, text: &str) -> Result<UserNote, String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err("Nội dung trống".into());
+        }
+        if text.chars().count() > MAX_USER_NOTE_CHARS {
+            return Err(format!("Nội dung vượt quá {MAX_USER_NOTE_CHARS} ký tự"));
+        }
+        let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        if notes.len() >= MAX_USER_NOTES {
+            return Err(format!("Đã đạt tối đa {MAX_USER_NOTES} thông tin bổ sung cho 1 phiên"));
+        }
+        let note = UserNote { ts: Utc::now(), text: text.to_owned() };
+        notes.push(note.clone());
+        Ok(note)
+    }
+
+    pub fn notes(&self) -> Vec<UserNote> {
+        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn take(&self, scope: &str) -> Vec<ControlAction> {
@@ -485,6 +513,7 @@ impl Council {
             rec.calls = self.calls.lock().unwrap_or_else(|e| e.into_inner()).calls.clone();
             rec.activities = self.activities.lock().unwrap_or_else(|e| e.into_inner()).clone();
             rec.membership = self.membership.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            rec.user_notes = self.extras.control.notes();
             for c in self.extra_cast.lock().unwrap_or_else(|e| e.into_inner()).iter() {
                 if !rec.cast.iter().any(|x| x.id == c.id) {
                     rec.cast.push(c.clone());
@@ -578,6 +607,7 @@ impl Council {
             r.by_role.entry(agent.to_owned()).or_default().add(p, cached, c, estimated);
             r.by_scope.entry(scope.to_owned()).or_default().add(p, cached, c, estimated);
             r.by_kind.entry(kind.to_owned()).or_default().add(p, cached, c, estimated);
+            r.by_model.entry(m.model.to_owned()).or_default().add(p, cached, c, estimated);
             r.total
         };
         let (cost_usd, unpriced_models) = {
@@ -612,6 +642,7 @@ impl Council {
             scope: scope.to_owned(),
             agent: agent.to_owned(),
             kind: kind.to_owned(),
+            model: m.model.to_owned(),
             prompt_tokens: p,
             completion_tokens: c,
             cached_tokens: cached,
@@ -699,7 +730,8 @@ impl Council {
         if let Some(sys) = msgs.first_mut().filter(|m| m.role == "system") {
             sys.content.push_str(&prompts::company_block(&self.extras.company));
         }
-        let prefix = prompts::context_prefix(notes, if overview { self.extras.overview.as_deref() } else { None });
+        let mut prefix = prompts::context_prefix(notes, if overview { self.extras.overview.as_deref() } else { None });
+        prefix.push_str(&prompts::user_notes_block(&self.extras.control.notes()));
         if !prefix.is_empty() {
             if let Some(user) = msgs.iter_mut().find(|m| m.role == "user") {
                 user.content.insert_str(0, &prefix);
@@ -957,6 +989,7 @@ impl Council {
         record.calls = std::mem::take(&mut self.calls.lock().unwrap_or_else(|e| e.into_inner()).calls);
         record.activities = std::mem::take(&mut *self.activities.lock().unwrap_or_else(|e| e.into_inner()));
         record.membership = std::mem::take(&mut *self.membership.lock().unwrap_or_else(|e| e.into_inner()));
+        record.user_notes = self.extras.control.notes();
         for c in self.extra_cast.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
             if !record.cast.iter().any(|x| x.id == c.id) {
                 record.cast.push(c);
@@ -2267,7 +2300,7 @@ mod tests {
             overview: Some(fs.overview()),
             toolbox: Toolbox { workspace: Some(Arc::new(fs)), web: None },
             company: CompanyMode::Enforced("Backend: Go only. DB: PostgreSQL.".into()),
-            info: SessionInfo { workspace: Some("game".into()), web_search: false, company_context: true },
+            info: SessionInfo { workspace: Some("game".into()), web_search: false, company_context: true, origin: None },
             ..SessionExtras::default()
         };
         let saw = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -2471,6 +2504,28 @@ mod tests {
         assert_eq!(agents, ["scale_reviewer", "pragmatic_reviewer", "cfo"], "người dùng mời không bị giới hạn max_invites");
         assert!(rec.membership.iter().all(|m| m.by == "user"));
         assert_eq!(rec.membership.len(), 2, "lệnh của scope khác không áp vào họp chính");
+    }
+
+    #[tokio::test]
+    async fn requester_notes_reach_every_prompt_after_they_arrive() {
+        let extras = SessionExtras::default();
+        extras.control.add_note("Phải hỗ trợ offline").unwrap();
+        assert!(extras.control.add_note("   ").is_err());
+        assert!(extras.control.add_note(&"x".repeat(MAX_USER_NOTE_CHARS + 1)).is_err());
+        let seen = Arc::new(AtomicUsize::new(0));
+        let base = standard_router(false);
+        let s2 = seen.clone();
+        let handler: Handler = Arc::new(move |body: &Value| {
+            let t = all_text(body);
+            assert!(t.contains("<requester_updates>") && t.contains("1. Phải hỗ trợ offline"), "mọi prompt đều có thông tin bổ sung");
+            s2.fetch_add(1, Ordering::SeqCst);
+            base(body)
+        });
+        let (rec, _) = run_with_extras(handler, |_| {}, None, extras).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert!(seen.load(Ordering::SeqCst) >= 2, "người viết + reviewer");
+        assert_eq!(rec.user_notes.len(), 1);
+        assert_eq!(rec.user_notes[0].text, "Phải hỗ trợ offline");
     }
 
     #[tokio::test]

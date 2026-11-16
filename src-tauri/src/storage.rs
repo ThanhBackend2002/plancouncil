@@ -22,6 +22,11 @@ pub const INTERRUPTED_ERROR: &str = "Ứng dụng đóng khi phiên đang chạy
 const APP_DIR: &str = "plancouncil";
 const CONFIG_FILE: &str = "config.json";
 const SESSIONS_DIR: &str = "sessions";
+/// File "lease" của phiên đang chạy ở tiến trình khác (MCP server): `<root>/live/<id>.lease`.
+const LIVE_DIR: &str = "live";
+/// Tiến trình giữ phiên làm mới lease mỗi `LEASE_REFRESH`; quá `LEASE_TTL` không làm mới = đã chết.
+pub const LEASE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+pub const LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -62,6 +67,30 @@ impl Storage {
     /// Thư mục chứa các file `<uuid>.json`.
     pub fn sessions_dir(&self) -> PathBuf {
         self.root.join(SESSIONS_DIR)
+    }
+
+    fn lease_path(&self, id: Uuid) -> PathBuf {
+        self.root.join(LIVE_DIR).join(format!("{id}.lease"))
+    }
+
+    /// Tạo / làm mới lease: báo cho tiến trình khác (app desktop) rằng phiên vẫn đang chạy thật.
+    pub fn touch_lease(&self, id: Uuid) -> Result<(), StorageError> {
+        fs::create_dir_all(self.root.join(LIVE_DIR))?;
+        fs::write(self.lease_path(id), std::process::id().to_string())?;
+        Ok(())
+    }
+
+    pub fn release_lease(&self, id: Uuid) {
+        let _ = fs::remove_file(self.lease_path(id));
+    }
+
+    /// Phiên đang được tiến trình khác chạy (lease được làm mới trong `LEASE_TTL`).
+    pub fn lease_alive(&self, id: Uuid) -> bool {
+        fs::metadata(self.lease_path(id))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < LEASE_TTL)
     }
 
     pub fn session_path(&self, id: Uuid) -> PathBuf {
@@ -125,7 +154,11 @@ impl Storage {
 
     pub fn load_session(&self, id: Uuid) -> Result<SessionRecord, StorageError> {
         match fs::read(self.session_path(id)) {
-            Ok(b) => Ok(serde_json::from_slice(&b)?),
+            Ok(b) => {
+                let mut rec: SessionRecord = serde_json::from_slice(&b)?;
+                backfill_by_model(&mut rec);
+                Ok(rec)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(StorageError::NotFound(id)),
             Err(e) => Err(e.into()),
         }
@@ -171,7 +204,7 @@ impl Storage {
                     continue;
                 }
             };
-            if Some(rec.id) == live || path != self.session_path(rec.id) {
+            if Some(rec.id) == live || path != self.session_path(rec.id) || self.lease_alive(rec.id) {
                 continue;
             }
             rec.status = SessionStatus::Interrupted;
@@ -235,6 +268,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// Bản ghi trước khi có `usage.by_model`: dựng lại từ token từng lần gọi (`calls`).
+fn backfill_by_model(rec: &mut SessionRecord) {
+    if !rec.usage.by_model.is_empty() {
+        return;
+    }
+    for c in &rec.calls {
+        rec.usage.by_model.entry(c.model.clone()).or_default().add(c.prompt, c.cached, c.completion, c.estimated);
+    }
 }
 
 #[cfg(test)]
@@ -331,4 +374,46 @@ mod tests {
         ));
         fs::remove_dir_all(s.root()).ok();
     }
+
+    #[test]
+    fn load_backfills_by_model_from_calls() {
+        let st = tmp_storage();
+        let mut rec = SessionRecord::new(Uuid::new_v4(), "x".into(), 3);
+        for (i, model) in ["a", "b", "a"].iter().enumerate() {
+            rec.calls.push(crate::models::CallUsage {
+                call_id: i as u32,
+                scope: "main".into(),
+                agent: "architect".into(),
+                round: 0,
+                kind: "plan".into(),
+                model: (*model).into(),
+                prompt: 10,
+                cached: 0,
+                completion: 5,
+                estimated: false,
+                finish: "stop".into(),
+                latency_ms: 1,
+            });
+        }
+        st.save_session(&rec).unwrap();
+        let got = st.load_session(rec.id).unwrap();
+        assert_eq!(got.usage.by_model["a"].calls, 2);
+        assert_eq!(got.usage.by_model["a"].prompt_tokens, 20);
+        assert_eq!(got.usage.by_model["b"].completion_tokens, 5);
+    }
+
+    #[test]
+    fn live_lease_protects_running_session_from_recovery() {
+        let st = tmp_storage();
+        let mut rec = SessionRecord::new(Uuid::new_v4(), "x".into(), 3);
+        rec.status = SessionStatus::Running;
+        st.save_session(&rec).unwrap();
+        st.touch_lease(rec.id).unwrap();
+        assert!(st.lease_alive(rec.id));
+        assert!(st.recover_interrupted(None).is_empty(), "phiên có lease còn hạn không bị đánh dấu interrupted");
+        st.release_lease(rec.id);
+        assert!(!st.lease_alive(rec.id));
+        assert_eq!(st.recover_interrupted(None), vec![rec.id]);
+    }
 }
+

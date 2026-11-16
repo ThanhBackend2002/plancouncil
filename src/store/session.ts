@@ -12,6 +12,7 @@ import {
   type RoundRecord,
   type MembershipChange,
   type SessionInfo,
+  type UserNote,
   type SessionRecord,
   type StaffingInfo,
   type SessionStatus,
@@ -130,6 +131,8 @@ export interface SessionState {
   cast: CastMember[];
   usage: UsageReport;
   options: SessionInfo | null;
+  /** Thông tin bổ sung giữa cuộc họp (chỉ có ở bản ghi; phiên app desktop không có). */
+  userNotes?: UserNote[];
   /** Thành phần do AI chọn (chế độ Tự động). */
   staffing: StaffingInfo | null;
   /** Ảnh chụp ngân sách token mới nhất (chỉ có khi phiên đặt giới hạn). */
@@ -199,13 +202,14 @@ function makeScope(p: {
 export const emptyUsage = (): TokenUsage => ({ prompt_tokens: 0, completion_tokens: 0, calls: 0, estimated_calls: 0 });
 export const emptyReport = (): UsageReport => ({ total: emptyUsage(), by_role: {}, by_scope: {}, by_kind: {} });
 
-function addUsage(map: Record<string, TokenUsage>, key: string, p: number, c: number, est: boolean): Record<string, TokenUsage> {
+function addUsage(map: Record<string, TokenUsage>, key: string, p: number, c: number, est: boolean, cached = 0): Record<string, TokenUsage> {
   const cur = map[key] ?? emptyUsage();
   return {
     ...map,
     [key]: {
       prompt_tokens: cur.prompt_tokens + p,
       completion_tokens: cur.completion_tokens + c,
+      cached_tokens: (cur.cached_tokens ?? 0) + cached,
       calls: cur.calls + 1,
       estimated_calls: cur.estimated_calls + (est ? 1 : 0),
     },
@@ -360,6 +364,9 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
           by_role: addUsage(s.usage.by_role, env.agent, p, c, e),
           by_scope: addUsage(s.usage.by_scope, env.scope, p, c, e),
           by_kind: addUsage(s.usage.by_kind, env.kind, p, c, e),
+          by_model: env.model
+            ? addUsage(s.usage.by_model ?? {}, env.model, p, c, e, (env as { cached_tokens?: number }).cached_tokens ?? 0)
+            : s.usage.by_model,
         },
       };
     }
@@ -802,6 +809,7 @@ export function fromRecord(rec: SessionRecord, readOnly = true): SessionState {
     cast: rec.cast ?? [],
     usage: rec.usage ?? emptyReport(),
     options: rec.options ?? null,
+    userNotes: rec.user_notes ?? [],
     staffing: rec.staffing ?? null,
     scopeOrder: [MAIN_SCOPE, ...(rec.departments ?? []).map((d) => d.id)],
     scopes,

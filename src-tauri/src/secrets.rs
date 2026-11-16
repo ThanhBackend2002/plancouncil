@@ -357,6 +357,33 @@ impl Secrets {
     /// key plaintext còn trong config.json sang keyring. Không bao giờ fail — lỗi ghi vào trạng thái.
     pub fn startup(&self, cfg: &mut AppConfig) {
         let mut inner = self.lock();
+        self.load_keys(&mut inner, cfg);
+        let legacy: Vec<Target> = targets(cfg).into_iter().filter(|t| inner.legacy.contains(&t.account())).collect();
+        for t in legacy {
+            match self.migrate_one(&mut inner, cfg, &t) {
+                Ok(()) => log::info!("đã chuyển key '{}' từ config.json vào keyring", t.account()),
+                Err(e) => {
+                    log::warn!("chưa chuyển được key '{}' vào keyring: {e}", t.account());
+                    inner.issues.insert(t.account(), Issue::new("Chưa chuyển được key vào keyring", &e));
+                }
+            }
+        }
+        drop(inner);
+        let left = self.leftover_files();
+        if !left.is_empty() {
+            log::warn!("{} file backup/hỏng còn chứa API key plaintext", left.len());
+        }
+    }
+
+    /// Như `startup` nhưng CHỈ ĐỌC: nạp key vào `cfg`, không migrate / không ghi file nào.
+    /// Dùng cho tiến trình phụ (MCP server) chạy song song với app desktop.
+    pub fn hydrate_readonly(&self, cfg: &mut AppConfig) {
+        let mut inner = self.lock();
+        self.load_keys(&mut inner, cfg);
+    }
+
+    /// Nạp key từ keyring / secrets.json vào `cfg`; key plaintext trong config.json được giữ và đánh dấu `legacy`.
+    fn load_keys(&self, inner: &mut Inner, cfg: &mut AppConfig) {
         inner.legacy.clear();
         inner.issues.clear();
         let file = read_file_map(&self.secrets_path()).inspect_err(|e| log::error!("không đọc được {SECRETS_FILE}: {e}"));
@@ -385,21 +412,6 @@ impl Secrets {
                 },
                 KeyStorage::Memory => {}
             }
-        }
-        let legacy: Vec<Target> = targets(cfg).into_iter().filter(|t| inner.legacy.contains(&t.account())).collect();
-        for t in legacy {
-            match self.migrate_one(&mut inner, cfg, &t) {
-                Ok(()) => log::info!("đã chuyển key '{}' từ config.json vào keyring", t.account()),
-                Err(e) => {
-                    log::warn!("chưa chuyển được key '{}' vào keyring: {e}", t.account());
-                    inner.issues.insert(t.account(), Issue::new("Chưa chuyển được key vào keyring", &e));
-                }
-            }
-        }
-        drop(inner);
-        let left = self.leftover_files();
-        if !left.is_empty() {
-            log::warn!("{} file backup/hỏng còn chứa API key plaintext", left.len());
         }
     }
 

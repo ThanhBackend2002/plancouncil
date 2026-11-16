@@ -2,7 +2,7 @@
 
 Phòng họp Multi-Agent dạng "công ty": bạn tự quản lý các vai trò (C-Level → Staff, mỗi role một model) và phòng ban. Chủ trì giao việc → các phòng ban họp nội bộ song song → chủ trì tổng hợp plan → reviewer phản biện cho tới khi hội tụ. Giao diện phòng họp pixel-art, nhân vật trao đổi bằng bong bóng thoại.
 
-Tài liệu: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (kiến trúc, IPC contract, bảo mật) · [docs/ROADMAP.md](docs/ROADMAP.md) (các bước tiếp theo).
+Tài liệu: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (kiến trúc, IPC contract, bảo mật) · [docs/ROADMAP.md](docs/ROADMAP.md) (các bước tiếp theo) · [docs/MCP.md](docs/MCP.md) (dùng từ Claude Code qua MCP: `plancouncil --mcp`).
 
 ## Cấu trúc
 

@@ -11,7 +11,7 @@ import { Badge, Panel, cx } from "./ui";
 /** Chỉ báo lỗi get_usage 1 lần / phiên để không spam toast khi backend chưa có lệnh. */
 const usageErrorShown = new Set<string>();
 
-const fmtUsd = (v: number | null | undefined): string => (v == null ? "—" : v < 0.01 && v > 0 ? "<$0.01" : `$${v.toFixed(v < 1 ? 3 : 2)}`);
+export const fmtUsd = (v: number | null | undefined): string => (v == null ? "—" : v < 0.01 && v > 0 ? "<$0.01" : `$${v.toFixed(v < 1 ? 3 : 2)}`);
 
 /**
  * Thanh tiến độ phía trên hội thoại: phase + round, ngân sách token (giới hạn mềm), chi phí.
@@ -40,6 +40,8 @@ export const ProgressBar = memo(function ProgressBar() {
       .then((u) => alive && setUsage(u))
       .catch((e) => {
         if (!alive || usageErrorShown.has(id)) return;
+        // Phiên vừa bắt đầu chưa có checkpoint trên đĩa → not_found là bình thường; sẽ lấy lại khi phiên kết thúc.
+        if (!terminal && (e as { kind?: string } | null)?.kind === "not_found") return;
         usageErrorShown.add(id);
         toastError(e, "Không lấy được chi phí");
       });

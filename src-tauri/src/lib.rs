@@ -8,6 +8,7 @@ mod cost;
 mod health;
 mod history;
 mod llm_client;
+mod mcp;
 mod models;
 mod normalize;
 mod orchestrator;
@@ -110,7 +111,8 @@ impl Checkpoint for CheckpointSink {
     fn save(&self, record: SessionRecord) {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let writer = self.writer.clone();
-        tauri::async_runtime::spawn_blocking(move || {
+        // tokio trực tiếp (không qua `tauri::async_runtime`): dùng chung cho app và MCP server.
+        tokio::task::spawn_blocking(move || {
             writer.write_checkpoint(seq, &record);
         });
     }
@@ -252,14 +254,14 @@ async fn build_extras(cfg: &AppConfig, opts: &SessionOptions) -> CmdResult<Sessi
             .workspace(id)
             .ok_or_else(|| CommandError::Invalid("Workspace đã chọn không còn trong cấu hình".into()))?
             .clone();
-        let fs = tauri::async_runtime::spawn_blocking(move || tools::WorkspaceFs::open(&w.name, &w.path))
+        let fs = tokio::task::spawn_blocking(move || tools::WorkspaceFs::open(&w.name, &w.path))
             .await
             .map_err(|e| CommandError::Internal(e.to_string()))?
             .map_err(CommandError::Invalid)?;
         let fs = Arc::new(fs);
         let f2 = fs.clone();
         extras.overview = Some(
-            tauri::async_runtime::spawn_blocking(move || f2.overview())
+            tokio::task::spawn_blocking(move || f2.overview())
                 .await
                 .map_err(|e| CommandError::Internal(e.to_string()))?,
         );
@@ -613,6 +615,9 @@ async fn delete_session(state: State<'_, AppState>, session_id: Uuid) -> CmdResu
             "Không thể xoá phiên đang chạy".into(),
         ));
     }
+    if state.storage.lease_alive(session_id) {
+        return Err(CommandError::Invalid("Phiên đang chạy ở tiến trình khác (Claude Code / MCP) — không thể xoá".into()));
+    }
     let storage = state.storage.clone();
     let history = state.history.clone();
     blocking(move || history.delete_session(&storage, session_id)).await
@@ -950,6 +955,11 @@ async fn delete_leftover_files(state: State<'_, AppState>, files: Vec<String>) -
 }
 
 // ───────────────────────────── Entry ─────────────────────────────
+
+/// `plancouncil --mcp`: MCP server qua stdio cho Claude Code (không mở cửa sổ). Trả mã thoát.
+pub fn run_mcp() -> i32 {
+    mcp::serve()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
