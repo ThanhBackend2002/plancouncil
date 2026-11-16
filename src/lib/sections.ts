@@ -17,8 +17,31 @@ export interface SectionPair {
   status: SectionStatus;
 }
 
-const H2 = /^##\s+(.+?)\s*#*\s*$/;
-const FENCE = /^ {0,3}(`{3,}|~{3,})/;
+const H2 = /^ {0,3}##\s+(.+?)\s*#*\s*$/;
+/** Fence mở (CommonMark): thụt ≤ 3 dấu cách, ≥ 3 dấu ` hoặc ~; info của fence ` không được chứa `. */
+// Cờ `s`: `.` khớp cả `\r` (file CRLF tách theo `\n` vẫn còn `\r` cuối dòng).
+const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})(.*)$/s;
+
+interface Fence {
+  ch: string;
+  len: number;
+}
+
+/** Dòng mở fence → ký tự + độ dài; null nếu không phải fence mở. */
+export function fenceOpen(line: string): Fence | null {
+  const m = FENCE_OPEN.exec(line);
+  if (!m) return null;
+  const marker = m[1]!;
+  const ch = marker[0]!;
+  if (ch === "`" && m[2]!.includes("`")) return null;
+  return { ch, len: marker.length };
+}
+
+/** Dòng đóng fence: cùng ký tự, dài ≥ fence mở, thụt ≤ 3 dấu cách, sau đó chỉ có khoảng trắng. */
+export function closesFence(line: string, open: Fence): boolean {
+  const m = /^ {0,3}(`+|~+)\s*$/.exec(line);
+  return !!m && m[1]![0] === open.ch && m[1]!.length >= open.len;
+}
 
 /** Bỏ phần trong ngoặc (vd "Changelog (v1 → v2)") để heading khớp giữa các version. */
 export function sectionKey(title: string): string {
@@ -32,14 +55,19 @@ export function sectionKey(title: string): string {
 export function splitSections(md: string): Section[] {
   const out: Section[] = [];
   let cur: { title: string; lines: string[] } = { title: "", lines: [] };
-  let inFence = false;
+  let fence: Fence | null = null;
   const flush = () => {
     const body = cur.lines.join("\n").replace(/^\n+|\s+$/g, "");
     if (cur.title || body) out.push({ key: cur.title ? sectionKey(cur.title) : "__intro", title: cur.title || "(Mở đầu)", body });
   };
   for (const line of md.split("\n")) {
-    if (FENCE.test(line)) inFence = !inFence;
-    const m = !inFence ? H2.exec(line) : null;
+    let m: RegExpExecArray | null = null;
+    if (fence) {
+      if (closesFence(line, fence)) fence = null;
+    } else {
+      fence = fenceOpen(line);
+      if (!fence) m = H2.exec(line);
+    }
     if (m) {
       flush();
       cur = { title: m[1]!, lines: [] };
