@@ -551,5 +551,6 @@ pub fn default_meeting() -> MeetingConfig {
         dynamic_membership: true,
         max_invites: 2,
         section_routing: true,
+        max_total_tokens: None,
     }
 }

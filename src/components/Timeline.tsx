@@ -15,6 +15,7 @@ type Msg =
   | { key: string; kind: "round"; round: RoundView }
   | { key: string; kind: "tool"; activity: ToolActivity }
   | { key: string; kind: "member"; change: MembershipChange }
+  | { key: string; kind: "notice"; agentId: RoleId; text: string }
   | { key: string; kind: "outcome" };
 
 function buildMessages(scope: ScopeState, running: boolean): Msg[] {
@@ -48,6 +49,13 @@ function buildMessages(scope: ScopeState, running: boolean): Msg[] {
         .forEach(({ m, i }) => out.push({ key: `m${i}`, kind: "member", change: m }));
       if (r.completed) out.push({ key: `rc${r.round}`, kind: "round", round: r });
     }
+    for (const n of scope.notices ?? []) {
+      if (n.planVersion === p.version) out.push({ key: n.key, kind: "notice", agentId: n.agentId, text: n.text });
+    }
+  }
+  // Thông báo xảy ra trước khi có plan nào (vd. v1 bị cắt khi chưa nhận agent_thinking).
+  for (const n of scope.notices ?? []) {
+    if (!scope.plans.some((p) => p.version === n.planVersion)) out.push({ key: n.key, kind: "notice", agentId: n.agentId, text: n.text });
   }
   if (!running && scope.status !== "idle" && scope.status !== "running") out.push({ key: "outcome", kind: "outcome" });
   return out;
@@ -118,6 +126,8 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
               return <ToolLine key={m.key} activity={m.activity} resolve={resolve} />;
             case "member":
               return <MemberLine key={m.key} change={m.change} resolve={resolve} />;
+            case "notice":
+              return <SystemLine key={m.key} text={`${resolve(m.agentId).name}: ${m.text}`} />;
             case "outcome":
               return (
                 <Outcome
@@ -405,6 +415,10 @@ const Outcome = memo(function Outcome({
       : `Tất cả reviewer đã APPROVE ở round ${rounds}.`,
     partially_approved: "Các reviewer còn hoạt động đã APPROVE, nhưng có reviewer không review được.",
     max_rounds_reached: `Hết ${maxRounds} vòng mà vẫn còn REJECT. Final có kèm mục Open Issues.`,
+    truncated: "Plan mới bị cắt do giới hạn token và không nối tiếp được. Final giữ phiên bản hợp lệ gần nhất.",
+    budget_exhausted: "Đã chạm ngân sách token của phiên. Final giữ phiên bản gần nhất.",
+    unresolved: "Còn vấn đề chưa được xử lý.",
+    interrupted: "Phiên bị gián đoạn.",
     cancelled: "Phiên đã bị dừng.",
     failed: error ?? "Gặp lỗi.",
   };

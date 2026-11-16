@@ -14,8 +14,14 @@
 //!
 //! Orchestrator **không phụ thuộc Tauri**: nó chỉ biết `EventSink` → test được bằng mock HTTP server.
 //! Số request LLM đồng thời bị giới hạn bởi semaphore (`max_parallel_calls`).
+//!
+//! Mọi lần gọi LLM đều giữ chỗ ngân sách token trước (`BudgetLedger`, giới hạn mềm) và settle
+//! sau khi xong — kể cả khi lỗi / huỷ (`Hold` tự trả chỗ khi bị drop).
+//! Plan bị cắt (`finish_reason=length`) → nối tiếp tối đa `MAX_CONTINUATIONS` lần; không cứu được
+//! → dừng vòng họp với `Truncated`, giữ phiên bản hợp lệ gần nhất.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,12 +34,99 @@ use uuid::Uuid;
 
 use serde_json::{json, Value};
 
-use crate::config::{AppConfig, Department, RoleDef, ToolPolicy};
-use crate::llm_client::{unwrap_markdown_fence, ChatMessage, Expect, LlmClient, LlmError, StreamSignal, Usage};
+use crate::budget::{BudgetLedger, ReservationId};
+use crate::config::{AppConfig, Department, ResolvedEndpoint, RoleDef, ToolPolicy};
+use crate::llm_client::{
+    unwrap_markdown_fence, ChatMessage, Completion, Expect, Finish, LlmClient, LlmError, StreamSignal, Usage,
+    DEFAULT_OUTPUT_TOKENS, OUTPUT_TOKENS_CAP,
+};
 use crate::models::*;
 use crate::prompts::{self, CompanyMode, PlanContext, PromptOpts};
-use crate::{routing, staffing};
+use crate::{routing, sections, staffing};
 use crate::tools::Toolbox;
+
+/// Số lần thử nối tiếp tối đa khi plan bị cắt do `max_tokens`.
+const MAX_CONTINUATIONS: u32 = 2;
+
+/// Ước lượng để giữ chỗ ngân sách: token prompt (×1.1 bù sai số tokenizer) + trần output.
+fn budget_estimate(prompt_tokens: usize, max_tokens: Option<u32>) -> u64 {
+    (prompt_tokens as u64) * 11 / 10 + u64::from(max_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS))
+}
+
+fn estimate_call(msgs: &[ChatMessage], max_tokens: Option<u32>) -> u64 {
+    budget_estimate(msgs.iter().map(|m| sections::approx_tokens(&m.content)).sum(), max_tokens)
+}
+
+/// Như `estimate_call` cho hội thoại có công cụ (message là JSON thô).
+fn estimate_raw_call(msgs: &[Value], max_tokens: Option<u32>) -> u64 {
+    budget_estimate(msgs.iter().map(|m| sections::approx_tokens(&m.to_string())).sum(), max_tokens)
+}
+
+/// Kiểm tra phần nối tiếp của plan bị cắt. Chỉ nhận khi: model tự dừng (`Stop`), dòng đầu
+/// (sau khi bỏ dòng trống) đúng là heading được yêu cầu, và bản ghép không còn code fence mở.
+/// Trả về markdown đã ghép.
+fn accept_continuation(kept: &str, heading: &str, c: &Completion) -> Option<String> {
+    if c.finish != Finish::Stop {
+        return None;
+    }
+    let body = unwrap_markdown_fence(&c.text);
+    let first = body.lines().next()?;
+    if first.trim() != heading.trim() {
+        return None;
+    }
+    let joined = format!("{kept}{body}");
+    let (_, fence_open) = sections::scan_lines(&joined);
+    (!fence_open).then(|| joined.trim().to_owned())
+}
+
+/// Kết quả 1 lần người viết ra plan.
+enum Authored {
+    Plan(PlanVersion),
+    /// Không tạo được phiên bản mới → vòng họp dừng với trạng thái này
+    /// (`Truncated` / `BudgetExhausted`), phiên bản trước vẫn là Final.
+    Stopped(SessionStatus),
+}
+
+/// Prompt review đã dựng sẵn (để giữ chỗ ngân sách cho cả nhóm trước khi gọi).
+struct PreparedReview {
+    ep: ResolvedEndpoint,
+    messages: Vec<ChatMessage>,
+    strict: bool,
+    /// Token tiết kiệm nhờ chỉ gửi phần plan được gắn tag (ghi nhận khi thực sự gọi).
+    saved: Option<u64>,
+}
+
+/// Việc của 1 reviewer trong round: prompt + chỗ giữ, hoặc lỗi dựng prompt.
+type ReviewWork<'a> = Result<(PreparedReview, Hold<'a>), LlmError>;
+
+/// Chỗ giữ ngân sách của 1 lần gọi. Không settle tường minh (lỗi / huỷ / `?`) → Drop tự trả chỗ, cộng 0 token.
+struct Hold<'a> {
+    council: &'a Council,
+    id: Option<ReservationId>,
+    est: u64,
+}
+
+impl Hold<'_> {
+    fn settle(mut self, usage: Option<Usage>, fallback: u64) {
+        if let Some(id) = self.id.take() {
+            self.council.settle_budget(id, usage, fallback);
+        }
+    }
+
+    /// Lần gọi bị cắt (usage bị mất theo lỗi) → tính bằng số ước lượng lúc giữ chỗ.
+    fn settle_truncated(self) {
+        let est = self.est;
+        self.settle(None, est);
+    }
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.council.settle_budget(id, Some(Usage::default()), 0);
+        }
+    }
+}
 
 /// Ngữ cảnh bổ sung của 1 phiên: công cụ, bối cảnh công ty, tổng quan workspace.
 #[derive(Clone, Default)]
@@ -201,6 +294,10 @@ pub struct Council {
     membership: Mutex<Vec<MembershipChange>>,
     /// Role được mời giữa chừng (bổ sung vào cast của bản ghi).
     extra_cast: Mutex<Vec<CastMember>>,
+    /// Ngân sách token của phiên (`meeting.max_total_tokens`).
+    budget: BudgetLedger,
+    /// Có reviewer bị cắt output ở bất kỳ nơi họp nào → phiên không bao giờ kết thúc `Converged`.
+    review_truncated: AtomicBool,
 }
 
 impl Council {
@@ -214,7 +311,10 @@ impl Council {
         extras: SessionExtras,
     ) -> Self {
         let permits = cfg.max_parallel_calls.clamp(1, 16) as usize;
+        let budget = BudgetLedger::new(cfg.meeting.max_total_tokens);
         Self {
+            budget,
+            review_truncated: AtomicBool::new(false),
             llm,
             cfg,
             emitter: Emitter {
@@ -237,6 +337,15 @@ impl Council {
     fn prompt_opts(&self) -> PromptOpts {
         let m = &self.cfg.meeting;
         PromptOpts { depth: m.plan_depth, routing: m.section_routing, strict_first_round: m.strict_first_round }
+    }
+
+    /// Ước lượng token cho lần chọn thành phần (dựng đúng prompt mà `staffing::propose` sẽ gửi).
+    fn staffing_estimate(&self, request: &str) -> u64 {
+        let m = &self.cfg.meeting;
+        let Some(coord) = self.cfg.role(&m.chair_id) else { return 0 };
+        let Some(ep) = self.cfg.resolve(&coord.id) else { return 0 };
+        let msgs = prompts::staffing_messages(coord, &self.cfg, request, m.max_auto_reviewers, m.max_auto_departments, &self.extras.company);
+        estimate_call(&msgs, ep.max_tokens)
     }
 
     /// Ghi token tiết kiệm được (review theo section / giữ nguyên APPROVE).
@@ -320,6 +429,78 @@ impl Council {
         });
     }
 
+    // ── ngân sách ──
+
+    /// Giữ chỗ cho 1 lần gọi. None = hết ngân sách (đã emit `Budget { state: "exhausted" }`).
+    fn hold(&self, est: u64) -> Option<Hold<'_>> {
+        self.hold_group(&[est]).map(|mut v| v.remove(0))
+    }
+
+    /// Giữ chỗ cho cả nhóm lần gọi chạy song song: hoặc tất cả, hoặc không cái nào.
+    fn hold_group(&self, ests: &[u64]) -> Option<Vec<Hold<'_>>> {
+        match self.budget.reserve_group(ests) {
+            Some(ids) => Some(
+                ids.into_iter()
+                    .zip(ests)
+                    .map(|(id, &est)| Hold { council: self, id: Some(id), est })
+                    .collect(),
+            ),
+            None => {
+                let need: u64 = ests.iter().sum();
+                log::warn!("hết ngân sách token: cần giữ ~{need} token, {:?}", self.budget.snapshot());
+                self.emit_budget(Some("exhausted"));
+                None
+            }
+        }
+    }
+
+    fn settle_budget(&self, id: ReservationId, usage: Option<Usage>, fallback: u64) {
+        self.budget.settle(id, usage, fallback);
+        self.emit_budget(None);
+    }
+
+    /// Emit ảnh chụp ngân sách (chỉ khi người dùng đặt giới hạn).
+    fn emit_budget(&self, state: Option<&str>) {
+        let s = self.budget.snapshot();
+        let Some(limit) = s.limit else { return };
+        self.emitter.send(CouncilEvent::Budget {
+            used: s.used,
+            reserved: s.reserved,
+            limit,
+            estimated: s.estimated,
+            soft: true,
+            state: state.unwrap_or(s.state()).to_owned(),
+        });
+    }
+
+    /// Ghi token của lần gọi + settle chỗ giữ bằng cùng con số (thiếu usage → ước lượng theo độ dài).
+    #[allow(clippy::too_many_arguments)]
+    fn account(
+        &self,
+        hold: Hold<'_>,
+        scope: &str,
+        agent: &str,
+        kind: &str,
+        usage: Option<Usage>,
+        prompt_chars: usize,
+        output_chars: usize,
+    ) {
+        self.record_usage(scope, agent, kind, usage, prompt_chars, output_chars);
+        let real = usage.filter(|u| u.prompt_tokens + u.completion_tokens > 0);
+        hold.settle(real, estimate_tokens(prompt_chars) + estimate_tokens(output_chars));
+    }
+
+    fn emit_truncated(&self, scope: &str, agent: &str, call_kind: &str, recovered: bool, reason: &str) {
+        log::warn!("[{scope}] {agent}: output {call_kind} bị cắt ({reason}), recovered={recovered}");
+        self.emitter.send(CouncilEvent::Truncated {
+            scope: scope.to_owned(),
+            agent: agent.to_owned(),
+            call_kind: call_kind.to_owned(),
+            recovered,
+            reason: reason.to_owned(),
+        });
+    }
+
     // ── bối cảnh ──
 
     /// Gắn bối cảnh công ty vào system prompt và dữ liệu bổ sung vào đầu user message.
@@ -390,6 +571,11 @@ impl Council {
         let mut used = 0u32;
         loop {
             let allow = used < max_steps;
+            // Mỗi lượt gọi công cụ giữ chỗ ngân sách riêng; hết ngân sách → bỏ nghiên cứu.
+            let Some(hold) = self.hold(estimate_raw_call(&msgs, ep.max_tokens)) else {
+                log::warn!("{}: hết ngân sách token → dừng bước nghiên cứu", role.name);
+                return Ok(None);
+            };
             let turn = match self.llm.chat_tools(&ep, &msgs, &tools, allow, &self.cancel).await {
                 Ok(t) => t,
                 Err(LlmError::Cancelled) => return Err(Halt::Cancelled),
@@ -406,7 +592,7 @@ impl Council {
             };
             let out_chars = turn.content.as_deref().map_or(0, str::len)
                 + turn.tool_calls.iter().map(|c| c.arguments.len() + c.name.len()).sum::<usize>();
-            self.record_usage(scope, &role.id, "research", turn.usage, chars(&msgs), out_chars);
+            self.account(hold, scope, &role.id, "research", turn.usage, chars(&msgs), out_chars);
 
             if turn.tool_calls.is_empty() || !allow {
                 let notes = turn.content.unwrap_or_default();
@@ -494,14 +680,19 @@ impl Council {
         // AI tự chọn thành phần họp (chế độ Tự động) — trước khi công bố thành phần.
         let mut staffing = None;
         if self.extras.auto_staff {
-            if let Ok((info, usage, pc, oc)) =
-                staffing::propose(&self.llm, &self.cfg, &prompt, &self.extras.company, &self.cancel).await
-            {
-                let m = &mut self.cfg.meeting;
-                m.chair_id = info.chair_id.clone();
-                m.reviewer_ids = info.reviewer_ids.clone();
-                m.department_ids = info.department_ids.clone();
-                staffing = Some((info, usage, pc, oc));
+            // Giữ chỗ ngân sách trực tiếp trên sổ (chưa emit gì trước `SessionStarted`); settle sau đó.
+            match self.budget.reserve(self.staffing_estimate(&prompt)) {
+                None => log::warn!("ngân sách token quá nhỏ cho bước chọn thành phần → dùng cấu hình mặc định"),
+                Some(rid) => match staffing::propose(&self.llm, &self.cfg, &prompt, &self.extras.company, &self.cancel).await {
+                    Ok((info, usage, pc, oc)) => {
+                        let m = &mut self.cfg.meeting;
+                        m.chair_id = info.chair_id.clone();
+                        m.reviewer_ids = info.reviewer_ids.clone();
+                        m.department_ids = info.department_ids.clone();
+                        staffing = Some((info, usage, pc, oc, rid));
+                    }
+                    Err(_) => self.budget.settle(rid, Some(Usage::default()), 0),
+                },
             }
         }
 
@@ -531,8 +722,15 @@ impl Council {
                 .collect(),
             options: self.extras.info.clone(),
         });
-        if let Some((info, usage, pc, oc)) = staffing {
+        if let Some((info, usage, pc, oc, rid)) = staffing {
             self.record_usage(MAIN_SCOPE, &info.chair_id, "staffing", usage, pc, oc);
+            let real = usage.filter(|u| u.prompt_tokens + u.completion_tokens > 0);
+            if real.is_none() && pc + oc == 0 {
+                // Không gọi model (chưa có chủ trì / model) → không tốn token.
+                self.settle_budget(rid, Some(Usage::default()), 0);
+            } else {
+                self.settle_budget(rid, real, estimate_tokens(pc) + estimate_tokens(oc));
+            }
             self.emitter.send(CouncilEvent::StaffingDecided { staffing: info.clone() });
             record.staffing = Some(info);
         }
@@ -597,7 +795,7 @@ impl Council {
         record.rounds = res.rounds;
         outcome?;
 
-        let status = res.status.unwrap_or(SessionStatus::MaxRoundsReached);
+        let status = self.aggregate_status(res.status.unwrap_or(SessionStatus::MaxRoundsReached), &record.departments);
         let final_md = res.final_markdown.unwrap_or_default();
         record.status = status;
         record.final_markdown = Some(final_md.clone());
@@ -607,6 +805,21 @@ impl Council {
             final_markdown: final_md,
         });
         Ok(())
+    }
+
+    /// Trạng thái cuối của phiên = kết quả tệ nhất giữa cuộc họp chính và các phòng ban dừng sớm
+    /// (`Truncated` / `BudgetExhausted`). Phòng ban lỗi / hết vòng không hạ trạng thái phiên
+    /// (báo cáo của họ vẫn vào cuộc họp chính như trước). Có reviewer bị cắt → không bao giờ `Converged`.
+    fn aggregate_status(&self, main: SessionStatus, depts: &[DepartmentRecord]) -> SessionStatus {
+        let mut status = depts
+            .iter()
+            .map(|d| d.status)
+            .filter(|s| matches!(s, SessionStatus::Truncated | SessionStatus::BudgetExhausted))
+            .fold(main, SessionStatus::worst);
+        if status == SessionStatus::Converged && self.review_truncated.load(AtomicOrdering::SeqCst) {
+            status = SessionStatus::PartiallyApproved;
+        }
+        status
     }
 
     /// Giao việc + cho các phòng ban họp song song. Trả về `(tên phòng ban, final plan)` cho chủ trì.
@@ -719,21 +932,30 @@ impl Council {
         };
         let mut tasks: HashMap<String, String> = HashMap::new();
 
-        if let Some(ep) = self.cfg.resolve(&chair.id) {
+        let ready = self.cfg.resolve(&chair.id).and_then(|ep| {
+            let msgs = self.decorate(prompts::assignment_messages(chair, prompt, depts, self.cfg.meeting.plan_depth), None, false);
+            match self.hold(estimate_call(&msgs, ep.max_tokens)) {
+                Some(hold) => Some((ep, msgs, hold)),
+                None => {
+                    log::warn!("hết ngân sách token → bỏ bước giao việc, phòng ban nhận nguyên yêu cầu");
+                    None
+                }
+            }
+        });
+        if let Some((ep, msgs, hold)) = ready {
             self.emitter.send(CouncilEvent::AgentThinking {
                 scope: MAIN_SCOPE.into(),
                 agent: chair.id.clone(),
                 round: 0,
                 plan_version: 0,
             });
-            let msgs = self.decorate(prompts::assignment_messages(chair, prompt, depts, self.cfg.meeting.plan_depth), None, false);
             let result = {
                 let _permit = self.permit().await?;
                 self.llm.chat_json::<RawAssignments>(&ep, &msgs, &self.cancel).await
             };
             match result {
                 Ok((raw, text, usage)) => {
-                    self.record_usage(MAIN_SCOPE, &chair.id, "assign", usage, msg_chars(&msgs), text.len());
+                    self.account(hold, MAIN_SCOPE, &chair.id, "assign", usage, msg_chars(&msgs), text.len());
                     for a in raw.assignments {
                         let task = a.task.trim();
                         if !task.is_empty() && depts.iter().any(|d| d.id == a.department_id) {
@@ -742,7 +964,12 @@ impl Council {
                     }
                 }
                 Err(LlmError::Cancelled) => return Err(Halt::Cancelled),
-                Err(e) => log::warn!("chủ trì giao việc lỗi ({e}); phòng ban nhận nguyên yêu cầu"),
+                Err(e) => {
+                    if matches!(e, LlmError::Truncated { .. }) {
+                        hold.settle_truncated();
+                    }
+                    log::warn!("chủ trì giao việc lỗi ({e}); phòng ban nhận nguyên yêu cầu");
+                }
             }
         }
         for d in depts {
@@ -779,7 +1006,13 @@ impl Council {
             notes.as_deref(),
             true,
         );
-        let v1 = self.call_author(spec.scope, spec.author, 1, &draft).await?;
+        let v1 = match self.call_author(spec.scope, spec.author, 1, &draft).await? {
+            Authored::Plan(p) => p,
+            Authored::Stopped(status) => {
+                self.finish_loop(out, status);
+                return Ok(());
+            }
+        };
         if opts.routing && !reviewers.is_empty() && !routing::is_tagged(&v1.markdown) {
             log::info!("[{}] {} không gắn tag reviewer cho section → reviewer đọc toàn bộ plan", spec.scope, spec.author.name);
         }
@@ -796,6 +1029,8 @@ impl Council {
         let mut last_fp: HashMap<String, u64> = HashMap::new();
         // (role_id, lý do, người đề nghị) — áp dụng ở đầu vòng kế tiếp
         let mut proposed: Vec<(String, String, String)> = Vec::new();
+        // Có reviewer bị cắt output trong vòng họp này → không kết thúc `Converged`.
+        let mut loop_truncated = false;
 
         for round in 1..=spec.max_rounds {
             // ── 1. Thay đổi thành viên ──
@@ -830,35 +1065,92 @@ impl Council {
             }
             if reviewers.is_empty() {
                 // Mọi reviewer đã rời cuộc họp → không còn ai phản đối.
-                self.finish_loop(out, SessionStatus::Converged);
+                let status = if loop_truncated { SessionStatus::PartiallyApproved } else { SessionStatus::Converged };
+                self.finish_loop(out, status);
                 return Ok(());
             }
 
             // ── 2. Review (song song; giữ nguyên APPROVE khi phần phụ trách không đổi) ──
             let plan = out.plans.last().cloned().expect("có ít nhất 1 plan");
             let available = if invites_left > 0 { self.available_experts(spec.author, &reviewers) } else { vec![] };
-            let (available, reviewed_once_ref, invited_ref, previous_ref, last_fp_ref, plan_ref) =
-                (&available, &reviewed_once, &invited, &previous, &last_fp, &plan);
-            let results = join_all(reviewers.iter().map(|r| async move {
-                let fp = routing::fingerprint(&plan_ref.markdown, &r.id);
-                let prev = previous_ref.get(&r.id);
-                let unchanged = last_fp_ref.get(&r.id) == Some(&fp);
-                if opts.routing && unchanged && prev.is_some_and(|p| p.verdict == Verdict::Approve) {
-                    return Ok((carried(prev.expect("vừa kiểm tra")), fp, true));
+            // 2a. Ai giữ nguyên APPROVE (không gọi model), ai cần review.
+            let fps: Vec<u64> = reviewers.iter().map(|r| routing::fingerprint(&plan.markdown, &r.id)).collect();
+            let carried_reviews: Vec<Option<Review>> = reviewers
+                .iter()
+                .zip(&fps)
+                .map(|(r, fp)| {
+                    let prev = previous.get(&r.id).filter(|p| p.verdict == Verdict::Approve);
+                    prev.filter(|_| opts.routing && last_fp.get(&r.id) == Some(fp)).map(carried)
+                })
+                .collect();
+            let jobs: Vec<&RoleDef> = reviewers
+                .iter()
+                .zip(&carried_reviews)
+                .filter(|(_, c)| c.is_none())
+                .map(|(r, _)| *r)
+                .collect();
+            // 2b. Reviewer tự kiểm chứng (chính sách "Tất cả", 1 lần ở round 1) — trước khi dựng prompt.
+            if round == 1 && self.may_research(false) {
+                join_all(jobs.iter().map(|r| self.reviewer_research(spec, r, request, &plan))).await;
+                if self.cancel.is_cancelled() {
+                    return Err(Halt::Cancelled);
                 }
-                let rc = prompts::ReviewCtx {
-                    round,
-                    first_review: !reviewed_once_ref.contains(&r.id),
-                    invited: invited_ref.contains(&r.id),
-                    routed: false,
-                    available,
+            }
+            // 2c. Dựng sẵn mọi prompt rồi giữ chỗ ngân sách cho cả nhóm: tất cả hoặc không ai.
+            let prepared: Vec<Result<PreparedReview, LlmError>> = jobs
+                .iter()
+                .map(|r| {
+                    let rc = prompts::ReviewCtx {
+                        round,
+                        first_review: !reviewed_once.contains(&r.id),
+                        invited: invited.contains(&r.id),
+                        routed: false,
+                        available: &available,
+                    };
+                    self.prepare_review(spec, r, rc, request, &plan, previous.get(&r.id))
+                })
+                .collect();
+            let ests: Vec<u64> = prepared
+                .iter()
+                .filter_map(|p| p.as_ref().ok())
+                .map(|p| estimate_call(&p.messages, p.ep.max_tokens))
+                .collect();
+            let Some(holds) = self.hold_group(&ests) else {
+                log::warn!("[{}] hết ngân sách token trước round {round} → dừng, giữ plan v{}", spec.scope, plan.version);
+                self.finish_loop(out, SessionStatus::BudgetExhausted);
+                return Ok(());
+            };
+            // 2d. Gọi song song (mỗi prompt hợp lệ đã có đúng 1 chỗ giữ).
+            let mut holds = holds.into_iter();
+            let work: Vec<(&RoleDef, ReviewWork<'_>)> = jobs
+                .iter()
+                .copied()
+                .zip(prepared)
+                .map(|(r, p)| (r, p.map(|p| (p, holds.next().expect("mỗi prompt hợp lệ có 1 chỗ giữ")))))
+                .collect();
+            let plan_version = plan.version;
+            let mut called: HashMap<String, Result<Review, LlmError>> = join_all(work.into_iter().map(|(r, w)| async move {
+                let res = match w {
+                    Ok((p, hold)) => self.exec_review(spec, r, round, plan_version, p, hold).await,
+                    Err(e) => Err(e),
                 };
-                self.call_reviewer(spec, r, rc, request, plan_ref, prev).await.map(|rv| (rv, fp, false))
+                (r.id.clone(), res)
             }))
-            .await;
+            .await
+            .into_iter()
+            .collect();
             if self.cancel.is_cancelled() {
                 return Err(Halt::Cancelled);
             }
+            let results: Vec<Result<(Review, u64, bool), LlmError>> = reviewers
+                .iter()
+                .zip(fps)
+                .zip(carried_reviews)
+                .map(|((r, fp), c)| match c {
+                    Some(rv) => Ok((rv, fp, true)),
+                    None => called.remove(&r.id).expect("reviewer cần review đã được gọi").map(|rv| (rv, fp, false)),
+                })
+                .collect();
 
             // ── 3. Tổng hợp ──
             let mut slots = Vec::with_capacity(reviewers.len());
@@ -885,6 +1177,13 @@ impl Council {
                         slots.push(ReviewSlot { agent: r.id.clone(), review: Some(review), error: None });
                     }
                     Err(e) => {
+                        if let LlmError::Truncated { reason } = &e {
+                            // Review JSON bị cắt kể cả sau lần nới max_tokens → slot lỗi như mọi lỗi khác,
+                            // nhưng phiên không còn được tính là hội tụ.
+                            loop_truncated = true;
+                            self.review_truncated.store(true, AtomicOrdering::SeqCst);
+                            self.emit_truncated(spec.scope, &r.id, "review", false, reason);
+                        }
                         let error = e.to_string();
                         self.emitter.send(CouncilEvent::ReviewFailed {
                             scope: spec.scope.to_owned(),
@@ -929,7 +1228,8 @@ impl Council {
             out.rounds.push(RoundRecord { round, plan_version: plan.version, slots, approvals, converged });
 
             let status = if converged {
-                Some(SessionStatus::Converged)
+                // Từng có reviewer bị cắt output → không khẳng định hội tụ.
+                Some(if loop_truncated { SessionStatus::PartiallyApproved } else { SessionStatus::Converged })
             } else if !has_reject {
                 // Reviewer còn sống đều APPROVE, reviewer lỗi không có feedback → refine vô nghĩa.
                 Some(SessionStatus::PartiallyApproved)
@@ -949,21 +1249,41 @@ impl Council {
                 notes.as_deref(),
                 false,
             );
-            let next = self.call_author(spec.scope, spec.author, plan.version + 1, &msgs).await?;
-            out.plans.push(next);
+            // Điểm gọi chỉnh sửa plan (vN → vN+1). Wave "section revise" thay prompt ở đây;
+            // `call_author` lo phần cắt cụt / ngân sách và trả `Authored::Stopped` khi phải dừng.
+            match self.call_author(spec.scope, spec.author, plan.version + 1, &msgs).await? {
+                Authored::Plan(next) => out.plans.push(next),
+                Authored::Stopped(status) => {
+                    self.finish_loop(out, status);
+                    return Ok(());
+                }
+            }
         }
         self.finish_loop(out, SessionStatus::MaxRoundsReached);
         Ok(())
     }
 
+    /// Chốt kết quả 1 vòng họp. Final = phiên bản plan gần nhất (+ phụ lục khi chưa hội tụ / dừng sớm).
+    /// Chưa có phiên bản nào (vd. v1 bị cắt / hết ngân sách) → `final_markdown = None`.
     fn finish_loop(&self, out: &mut LoopResult, status: SessionStatus) {
-        let mut final_md = out.plans.last().map(|p| p.markdown.clone()).unwrap_or_default();
-        if matches!(status, SessionStatus::MaxRoundsReached | SessionStatus::PartiallyApproved) {
-            if let Some(r) = out.rounds.last() {
-                final_md.push_str(&prompts::open_issues_appendix(r, |id| self.name_of(id)));
-            }
-        }
         out.status = Some(status);
+        let Some(last) = out.plans.last() else {
+            out.final_markdown = None;
+            return;
+        };
+        let mut final_md = last.markdown.clone();
+        let open_issues = match status {
+            SessionStatus::MaxRoundsReached | SessionStatus::PartiallyApproved => out.rounds.last(),
+            SessionStatus::Truncated | SessionStatus::BudgetExhausted => {
+                final_md.push_str(&prompts::stop_appendix(status, last.version));
+                // Chỉ liệt kê issue nếu round cuối review đúng phiên bản được giữ làm Final.
+                out.rounds.last().filter(|r| r.plan_version == last.version)
+            }
+            _ => None,
+        };
+        if let Some(r) = open_issues {
+            final_md.push_str(&prompts::open_issues_appendix(r, |id| self.name_of(id)));
+        }
         out.final_markdown = Some(final_md);
     }
 
@@ -973,10 +1293,14 @@ impl Council {
         author: &RoleDef,
         version: u32,
         messages: &[ChatMessage],
-    ) -> Result<PlanVersion, Halt> {
+    ) -> Result<Authored, Halt> {
         let ep = self.cfg.resolve(&author.id).ok_or_else(|| {
             Halt::Failed(format!("role '{}' không tồn tại", author.id))
         })?;
+        let Some(hold) = self.hold(estimate_call(messages, ep.max_tokens)) else {
+            log::warn!("[{scope}] hết ngân sách token trước plan v{version} → dừng");
+            return Ok(Authored::Stopped(SessionStatus::BudgetExhausted));
+        };
         let _permit = self.permit().await?;
         self.emitter.send(CouncilEvent::AgentThinking {
             scope: scope.to_owned(),
@@ -985,13 +1309,78 @@ impl Council {
             plan_version: version,
         });
 
-        let raw = if self.cfg.stream_plans {
-            let mut pending = String::new();
-            let mut last_flush = Instant::now();
-            let emitter = &self.emitter;
-            let completion = self
-                .llm
-                .chat_stream(&ep, messages, &self.cancel, |sig| match sig {
+        let raw = self.author_completion(&ep, scope, version, messages, true).await?;
+        self.account(hold, scope, &author.id, "plan", raw.usage, msg_chars(messages), raw.text.len());
+
+        let markdown = match raw.finish {
+            Finish::Stop => unwrap_markdown_fence(&raw.text),
+            Finish::Error => {
+                // Stream đứt giữa chừng: không biết thiếu bao nhiêu → không nối tiếp, không tạo phiên bản.
+                self.emit_truncated(scope, &author.id, "plan", false, "stream_error");
+                return Ok(Authored::Stopped(SessionStatus::Truncated));
+            }
+            Finish::Length => {
+                let reason = if ep.max_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS) >= OUTPUT_TOKENS_CAP {
+                    "max_tokens_cap"
+                } else {
+                    "length"
+                };
+                match self.continue_plan(&ep, scope, author, version, messages, &raw.text, reason).await? {
+                    Ok(md) => {
+                        self.emit_truncated(scope, &author.id, "plan", true, reason);
+                        // UI đã nhận phần đuôi bị cắt qua stream → xoá và gửi lại toàn văn bản ghép.
+                        self.emitter.send(CouncilEvent::PlanStreamReset { scope: scope.to_owned(), version });
+                        self.emitter.send(CouncilEvent::PlanDelta { scope: scope.to_owned(), version, delta: md.clone() });
+                        md
+                    }
+                    Err(why) => {
+                        self.emit_truncated(scope, &author.id, "plan", false, why);
+                        return Ok(Authored::Stopped(SessionStatus::Truncated));
+                    }
+                }
+            }
+        };
+        if markdown.trim().is_empty() {
+            return Err(Halt::Failed(format!(
+                "{} trả về plan v{version} rỗng",
+                author.name
+            )));
+        }
+        self.emitter.send(CouncilEvent::PlanReady {
+            scope: scope.to_owned(),
+            version,
+            markdown: markdown.clone(),
+        });
+        Ok(Authored::Plan(PlanVersion {
+            version,
+            markdown,
+            created_at: Utc::now(),
+        }))
+    }
+
+    /// 1 lần gọi người viết (stream hoặc không). `forward = true` → chuyển delta lên UI;
+    /// lần nối tiếp dùng `false` (UI nhận toàn văn bản ghép sau khi kiểm tra xong).
+    async fn author_completion(
+        &self,
+        ep: &ResolvedEndpoint,
+        scope: &str,
+        version: u32,
+        messages: &[ChatMessage],
+        forward: bool,
+    ) -> Result<Completion, LlmError> {
+        if !self.cfg.stream_plans {
+            return self.llm.chat(ep, messages, Expect::Text, &self.cancel).await;
+        }
+        let mut pending = String::new();
+        let mut last_flush = Instant::now();
+        let emitter = &self.emitter;
+        let completion = self
+            .llm
+            .chat_stream(ep, messages, &self.cancel, |sig| {
+                if !forward {
+                    return;
+                }
+                match sig {
                     StreamSignal::Reset => {
                         pending.clear();
                         emitter.send(CouncilEvent::PlanStreamReset {
@@ -1010,41 +1399,71 @@ impl Council {
                             last_flush = Instant::now();
                         }
                     }
-                })
-                .await?;
-            if !pending.is_empty() {
-                self.emitter.send(CouncilEvent::PlanDelta {
-                    scope: scope.to_owned(),
-                    version,
-                    delta: pending,
-                });
-            }
-            completion
-        } else {
-            self.llm.chat(&ep, messages, Expect::Text, &self.cancel).await?
-        };
-        self.record_usage(scope, &author.id, "plan", raw.usage, msg_chars(messages), raw.text.len());
-
-        let markdown = unwrap_markdown_fence(&raw.text);
-        if markdown.trim().is_empty() {
-            return Err(Halt::Failed(format!(
-                "{} trả về plan v{version} rỗng",
-                author.name
-            )));
+                }
+            })
+            .await?;
+        if !pending.is_empty() {
+            self.emitter.send(CouncilEvent::PlanDelta {
+                scope: scope.to_owned(),
+                version,
+                delta: pending,
+            });
         }
-        self.emitter.send(CouncilEvent::PlanReady {
-            scope: scope.to_owned(),
-            version,
-            markdown: markdown.clone(),
-        });
-        Ok(PlanVersion {
-            version,
-            markdown,
-            created_at: Utc::now(),
-        })
+        Ok(completion)
     }
 
-    async fn call_reviewer(
+    /// Plan bị cắt do `max_tokens`: bỏ section dở dang cuối, xin model viết tiếp từ đúng heading đó.
+    /// Tối đa `MAX_CONTINUATIONS` lần thử, mỗi lần giữ chỗ ngân sách riêng. Chạy dưới permit của
+    /// lần gọi gốc (không xin thêm permit → không deadlock khi `max_parallel_calls = 1`).
+    /// `Ok(Ok(md))` = bản ghép hợp lệ; `Ok(Err(reason))` = không cứu được ("budget" | `reason`).
+    #[allow(clippy::too_many_arguments)]
+    async fn continue_plan(
+        &self,
+        ep: &ResolvedEndpoint,
+        scope: &str,
+        author: &RoleDef,
+        version: u32,
+        messages: &[ChatMessage],
+        cut_text: &str,
+        reason: &'static str,
+    ) -> Result<Result<String, &'static str>, Halt> {
+        let Some((kept, heading)) = sections::cut_last_incomplete(cut_text) else {
+            log::warn!("[{scope}] plan v{version} bị cắt nhưng không có heading để cắt lại → bỏ");
+            return Ok(Err(reason));
+        };
+        let msgs = prompts::author_continue_messages(messages, &kept, &heading);
+        for attempt in 1..=MAX_CONTINUATIONS {
+            let Some(hold) = self.hold(estimate_call(&msgs, ep.max_tokens)) else {
+                return Ok(Err("budget"));
+            };
+            let c = self.author_completion(ep, scope, version, &msgs, false).await?;
+            self.account(hold, scope, &author.id, "plan", c.usage, msg_chars(&msgs), c.text.len());
+            if let Some(md) = accept_continuation(&kept, &heading, &c) {
+                return Ok(Ok(md));
+            }
+            log::warn!(
+                "[{scope}] nối tiếp plan v{version} lần {attempt} không hợp lệ (finish={:?}, heading '{heading}')",
+                c.finish
+            );
+        }
+        Ok(Err(reason))
+    }
+
+    /// Chính sách "Tất cả": reviewer tự kiểm chứng (1 lần ở round 1), ghi chú dùng lại các round sau.
+    async fn reviewer_research(&self, spec: &LoopSpec<'_>, reviewer: &RoleDef, request: &str, plan: &PlanVersion) {
+        if self.cfg.resolve(&reviewer.id).is_none() {
+            return;
+        }
+        let note_key = format!("{}/{}", spec.scope, reviewer.id);
+        let purpose = "review the plan below from your area of expertise";
+        // Lỗi / huỷ: bỏ qua ghi chú (caller kiểm tra `cancel` ngay sau đó).
+        if let Ok(Some(n)) = self.research(spec.scope, reviewer, "review", 1, purpose, &spec.ctx, request, Some(plan)).await {
+            self.reviewer_notes.lock().unwrap_or_else(|e| e.into_inner()).insert(note_key, n);
+        }
+    }
+
+    /// Dựng prompt review (chưa gọi model) — để giữ chỗ ngân sách cho cả round trước khi gọi.
+    fn prepare_review(
         &self,
         spec: &LoopSpec<'_>,
         reviewer: &RoleDef,
@@ -1052,37 +1471,16 @@ impl Council {
         request: &str,
         plan: &PlanVersion,
         previous: Option<&Review>,
-    ) -> Result<Review, LlmError> {
+    ) -> Result<PreparedReview, LlmError> {
         let round = rc.round;
         let opts = self.prompt_opts();
         let ep = self
             .cfg
             .resolve(&reviewer.id)
             .ok_or_else(|| LlmError::InvalidResponse(format!("role '{}' không tồn tại", reviewer.id)))?;
-
-        // Chính sách "Tất cả": reviewer tự kiểm chứng (1 lần ở round 1), ghi chú dùng lại các round sau.
         let note_key = format!("{}/{}", spec.scope, reviewer.id);
-        if round == 1 && self.may_research(false) {
-            match self
-                .research(spec.scope, reviewer, "review", round, "review the plan below from your area of expertise", &spec.ctx, request, Some(plan))
-                .await
-            {
-                Ok(Some(n)) => {
-                    self.reviewer_notes.lock().unwrap_or_else(|e| e.into_inner()).insert(note_key.clone(), n);
-                }
-                Ok(None) | Err(Halt::Failed(_)) => {}
-                Err(Halt::Cancelled) => return Err(LlmError::Cancelled),
-            }
-        }
         let notes = self.reviewer_notes.lock().unwrap_or_else(|e| e.into_inner()).get(&note_key).cloned();
 
-        let _permit = self.permit().await?;
-        self.emitter.send(CouncilEvent::AgentThinking {
-            scope: spec.scope.to_owned(),
-            agent: reviewer.id.clone(),
-            round,
-            plan_version: plan.version,
-        });
         // Review theo section: chỉ gửi phần được gắn tag cho reviewer này (+ phần dùng chung).
         // Mục được issue vòng trước / dòng Changelog gửi reviewer nhắc tới → gửi đầy đủ để kiểm chứng;
         // không xác định được mục nào → gửi nguyên plan.
@@ -1093,20 +1491,52 @@ impl Council {
         } else {
             None
         };
-        if let Some(v) = &routed_view {
+        let saved = routed_view.as_ref().map(|v| {
             rc.routed = true;
-            self.record_saving(spec.scope, &reviewer.id, estimate_tokens(plan.markdown.len().saturating_sub(v.len())), false);
-        }
+            estimate_tokens(plan.markdown.len().saturating_sub(v.len()))
+        });
         let view = routed_view.as_deref().unwrap_or(&plan.markdown);
         let strict = opts.strict_first_round && round == 1 && !rc.invited;
-        let mut messages = self.decorate(
+        let messages = self.decorate(
             prompts::reviewer_messages(reviewer, &spec.author.name, &spec.ctx, &rc, &opts, request, plan.version, view, previous),
             notes.as_deref(),
             false,
         );
+        Ok(PreparedReview { ep, messages, strict, saved })
+    }
 
-        let (raw, raw_text, usage) = self.llm.chat_json::<RawReview>(&ep, &messages, &self.cancel).await?;
-        self.record_usage(spec.scope, &reviewer.id, "review", usage, msg_chars(&messages), raw_text.len());
+    /// Gọi model review với prompt đã dựng và chỗ ngân sách đã giữ.
+    async fn exec_review(
+        &self,
+        spec: &LoopSpec<'_>,
+        reviewer: &RoleDef,
+        round: u32,
+        plan_version: u32,
+        prep: PreparedReview,
+        hold: Hold<'_>,
+    ) -> Result<Review, LlmError> {
+        let PreparedReview { ep, mut messages, strict, saved } = prep;
+        let _permit = self.permit().await?;
+        self.emitter.send(CouncilEvent::AgentThinking {
+            scope: spec.scope.to_owned(),
+            agent: reviewer.id.clone(),
+            round,
+            plan_version,
+        });
+        if let Some(tokens) = saved {
+            self.record_saving(spec.scope, &reviewer.id, tokens, false);
+        }
+
+        let (raw, raw_text, usage) = match self.llm.chat_json::<RawReview>(&ep, &messages, &self.cancel).await {
+            Ok(r) => r,
+            Err(e) => {
+                if matches!(e, LlmError::Truncated { .. }) {
+                    hold.settle_truncated();
+                }
+                return Err(e);
+            }
+        };
+        self.account(hold, spec.scope, &reviewer.id, "review", usage, msg_chars(&messages), raw_text.len());
         let mut review = Review::from_raw(&reviewer.id, &reviewer.name, raw);
 
         if strict && review.violates_round_one_policy() {
@@ -1114,13 +1544,21 @@ impl Council {
             log::info!("{} vi phạm round-1 policy; yêu cầu review lại", reviewer.name);
             messages.push(ChatMessage::assistant(raw_text));
             messages.push(ChatMessage::user(prompts::ROUND_ONE_CORRECTION));
-            match self.llm.chat_json::<RawReview>(&ep, &messages, &self.cancel).await {
-                Ok((raw2, text2, usage2)) => {
-                    self.record_usage(spec.scope, &reviewer.id, "review", usage2, msg_chars(&messages), text2.len());
-                    review = Review::from_raw(&reviewer.id, &reviewer.name, raw2);
-                }
-                Err(LlmError::Cancelled) => return Err(LlmError::Cancelled),
-                Err(e) => log::warn!("{}: correction call lỗi ({e}); giữ review gốc", reviewer.name),
+            match self.hold(estimate_call(&messages, ep.max_tokens)) {
+                None => log::warn!("{}: hết ngân sách token cho lần sửa review; giữ review gốc", reviewer.name),
+                Some(hold2) => match self.llm.chat_json::<RawReview>(&ep, &messages, &self.cancel).await {
+                    Ok((raw2, text2, usage2)) => {
+                        self.account(hold2, spec.scope, &reviewer.id, "review", usage2, msg_chars(&messages), text2.len());
+                        review = Review::from_raw(&reviewer.id, &reviewer.name, raw2);
+                    }
+                    Err(LlmError::Cancelled) => return Err(LlmError::Cancelled),
+                    Err(e) => {
+                        if matches!(e, LlmError::Truncated { .. }) {
+                            hold2.settle_truncated();
+                        }
+                        log::warn!("{}: correction call lỗi ({e}); giữ review gốc", reviewer.name);
+                    }
+                },
             }
             review.enforce_round_one_policy();
         }
@@ -1141,7 +1579,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use crate::test_support::{completion, spawn_mock, sse, tool_call, Handler, MockResp};
+    use crate::test_support::{completion, completion_with, spawn_mock, sse, sse_with, tool_call, Handler, MockResp};
 
     // ── Mock server dùng chung nằm ở `crate::test_support`; dưới đây là helper riêng của orchestrator ──
 
@@ -1826,5 +2264,286 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(2));
         assert!(rec.plans.is_empty(), "không được vào cuộc họp chính sau khi huỷ");
         assert_eq!(sink.types().last().unwrap(), "cancelled");
+    }
+
+    // ── Output bị cắt + ngân sách token ──
+
+    fn is_continuation(body: &Value) -> bool {
+        is_author(body) && all_text(body).contains(prompts::CONTINUE_MARKER)
+    }
+
+    /// Phiên bản plan mà lần gọi người viết đang viết ("Write plan vN" → N, bản nháp → 1).
+    fn author_version(body: &Value) -> u32 {
+        let t = all_text(body);
+        t.split("Write plan v")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| s.trim_end_matches('.').parse().ok())
+            .unwrap_or(1)
+    }
+
+    fn truncations(sink: &CollectSink) -> Vec<(String, String, bool, String)> {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                CouncilEvent::Truncated { agent, call_kind, recovered, reason, .. } => {
+                    Some((agent.clone(), call_kind.clone(), *recovered, reason.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn budgets(sink: &CollectSink) -> Vec<(u64, u64, u64, bool, String)> {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                CouncilEvent::Budget { used, reserved, limit, estimated, soft, state } => {
+                    assert!(*soft);
+                    Some((*used, *reserved, *limit, *estimated, state.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Plan bị cắt giữa section 2 (heading cuối ngoài fence = "## 2. Architecture").
+    const CUT_PLAN: &str = "## 1. Overview\nPlan v1 bị cắt\n## 2. Architecture\nKiến trúc dở da";
+    const TAIL: &str = "## 2. Architecture\nKiến trúc đầy đủ\n```mermaid\nflowchart LR\n  A-->B\n```\n## 3. Data Flow\nLuồng dữ liệu\n";
+
+    #[test]
+    fn continuation_is_validated_strictly() {
+        let ok = Completion { text: format!("\n\n{TAIL}"), usage: None, finish: Finish::Stop };
+        let joined = accept_continuation("## 1. A\nx\n", "## 2. Architecture", &ok).unwrap();
+        assert!(joined.starts_with("## 1. A\nx\n## 2. Architecture\n") && joined.ends_with("Luồng dữ liệu"));
+        let wrong_head = Completion { text: "## 3. Data Flow\n".into(), usage: None, finish: Finish::Stop };
+        assert!(accept_continuation("", "## 2. Architecture", &wrong_head).is_none());
+        let cut = Completion { text: TAIL.into(), usage: None, finish: Finish::Length };
+        assert!(accept_continuation("", "## 2. Architecture", &cut).is_none());
+        let open_fence = Completion { text: "## 2. Architecture\n```js\nlet a\n".into(), usage: None, finish: Finish::Stop };
+        assert!(accept_continuation("", "## 2. Architecture", &open_fence).is_none());
+    }
+
+    #[tokio::test]
+    async fn truncated_plan_is_continued_and_joined() {
+        let conts = Arc::new(AtomicUsize::new(0));
+        let c2 = conts.clone();
+        let handler: Handler = Arc::new(move |body: &Value| {
+            if is_continuation(body) {
+                c2.fetch_add(1, Ordering::SeqCst);
+                let t = all_text(body);
+                assert!(t.contains("## 2. Architecture") && t.contains("Plan v1 bị cắt"), "phải gửi phần đã giữ + heading");
+                assert!(!t.contains("Kiến trúc dở da"), "phần dở dang không được gửi lại");
+                return sse(TAIL);
+            }
+            if is_author(body) {
+                return sse_with(CUT_PLAN, Some("length"), Some((100, 20)));
+            }
+            completion(&approve())
+        });
+        let (rec, sink) = run_with(
+            handler,
+            |c| {
+                c.stream_plans = true;
+                c.meeting.strict_first_round = false;
+            },
+            None,
+        )
+        .await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert_eq!(conts.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.plans.len(), 1);
+        let md = &rec.plans[0].markdown;
+        assert!(md.starts_with("## 1. Overview\nPlan v1 bị cắt\n## 2. Architecture\nKiến trúc đầy đủ"), "{md}");
+        assert!(!md.contains("dở da") && md.contains("## 3. Data Flow"));
+        assert_eq!(truncations(&sink), vec![("architect".into(), "plan".into(), true, "length".into())]);
+
+        // UI: sau reset cuối cùng, delta của v1 ghép lại đúng bằng bản ghép (không còn đuôi bị cắt).
+        let evs = sink.0.lock().unwrap();
+        let last_reset = evs
+            .iter()
+            .rposition(|e| matches!(&e.event, CouncilEvent::PlanStreamReset { version: 1, .. }))
+            .unwrap();
+        let shown: String = evs[last_reset..]
+            .iter()
+            .filter_map(|e| match &e.event {
+                CouncilEvent::PlanDelta { version: 1, delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(&shown, md);
+    }
+
+    #[tokio::test]
+    async fn failed_continuations_stop_with_truncated_and_keep_last_version() {
+        let conts = Arc::new(AtomicUsize::new(0));
+        let c2 = conts.clone();
+        let handler: Handler = Arc::new(move |body: &Value| {
+            if is_continuation(body) {
+                // Lần 1: sai heading; lần 2: lại bị cắt → cả 2 đều không hợp lệ.
+                return if c2.fetch_add(1, Ordering::SeqCst) == 0 {
+                    completion("## 3. Data Flow\nbỏ qua section 2")
+                } else {
+                    completion_with(TAIL, Some("length"), Some((100, 20)))
+                };
+            }
+            if is_author(body) {
+                return if author_version(body) == 1 {
+                    completion(&plan_md(1))
+                } else {
+                    completion_with(CUT_PLAN, Some("length"), Some((100, 20)))
+                };
+            }
+            completion(&if plan_version_of(body) == 1 { reject() } else { approve() })
+        });
+        let (rec, sink) = run_with(handler, |_| {}, None).await;
+        assert_eq!(rec.status, SessionStatus::Truncated, "{:?}", rec.error);
+        assert_eq!(conts.load(Ordering::SeqCst), MAX_CONTINUATIONS as usize);
+        assert_eq!(rec.plans.len(), 1, "không tạo phiên bản từ plan bị cắt");
+        assert_eq!(rec.rounds.len(), 1);
+        let fin = rec.final_markdown.unwrap();
+        assert!(fin.contains("Plan v1") && fin.contains("Phiên dừng sớm") && fin.contains("Open Issues"), "{fin}");
+        assert_eq!(truncations(&sink), vec![("architect".into(), "plan".into(), false, "length".into())]);
+        assert!(!sink.0.lock().unwrap().iter().any(|e| matches!(&e.event, CouncilEvent::PlanReady { version: 2, .. })));
+        assert_eq!(sink.types().last().unwrap(), "finished");
+    }
+
+    #[tokio::test]
+    async fn broken_stream_stops_with_truncated() {
+        let handler: Handler = Arc::new(move |body: &Value| {
+            if is_author(body) {
+                return if author_version(body) == 1 { sse(&plan_md(1)) } else { sse(&plan_md(2)).abort_after(3) };
+            }
+            completion(&if plan_version_of(body) == 1 { reject() } else { approve() })
+        });
+        let (rec, sink) = run_with(handler, |c| c.stream_plans = true, None).await;
+        assert_eq!(rec.status, SessionStatus::Truncated, "{:?}", rec.error);
+        assert_eq!(rec.plans.len(), 1);
+        assert_eq!(truncations(&sink)[0].3, "stream_error");
+    }
+
+    #[tokio::test]
+    async fn truncated_reviewer_fails_slot_and_session_never_converges() {
+        let handler: Handler = Arc::new(move |body: &Value| {
+            if is_author(body) {
+                return completion(&plan_md(author_version(body)));
+            }
+            let v = plan_version_of(body);
+            if is_reviewer(body, "Performance Engineer") && v == 1 {
+                return completion_with(r#"{"verdict":"REJECT","critical_issues":["dở da"#, Some("length"), None);
+            }
+            completion(&if v == 1 { reject() } else { approve() })
+        });
+        // max_tokens đã ở trần → chat_json không nới thêm, trả Truncated { max_tokens_cap } ngay.
+        let (rec, sink) = run_with(handler, |c| c.max_tokens = Some(OUTPUT_TOKENS_CAP), None).await;
+        let slot = rec.rounds[0].slots.iter().find(|s| s.agent == "scale_reviewer").unwrap();
+        assert!(slot.review.is_none() && slot.error.as_deref().unwrap().contains("bị cắt"));
+        assert!(rec.rounds[1].converged, "round 2 mọi reviewer đều APPROVE");
+        assert_eq!(rec.status, SessionStatus::PartiallyApproved, "có reviewer bị cắt → không được Converged");
+        assert_eq!(truncations(&sink), vec![("scale_reviewer".into(), "review".into(), false, "max_tokens_cap".into())]);
+        assert!(sink.types().contains(&"review_failed".to_owned()));
+    }
+
+    /// Router có usage tuỳ chỉnh: reviewer REJECT v1, APPROVE từ v2.
+    fn usage_router(usage: Option<(u32, u32)>, reviewer_calls: Arc<AtomicUsize>) -> Handler {
+        Arc::new(move |body: &Value| {
+            if is_author(body) {
+                return completion_with(&plan_md(author_version(body)), Some("stop"), usage);
+            }
+            reviewer_calls.fetch_add(1, Ordering::SeqCst);
+            let r = if plan_version_of(body) == 1 { reject() } else { approve() };
+            completion_with(&r, Some("stop"), usage)
+        })
+    }
+
+    #[tokio::test]
+    async fn budget_too_small_for_round_two_keeps_v1() {
+        // Mỗi lần gọi tốn 20k token: v1 (20k) + 3 review (60k) = 80k > 50k → không giữ được chỗ cho v2.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (rec, sink) =
+            run_with(usage_router(Some((20_000, 0)), calls.clone()), |c| c.meeting.max_total_tokens = Some(50_000), None).await;
+        assert_eq!(rec.status, SessionStatus::BudgetExhausted, "{:?}", rec.error);
+        assert_eq!(rec.plans.len(), 1);
+        assert_eq!(rec.rounds.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let fin = rec.final_markdown.unwrap();
+        assert!(fin.contains("Plan v1") && fin.contains("ngân sách") && fin.contains("Open Issues"), "{fin}");
+        let b = budgets(&sink);
+        let last = b.last().unwrap();
+        assert_eq!((last.0, last.1, last.2), (80_000, 0, 50_000), "used = usage thật, không còn chỗ giữ");
+        assert_eq!(last.4, "exhausted");
+        assert!(b.iter().any(|x| x.4 == "warn" || x.4 == "ok"));
+        assert!(!last.3);
+    }
+
+    #[tokio::test]
+    async fn reviewer_group_reservation_is_all_or_nothing() {
+        // Ước lượng mỗi lần gọi ≈ 30k (max_tokens) + prompt. Plan v1 vừa đủ; 2 reviewer (~62k) cũng vừa
+        // 70k, nhưng cả nhóm 3 reviewer (~93k) thì không → không reviewer nào được gọi.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (rec, sink) = run_with(
+            usage_router(Some((100, 20)), calls.clone()),
+            |c| {
+                c.max_tokens = Some(30_000);
+                c.meeting.max_total_tokens = Some(70_000);
+            },
+            None,
+        )
+        .await;
+        assert_eq!(rec.status, SessionStatus::BudgetExhausted, "{:?}", rec.error);
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "nhóm bị từ chối → không gọi reviewer nào");
+        assert!(rec.rounds.is_empty());
+        assert_eq!(rec.plans.len(), 1);
+        let last = budgets(&sink).pop().unwrap();
+        assert_eq!((last.0, last.1, last.4.as_str()), (120, 0, "exhausted"));
+    }
+
+    #[tokio::test]
+    async fn missing_usage_marks_budget_estimated() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (rec, sink) =
+            run_with(usage_router(None, calls), |c| c.meeting.max_total_tokens = Some(10_000_000), None).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        let b = budgets(&sink);
+        assert_eq!(b.len(), 8, "1 event sau mỗi lần settle (2 plan + 6 review)");
+        let last = b.last().unwrap();
+        assert!(last.3, "thiếu usage → estimated");
+        assert_eq!(last.0, rec.usage.total.total(), "sổ ngân sách khớp báo cáo token");
+        assert_eq!((last.1, last.4.as_str()), (0, "ok"));
+    }
+
+    #[tokio::test]
+    async fn no_budget_events_without_limit() {
+        let (rec, sink) = run_council(standard_router(false), false, None).await;
+        assert_eq!(rec.status, SessionStatus::Converged);
+        assert!(budgets(&sink).is_empty());
+    }
+
+    #[tokio::test]
+    async fn truncated_department_feeds_main_meeting_like_max_rounds() {
+        let base = standard_router(false);
+        let handler: Handler = Arc::new(move |body: &Value| {
+            if system_of(body).contains("You lead the \"QA & QC\"") && is_author(body) {
+                return if author_version(body) == 1 {
+                    completion(&plan_md(1))
+                } else {
+                    completion_with(CUT_PLAN, Some("length"), Some((100, 20)))
+                };
+            }
+            if is_continuation(body) {
+                return completion("không có heading");
+            }
+            base(body)
+        });
+        let (rec, _) = run_with(handler, |c| c.meeting.department_ids = vec!["qa".into()], None).await;
+        let qa = &rec.departments[0];
+        assert_eq!(qa.status, SessionStatus::Truncated, "{:?}", qa.error);
+        assert!(qa.final_markdown.as_deref().unwrap().contains("Phiên dừng sớm"));
+        assert_eq!(rec.plans.len(), 2, "cuộc họp chính vẫn chạy với báo cáo của phòng ban");
+        assert_eq!(rec.status, SessionStatus::Truncated, "trạng thái phiên = kết quả tệ nhất");
     }
 }

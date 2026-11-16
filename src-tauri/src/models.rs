@@ -295,8 +295,43 @@ pub enum SessionStatus {
     MaxRoundsReached,
     /// Reviewer còn lại đều APPROVE nhưng ≥1 reviewer lỗi API.
     PartiallyApproved,
+    /// Output của người viết bị cắt (max_tokens / stream đứt) và không nối tiếp được →
+    /// dừng, giữ phiên bản hợp lệ gần nhất.
+    Truncated,
+    /// Hết ngân sách token (giới hạn mềm) trước lần gọi kế tiếp → dừng, giữ phiên bản gần nhất.
+    BudgetExhausted,
+    /// Dành cho wave sau (consistency gate): còn vấn đề chưa giải quyết.
+    Unresolved,
+    /// Dành cho wave sau: phiên bị gián đoạn (vd. app tắt giữa chừng).
+    Interrupted,
     Cancelled,
     Failed,
+}
+
+impl SessionStatus {
+    /// Mức "tệ" của kết quả để gộp trạng thái phiên (lớn hơn = tệ hơn).
+    pub fn severity(self) -> u8 {
+        match self {
+            SessionStatus::Running => 0,
+            SessionStatus::Converged => 1,
+            SessionStatus::PartiallyApproved => 2,
+            SessionStatus::MaxRoundsReached => 3,
+            SessionStatus::Unresolved => 4,
+            SessionStatus::Truncated => 5,
+            SessionStatus::BudgetExhausted => 6,
+            SessionStatus::Interrupted => 7,
+            SessionStatus::Cancelled => 8,
+            SessionStatus::Failed => 9,
+        }
+    }
+
+    pub fn worst(self, other: SessionStatus) -> SessionStatus {
+        if other.severity() > self.severity() {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 /// Ảnh chụp role tại thời điểm họp — lịch sử vẫn hiển thị đúng khi role bị sửa/xoá sau này.
@@ -612,6 +647,26 @@ pub enum CouncilEvent {
         agent: RoleId,
         error: String,
     },
+    /// Output bị cắt. `call_kind`: "plan" | "review" | "consistency";
+    /// `reason`: "length" | "max_tokens_cap" | "budget" | "stream_error";
+    /// `recovered = true` khi đã nối tiếp thành công (plan dùng bản ghép).
+    Truncated {
+        scope: String,
+        agent: RoleId,
+        call_kind: String,
+        recovered: bool,
+        reason: String,
+    },
+    /// Ảnh chụp ngân sách token sau mỗi lần settle (chỉ khi có giới hạn). `soft` luôn true.
+    /// `state`: "ok" | "warn" (≥ 80%) | "exhausted".
+    Budget {
+        used: u64,
+        reserved: u64,
+        limit: u64,
+        estimated: bool,
+        soft: bool,
+        state: String,
+    },
     RoundCompleted {
         scope: String,
         round: u32,
@@ -671,6 +726,32 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_statuses_and_events_serialize_snake_case() {
+        for (s, j) in [
+            (SessionStatus::Truncated, "\"truncated\""),
+            (SessionStatus::BudgetExhausted, "\"budget_exhausted\""),
+            (SessionStatus::Unresolved, "\"unresolved\""),
+            (SessionStatus::Interrupted, "\"interrupted\""),
+        ] {
+            assert_eq!(serde_json::to_string(&s).unwrap(), j);
+            assert_eq!(serde_json::from_str::<SessionStatus>(j).unwrap(), s);
+        }
+        assert_eq!(SessionStatus::Converged.worst(SessionStatus::Truncated), SessionStatus::Truncated);
+        assert_eq!(SessionStatus::BudgetExhausted.worst(SessionStatus::MaxRoundsReached), SessionStatus::BudgetExhausted);
+        let t = serde_json::to_value(CouncilEvent::Truncated {
+            scope: "main".into(),
+            agent: "cto".into(),
+            call_kind: "plan".into(),
+            recovered: true,
+            reason: "length".into(),
+        })
+        .unwrap();
+        assert_eq!(t, serde_json::json!({"type":"truncated","scope":"main","agent":"cto","call_kind":"plan","recovered":true,"reason":"length"}));
+        let b = serde_json::to_value(CouncilEvent::Budget { used: 1, reserved: 2, limit: 3, estimated: false, soft: true, state: "ok".into() }).unwrap();
+        assert_eq!(b, serde_json::json!({"type":"budget","used":1,"reserved":2,"limit":3,"estimated":false,"soft":true,"state":"ok"}));
+    }
 
     #[test]
     fn verdict_is_lenient() {

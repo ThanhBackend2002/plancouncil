@@ -3,6 +3,7 @@
 
 import {
   MAIN_SCOPE,
+  type BudgetSnapshot,
   type CastMember,
   type DepartmentBrief,
   type EventEnvelope,
@@ -16,8 +17,18 @@ import {
   type SessionStatus,
   type ToolActivity,
   type TokenUsage,
+  type TruncatedReason,
   type UsageReport,
 } from "../lib/contracts";
+
+const TRUNCATE_REASON: Record<TruncatedReason, string> = {
+  length: "chạm giới hạn token",
+  max_tokens_cap: "chạm trần max_tokens",
+  budget: "hết ngân sách để nối tiếp",
+  stream_error: "stream bị đứt",
+};
+
+const TRUNCATE_KIND: Record<string, string> = { plan: "Plan", review: "Review", consistency: "Kiểm tra nhất quán" };
 
 export type AgentStatus = "idle" | "thinking" | "done" | "error";
 export type Phase = "idle" | SessionStatus;
@@ -87,6 +98,15 @@ export interface ScopeState {
   activities: ToolActivity[];
   /** Thành viên vào / ra giữa chừng. */
   membership: MembershipChange[];
+  /** Dòng thông báo hệ thống trong hội thoại (vd. output bị cắt), gắn với phiên bản plan lúc xảy ra. */
+  notices?: ScopeNotice[];
+}
+
+export interface ScopeNotice {
+  key: string;
+  agentId: RoleId;
+  planVersion: number;
+  text: string;
 }
 
 export interface SessionState {
@@ -98,6 +118,8 @@ export interface SessionState {
   options: SessionInfo | null;
   /** Thành phần do AI chọn (chế độ Tự động). */
   staffing: StaffingInfo | null;
+  /** Ảnh chụp ngân sách token mới nhất (chỉ có khi phiên đặt giới hạn). */
+  budget?: BudgetSnapshot;
   /** Thứ tự hiển thị: "main" trước, rồi các phòng ban. */
   scopeOrder: string[];
   scopes: Record<string, ScopeState>;
@@ -490,6 +512,34 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
           })),
         };
       });
+
+    case "truncated": {
+      const what = TRUNCATE_KIND[env.call_kind] ?? env.call_kind;
+      const why = TRUNCATE_REASON[env.reason] ?? env.reason;
+      const text = env.recovered
+        ? `${what} bị cắt (${why}) — đã viết tiếp và ghép lại.`
+        : `${what} bị cắt (${why}) — không dùng được.`;
+      return patchScope(s, env.scope, (sc) => ({
+        ...sc,
+        notices: [
+          ...(sc.notices ?? []),
+          { key: `n${env.seq}`, agentId: env.agent, planVersion: sc.plans.at(-1)?.version ?? 0, text },
+        ],
+      }));
+    }
+
+    case "budget":
+      return {
+        ...s,
+        budget: {
+          used: env.used,
+          reserved: env.reserved,
+          limit: env.limit,
+          estimated: env.estimated,
+          soft: env.soft,
+          state: env.state,
+        },
+      };
 
     case "round_completed":
       return patchScope(s, env.scope, (sc) => ({
