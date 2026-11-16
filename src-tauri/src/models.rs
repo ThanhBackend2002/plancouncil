@@ -262,11 +262,43 @@ impl Review {
 
 // ───────────────────────────── Session ─────────────────────────────
 
+/// Cách phiên bản plan được tạo ra.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviseKind {
+    /// Bản nháp đầu (v1).
+    Initial,
+    /// Viết lại toàn bộ plan. Mặc định cho bản ghi cũ không có field.
+    #[default]
+    Full,
+    /// Chỉ sửa các section liên quan rồi ghép lại (section revise).
+    Section,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanVersion {
     pub version: u32,
     pub markdown: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub revise_mode: ReviseKind,
+    /// Lý do section revise không dùng được → viết lại toàn bộ (vd "missing_ids", "ratio").
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
+}
+
+impl PlanVersion {
+    pub fn new(version: u32, markdown: String, revise_mode: ReviseKind) -> Self {
+        Self { version, markdown, created_at: Utc::now(), revise_mode, fallback_reason: None }
+    }
+}
+
+/// 1 mâu thuẫn giữa các section do bước kiểm tra nhất quán phát hiện.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsistencyConflict {
+    /// Id section ("s2", "s5").
+    pub sections: Vec<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -657,6 +689,21 @@ pub enum CouncilEvent {
         recovered: bool,
         reason: String,
     },
+    /// Section revise không dùng được → viết lại toàn bộ plan. `consecutive` = số lần fallback liên tiếp
+    /// (≥ 2 → các vòng còn lại của nơi họp này luôn viết lại toàn bộ).
+    ReviseFallback {
+        scope: String,
+        round: u32,
+        reason: crate::context_builder::FallbackReason,
+        consecutive: u32,
+    },
+    /// Kết quả kiểm tra nhất quán sau khi mọi reviewer APPROVE (chỉ khi có vòng dùng section revise).
+    /// `result`: "ok" | "conflicts" | "unverified".
+    Consistency {
+        scope: String,
+        result: String,
+        conflicts: Vec<ConsistencyConflict>,
+    },
     /// Ảnh chụp ngân sách token sau mỗi lần settle (chỉ khi có giới hạn). `soft` luôn true.
     /// `state`: "ok" | "warn" (≥ 80%) | "exhausted".
     Budget {
@@ -749,6 +796,27 @@ mod tests {
         })
         .unwrap();
         assert_eq!(t, serde_json::json!({"type":"truncated","scope":"main","agent":"cto","call_kind":"plan","recovered":true,"reason":"length"}));
+        let f = serde_json::to_value(CouncilEvent::ReviseFallback {
+            scope: "main".into(),
+            round: 2,
+            reason: crate::context_builder::FallbackReason::MissingIds,
+            consecutive: 1,
+        })
+        .unwrap();
+        assert_eq!(f, serde_json::json!({"type":"revise_fallback","scope":"main","round":2,"reason":"missing_ids","consecutive":1}));
+        let c = serde_json::to_value(CouncilEvent::Consistency {
+            scope: "main".into(),
+            result: "conflicts".into(),
+            conflicts: vec![ConsistencyConflict { sections: vec!["s2".into(), "s5".into()], text: "lệch".into() }],
+        })
+        .unwrap();
+        assert_eq!(
+            c,
+            serde_json::json!({"type":"consistency","scope":"main","result":"conflicts","conflicts":[{"sections":["s2","s5"],"text":"lệch"}]})
+        );
+        // Bản ghi cũ không có revise_mode / fallback_reason vẫn đọc được.
+        let old: PlanVersion = serde_json::from_str(r#"{"version":1,"markdown":"x","created_at":"2024-01-01T00:00:00Z"}"#).unwrap();
+        assert_eq!((old.revise_mode, old.fallback_reason), (ReviseKind::Full, None));
         let b = serde_json::to_value(CouncilEvent::Budget { used: 1, reserved: 2, limit: 3, estimated: false, soft: true, state: "ok".into() }).unwrap();
         assert_eq!(b, serde_json::json!({"type":"budget","used":1,"reserved":2,"limit":3,"estimated":false,"soft":true,"state":"ok"}));
     }

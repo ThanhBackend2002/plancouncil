@@ -268,7 +268,29 @@ pub struct MeetingConfig {
     /// Hết chỗ giữ trước lần gọi kế tiếp → vòng họp dừng với `BudgetExhausted`.
     #[serde(default)]
     pub max_total_tokens: Option<u64>,
+    /// Cách người viết chỉnh plan từ vòng 2: viết lại toàn bộ (mặc định) hay chỉ sửa section liên quan.
+    pub revise_mode: ReviseMode,
+    /// Section revise chỉ dùng khi token các section cần sửa ≤ tỉ lệ này × cả plan (0.1..=1.0; chỉ áp cho `auto`).
+    pub section_mode_max_ratio: f32,
+    /// Ai kiểm tra nhất quán sau section revise: "author" (người viết plan) hoặc id role reviewer.
+    pub consistency_checker: String,
 }
+
+/// Chế độ chỉnh sửa plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviseMode {
+    /// Luôn viết lại toàn bộ plan (hành vi cũ).
+    #[default]
+    Full,
+    /// Section revise + mọi luật fallback (tỉ lệ, patch hỏng, 2 lần fallback liên tiếp).
+    Auto,
+    /// Section revise; chỉ quay về viết lại toàn bộ khi patch không hợp lệ.
+    Section,
+}
+
+/// Giá trị `consistency_checker` mặc định: người viết plan.
+pub const CONSISTENCY_CHECKER_AUTHOR: &str = "author";
 
 impl Default for MeetingConfig {
     fn default() -> Self {
@@ -701,6 +723,12 @@ impl AppConfig {
         }
         if m.max_total_tokens.is_some_and(|t| t < MIN_TOTAL_TOKENS) {
             errs.push(format!("ngân sách token của phiên phải ≥ {MIN_TOTAL_TOKENS} hoặc để trống"));
+        }
+        if !(0.1..=1.0).contains(&m.section_mode_max_ratio) {
+            errs.push("tỉ lệ tối đa của section revise phải trong 0.1..=1.0".to_owned());
+        }
+        if m.consistency_checker != CONSISTENCY_CHECKER_AUTHOR && !role_ok(&m.consistency_checker) {
+            errs.push(format!("người kiểm tra nhất quán '{}' không tồn tại", m.consistency_checker));
         }
 
         if errs.is_empty() {

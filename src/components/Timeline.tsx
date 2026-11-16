@@ -418,7 +418,7 @@ const Outcome = memo(function Outcome({
     max_rounds_reached: `Hết ${maxRounds} vòng mà vẫn còn REJECT. Final có kèm mục Open Issues.`,
     truncated: "Plan mới bị cắt do giới hạn token và không nối tiếp được. Final giữ phiên bản hợp lệ gần nhất.",
     budget_exhausted: "Đã chạm ngân sách token của phiên. Final giữ phiên bản gần nhất.",
-    unresolved: "Còn vấn đề chưa được xử lý.",
+    unresolved: "Mọi reviewer đã APPROVE nhưng kiểm tra nhất quán giữa các section chưa đạt — xem phụ lục trong Final.",
     interrupted: "Phiên bị gián đoạn.",
     cancelled: "Phiên đã bị dừng.",
     failed: error ?? "Gặp lỗi.",

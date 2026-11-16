@@ -151,7 +151,7 @@ mod tests {
     fn record(prompt: &str, markdown: &str) -> SessionRecord {
         let mut r = SessionRecord::new(Uuid::new_v4(), prompt.into(), 3);
         r.status = SessionStatus::Converged;
-        r.plans = vec![PlanVersion { version: 1, markdown: markdown.into(), created_at: Utc::now() }];
+        r.plans = vec![PlanVersion { version: 1, markdown: markdown.into(), created_at: Utc::now(), revise_mode: Default::default(), fallback_reason: None }];
         r
     }
 

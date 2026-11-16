@@ -1,4 +1,4 @@
-import type { AppConfig, PlanDepth, RoleId, StaffingMode } from "../../lib/contracts";
+import type { AppConfig, PlanDepth, ReviseMode, RoleId, StaffingMode } from "../../lib/contracts";
 import { Button, Panel, cx } from "../ui";
 import { Field, INPUT, NumberInput, RoleChips, RoleSelect, SectionTitle, Toggle, type Errors } from "./fields";
 
@@ -189,6 +189,50 @@ export function MeetingTab({
             <Toggle checked={m.section_routing} onChange={(v) => setMeeting({ section_routing: v })} label="Bật (tiết kiệm token)" />
           </Field>
         </div>
+        <div className="mt-4 grid grid-cols-3 gap-4">
+          <Field label="Cách chỉnh sửa plan" hint="Từ vòng 2: chỉ viết lại section reviewer nêu + Changelog, phần còn lại giữ nguyên">
+            <select
+              value={m.revise_mode ?? "full"}
+              onChange={(e) => setMeeting({ revise_mode: e.target.value as ReviseMode })}
+              className={INPUT}
+            >
+              <option value="full">Viết lại toàn bộ (mặc định)</option>
+              <option value="auto">Tự động — sửa theo section, quay về toàn bộ khi cần</option>
+              <option value="section">Theo section — chỉ quay về toàn bộ khi patch hỏng</option>
+            </select>
+          </Field>
+          <Field label="Tỉ lệ tối đa phần cần sửa" error={errors["meeting.section_mode_max_ratio"]} hint="Chế độ Tự động: phần cần sửa vượt tỉ lệ này → viết lại toàn bộ">
+            <select
+              value={String(m.section_mode_max_ratio ?? 0.5)}
+              onChange={(e) => setMeeting({ section_mode_max_ratio: Number(e.target.value) })}
+              disabled={m.revise_mode !== "auto"}
+              className={INPUT}
+            >
+              {RATIOS.map((r) => (
+                <option key={r} value={String(r)}>
+                  {Math.round(r * 100)}% plan
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Người kiểm tra nhất quán" hint="Đọc plan đã ghép, tìm mâu thuẫn giữa các section trước khi kết luận hội tụ">
+            <select
+              value={m.consistency_checker ?? "author"}
+              onChange={(e) => setMeeting({ consistency_checker: e.target.value })}
+              disabled={(m.revise_mode ?? "full") === "full"}
+              className={INPUT}
+            >
+              <option value="author">Người viết plan</option>
+              {draft.roles
+                .filter((r) => m.reviewer_ids.includes(r.id) || r.id === m.consistency_checker)
+                .map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name}
+                  </option>
+                ))}
+            </select>
+          </Field>
+        </div>
       </Panel>
     </div>
   );
@@ -199,3 +243,5 @@ const STAFFING: { id: StaffingMode; label: string; desc: string }[] = [
   { id: "suggest", label: "Đề xuất rồi duyệt", desc: "AI đề xuất kèm lý do, bạn bật/tắt rồi mới họp. Khuyên dùng." },
   { id: "auto", label: "Tự động", desc: "AI chọn rồi họp luôn, lý do hiện trong phiên." },
 ];
+
+const RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1];

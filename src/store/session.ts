@@ -18,6 +18,7 @@ import {
   type ToolActivity,
   type TokenUsage,
   type TruncatedReason,
+  type FallbackReason,
   type UsageReport,
 } from "../lib/contracts";
 
@@ -26,6 +27,17 @@ const TRUNCATE_REASON: Record<TruncatedReason, string> = {
   max_tokens_cap: "chạm trần max_tokens",
   budget: "hết ngân sách để nối tiếp",
   stream_error: "stream bị đứt",
+};
+
+const FALLBACK_REASON: Record<FallbackReason, string> = {
+  missing_ids: "thiếu section bắt buộc",
+  extra_ids: "trả thừa / sai id section",
+  duplicate_ids: "trùng id section",
+  base_mismatch: "sai phiên bản gốc",
+  bad_structure: "sai cấu trúc",
+  structural_change: "cần đổi cấu trúc plan",
+  ratio: "phần cần sửa quá lớn / không chỉ rõ section",
+  truncated: "output bị cắt",
 };
 
 const TRUNCATE_KIND: Record<string, string> = { plan: "Plan", review: "Review", consistency: "Kiểm tra nhất quán" };
@@ -524,6 +536,37 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
         notices: [
           ...(sc.notices ?? []),
           { key: `n${env.seq}`, agentId: env.agent, planVersion: sc.plans.at(-1)?.version ?? 0, text },
+        ],
+      }));
+    }
+
+    case "revise_fallback": {
+      const why = FALLBACK_REASON[env.reason] ?? env.reason;
+      const text =
+        `Không sửa theo section được (${why}) — viết lại toàn bộ plan.` +
+        (env.consecutive >= 2 ? ` ${env.consecutive} lần liên tiếp → các vòng sau luôn viết lại toàn bộ.` : "");
+      return patchScope(s, env.scope, (sc) => ({
+        ...sc,
+        notices: [
+          ...(sc.notices ?? []),
+          { key: `n${env.seq}`, agentId: sc.authorId, planVersion: sc.plans.at(-1)?.version ?? 0, text },
+        ],
+      }));
+    }
+
+    case "consistency": {
+      const list = env.conflicts.map((c) => `[${c.sections.join(", ")}] ${c.text}`).join("; ");
+      const text =
+        env.result === "ok"
+          ? "Kiểm tra nhất quán: các section không mâu thuẫn."
+          : env.result === "conflicts"
+            ? `Kiểm tra nhất quán phát hiện mâu thuẫn: ${list}`
+            : "Kiểm tra nhất quán: không xác minh được (sai định dạng, bị cắt hoặc hết ngân sách).";
+      return patchScope(s, env.scope, (sc) => ({
+        ...sc,
+        notices: [
+          ...(sc.notices ?? []),
+          { key: `n${env.seq}`, agentId: sc.authorId, planVersion: sc.plans.at(-1)?.version ?? 0, text },
         ],
       }));
     }
