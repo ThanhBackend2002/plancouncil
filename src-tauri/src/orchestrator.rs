@@ -1141,113 +1141,9 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use crate::test_support::{completion, spawn_mock, sse, tool_call, Handler, MockResp};
 
-    // ── Mock OpenAI-compatible server (HTTP/1.1 tối giản, 1 request / connection) ──
-
-    struct MockResp {
-        status: u16,
-        content_type: &'static str,
-        body: String,
-        delay: Duration,
-    }
-
-    type Handler = Arc<dyn Fn(&Value) -> MockResp + Send + Sync>;
-
-    async fn spawn_mock(handler: Handler) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    break;
-                };
-                let handler = handler.clone();
-                tokio::spawn(async move {
-                    let mut buf = Vec::new();
-                    let mut tmp = [0u8; 16 * 1024];
-                    let header_end = loop {
-                        let n = sock.read(&mut tmp).await.unwrap_or(0);
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&tmp[..n]);
-                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                            break p + 4;
-                        }
-                    };
-                    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
-                    let cl = headers
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            k.eq_ignore_ascii_case("content-length")
-                                .then(|| v.trim().parse::<usize>().ok())?
-                        })
-                        .unwrap_or(0);
-                    while buf.len() < header_end + cl {
-                        let n = sock.read(&mut tmp).await.unwrap_or(0);
-                        if n == 0 {
-                            return;
-                        }
-                        buf.extend_from_slice(&tmp[..n]);
-                    }
-                    let body: Value = serde_json::from_slice(&buf[header_end..header_end + cl]).unwrap();
-                    let r = handler(&body);
-                    tokio::time::sleep(r.delay).await;
-                    let out = format!(
-                        "HTTP/1.1 {} MOCK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        r.status,
-                        r.content_type,
-                        r.body.len(),
-                        r.body
-                    );
-                    let _ = sock.write_all(out.as_bytes()).await;
-                    let _ = sock.shutdown().await;
-                });
-            }
-        });
-        format!("http://{addr}/v1")
-    }
-
-    fn completion(content: &str) -> MockResp {
-        MockResp {
-            status: 200,
-            content_type: "application/json",
-            body: json!({"choices":[{"message":{"role":"assistant","content":content},"finish_reason":"stop"}],
-                         "usage":{"prompt_tokens":100,"completion_tokens":20}})
-            .to_string(),
-            delay: Duration::ZERO,
-        }
-    }
-
-    fn tool_call(name: &str, args: Value) -> MockResp {
-        MockResp {
-            status: 200,
-            content_type: "application/json",
-            body: json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[
-                {"id":"call_1","type":"function","function":{"name":name,"arguments":args.to_string()}}]}}],
-                "usage":{"prompt_tokens":50,"completion_tokens":5}})
-            .to_string(),
-            delay: Duration::ZERO,
-        }
-    }
-
-    fn sse(content: &str) -> MockResp {
-        let mut body = String::new();
-        for piece in content.split_inclusive(' ') {
-            body.push_str(&format!("data: {}\n\n", json!({"choices":[{"delta":{"content":piece}}]})));
-        }
-        body.push_str(": keep-alive comment\n\n");
-        body.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20}}\n\ndata: [DONE]\n\n");
-        MockResp {
-            status: 200,
-            content_type: "text/event-stream",
-            body,
-            delay: Duration::ZERO,
-        }
-    }
+    // ── Mock server dùng chung nằm ở `crate::test_support`; dưới đây là helper riêng của orchestrator ──
 
     fn system_of(body: &Value) -> String {
         body["messages"][0]["content"].as_str().unwrap_or_default().to_owned()
@@ -1426,7 +1322,7 @@ mod tests {
                 CouncilEvent::UsageUpdated { total, .. } => Some(*total),
                 _ => None,
             })
-            .last()
+            .next_back()
             .unwrap();
         assert_eq!(last_total.total(), 960);
     }
@@ -1512,12 +1408,7 @@ mod tests {
         let handler: Handler = Arc::new(move |body: &Value| {
             if system_of(body).contains("[RESEARCH]") {
                 r2.fetch_add(1, Ordering::SeqCst);
-                return MockResp {
-                    status: 400,
-                    content_type: "application/json",
-                    body: r#"{"error":"tools not supported"}"#.into(),
-                    delay: Duration::ZERO,
-                };
+                return MockResp::http(400, "application/json", r#"{"error":"tools not supported"}"#);
             }
             base(body)
         });
@@ -1720,10 +1611,14 @@ mod tests {
         let base = standard_router(false);
         let handler: Handler = Arc::new(move |body: &Value| {
             let t = all_text(body);
-            if is_author(body) && system_of(body).contains("You chair the main meeting") && !t.contains("Write plan v") {
-                if t.contains("<department_reports>") && t.contains("department=\"QA & QC\"") && t.contains("department=\"Growth (UA & Monetization)\"") {
-                    s2.fetch_add(1, Ordering::SeqCst);
-                }
+            if is_author(body)
+                && system_of(body).contains("You chair the main meeting")
+                && !t.contains("Write plan v")
+                && t.contains("<department_reports>")
+                && t.contains("department=\"QA & QC\"")
+                && t.contains("department=\"Growth (UA & Monetization)\"")
+            {
+                s2.fetch_add(1, Ordering::SeqCst);
             }
             if is_author(body) && system_of(body).contains("You lead the \"QA & QC\"") {
                 assert!(t.contains("Viết test plan cho leaderboard"), "task từ chủ trì phải tới phòng ban");
@@ -1761,12 +1656,7 @@ mod tests {
         let base = standard_router(false);
         let handler: Handler = Arc::new(move |body: &Value| {
             if system_of(body).contains("You lead the \"QA & QC\"") {
-                return MockResp {
-                    status: 401,
-                    content_type: "application/json",
-                    body: r#"{"error":"bad key"}"#.into(),
-                    delay: Duration::ZERO,
-                };
+                return MockResp::http(401, "application/json", r#"{"error":"bad key"}"#);
             }
             base(body)
         });
@@ -1856,12 +1746,7 @@ mod tests {
         let base = standard_router(false);
         let handler: Handler = Arc::new(move |body: &Value| {
             if is_reviewer(body, "Performance Engineer") {
-                return MockResp {
-                    status: 401,
-                    content_type: "application/json",
-                    body: r#"{"error":"bad key"}"#.into(),
-                    delay: Duration::ZERO,
-                };
+                return MockResp::http(401, "application/json", r#"{"error":"bad key"}"#);
             }
             base(body)
         });
@@ -1879,12 +1764,7 @@ mod tests {
         let base = standard_router(false);
         let handler: Handler = Arc::new(move |body: &Value| {
             if is_author(body) && h2.fetch_add(1, Ordering::SeqCst) == 0 {
-                return MockResp {
-                    status: 503,
-                    content_type: "text/plain",
-                    body: "overloaded".into(),
-                    delay: Duration::ZERO,
-                };
+                return MockResp::http(503, "text/plain", "overloaded");
             }
             base(body)
         });
@@ -1898,12 +1778,7 @@ mod tests {
         let base = standard_router(false);
         let handler: Handler = Arc::new(move |body: &Value| {
             if !is_author(body) && body.get("response_format").is_some() {
-                return MockResp {
-                    status: 400,
-                    content_type: "application/json",
-                    body: r#"{"error":"response_format unsupported"}"#.into(),
-                    delay: Duration::ZERO,
-                };
+                return MockResp::http(400, "application/json", r#"{"error":"response_format unsupported"}"#);
             }
             if !is_author(body) {
                 let r = if plan_version_of(body) == 1 { reject() } else { approve() };

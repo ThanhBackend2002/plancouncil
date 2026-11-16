@@ -753,7 +753,8 @@ impl Toolbox {
     pub async fn execute(&self, name: &str, raw_args: &str) -> (String, String, bool) {
         let args: Args = serde_json::from_str(raw_args).unwrap_or_default();
         let ws = self.workspace.clone();
-        let blocking = |f: Box<dyn FnOnce(&WorkspaceFs) -> Result<String, String> + Send>| async move {
+        type BlockingJob = Box<dyn FnOnce(&WorkspaceFs) -> Result<String, String> + Send>;
+        let blocking = |f: BlockingJob| async move {
             match ws {
                 Some(ws) => tokio::task::spawn_blocking(move || f(&ws)).await.unwrap_or_else(|e| Err(e.to_string())),
                 None => Err("workspace chưa được cấp quyền cho phiên này".into()),

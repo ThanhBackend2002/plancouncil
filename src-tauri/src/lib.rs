@@ -10,6 +10,7 @@ mod roster;
 mod routing;
 mod staffing;
 mod storage;
+#[cfg(test)] pub(crate) mod test_support;
 mod tools;
 
 use std::sync::{Arc, Mutex, MutexGuard};

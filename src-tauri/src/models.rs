@@ -534,6 +534,8 @@ pub const COUNCIL_EVENT: &str = "council-event";
 /// `scope` = "main" (cuộc họp chính) hoặc id phòng ban.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Event ngắn hạn, emit xong là bỏ → chênh kích thước biến thể không đáng kể; box sẽ phải sửa mọi chỗ tạo event.
+#[allow(clippy::large_enum_variant)]
 pub enum CouncilEvent {
     SessionStarted {
         prompt: String,
