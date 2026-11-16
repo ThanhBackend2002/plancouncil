@@ -45,7 +45,7 @@ export function AppearanceEditor({ role, onChange }: { role: RoleDef; onChange: 
   return (
     <div className="grid grid-cols-[132px_1fr] gap-4">
       <div className="flex flex-col items-center gap-2">
-        <div className="grid h-[180px] w-[132px] place-items-center rounded-lg border border-neutral-800 bg-[linear-gradient(#2b2740_0_45%,#3a3352_45%)]">
+        <div className="grid h-[180px] w-[132px] place-items-center rounded-lg border border-line bg-[linear-gradient(#2b2740_0_45%,#3a3352_45%)]">
           <PixelPortrait meta={meta} size={96} full />
         </div>
         <div className="flex gap-1">
@@ -70,7 +70,7 @@ export function AppearanceEditor({ role, onChange }: { role: RoleDef; onChange: 
                   title={p.label}
                   className={cx(
                     "flex flex-col items-center gap-0.5 rounded-md border p-1 text-[9px] leading-tight",
-                    active ? "border-violet-500 bg-violet-500/15 text-violet-200" : "border-neutral-800 text-neutral-500 hover:border-neutral-600",
+                    active ? "border-accent bg-accent-subtle text-accent-fg" : "border-line text-fg-subtle hover:border-line-heavy",
                   )}
                 >
                   <PixelPortrait meta={pm} size={32} />
@@ -118,11 +118,11 @@ export function AppearanceEditor({ role, onChange }: { role: RoleDef; onChange: 
         </Row>
 
         <Row label="Màu áo">
-          <div className="flex items-center gap-2 text-xs text-neutral-400">
+          <div className="flex items-center gap-2 text-xs text-fg-muted">
             <button
               type="button"
               onClick={() => set({ outfit_color: "" })}
-              className={cx("rounded-full border px-2 py-0.5", !a.outfit_color ? "border-violet-500 text-violet-200" : "border-neutral-700 hover:text-neutral-200")}
+              className={cx("rounded-full border px-2 py-0.5", !a.outfit_color ? "border-accent text-accent-fg" : "border-line-strong hover:text-fg")}
             >
               Theo màu role
             </button>
@@ -130,7 +130,7 @@ export function AppearanceEditor({ role, onChange }: { role: RoleDef; onChange: 
               type="color"
               value={/^#[0-9a-f]{6}$/i.test(a.outfit_color) ? a.outfit_color : role.color}
               onChange={(e) => set({ outfit_color: e.target.value })}
-              className="h-7 w-9 cursor-pointer rounded border border-neutral-700 bg-neutral-950"
+              className="h-7 w-9 cursor-pointer rounded border border-line-strong bg-canvas"
               aria-label="Màu trang phục"
             />
           </div>
@@ -151,7 +151,7 @@ export function AppearanceEditor({ role, onChange }: { role: RoleDef; onChange: 
 function Row({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="grid grid-cols-[84px_1fr] items-start gap-2">
-      <span className="pt-1 text-[11px] font-medium text-neutral-500">{label}</span>
+      <span className="pt-1 text-[11px] font-medium text-fg-subtle">{label}</span>
       <div className="min-w-0">{children}</div>
     </div>
   );
@@ -169,7 +169,7 @@ function Chips({ value, onChange, options }: { value: string; onChange: (v: stri
           onClick={() => onChange(o.id)}
           className={cx(
             "rounded-full border px-2 py-0.5 text-[11px]",
-            value === o.id ? "border-violet-500 bg-violet-500/15 text-violet-200" : "border-neutral-700 text-neutral-400 hover:text-neutral-200",
+            value === o.id ? "border-accent bg-accent-subtle text-accent-fg" : "border-line-strong text-fg-muted hover:text-fg",
             o.id === "" && value !== "" && "border-dashed",
           )}
         >
@@ -196,7 +196,7 @@ function Swatches({
         onClick={() => onChange("")}
         className={cx(
           "rounded-full border px-2 py-0.5 text-[11px]",
-          value === "" ? "border-violet-500 bg-violet-500/15 text-violet-200" : "border-dashed border-neutral-700 text-neutral-400 hover:text-neutral-200",
+          value === "" ? "border-accent bg-accent-subtle text-accent-fg" : "border-dashed border-line-strong text-fg-muted hover:text-fg",
         )}
       >
         Tự động
@@ -209,7 +209,7 @@ function Swatches({
           aria-label={o.label}
           aria-pressed={value === o.id}
           onClick={() => onChange(o.id)}
-          className={cx("size-6 rounded-[3px] border-2", value === o.id ? "border-violet-400" : "border-neutral-800 hover:border-neutral-500")}
+          className={cx("size-6 rounded-[3px] border-2", value === o.id ? "border-accent-fg" : "border-line hover:border-line-heavy")}
           style={{ background: o.color }}
         />
       ))}

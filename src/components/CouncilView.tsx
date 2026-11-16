@@ -41,7 +41,7 @@ export function CouncilView() {
       <div className="flex min-h-0 min-w-0 flex-col gap-3 overflow-y-auto">
         <PromptPanel />
         <ScopeBar active={scope.id} />
-        {/* data-scene: cảnh pixel giữ palette tối gốc ở light theme (xem index.css). */}
+        {/* data-scene: đánh dấu cảnh pixel (luôn tối, dùng palette Tailwind gốc, không dùng token). */}
         <div data-scene className="contents">
           <MeetingRoom
             scope={scope}
