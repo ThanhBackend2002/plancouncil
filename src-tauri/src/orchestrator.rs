@@ -35,13 +35,15 @@ use uuid::Uuid;
 use serde_json::{json, Value};
 
 use crate::budget::{BudgetLedger, ReservationId};
-use crate::config::{AppConfig, Department, ResolvedEndpoint, RoleDef, ToolPolicy};
+use crate::config::{AppConfig, Department, ResolvedEndpoint, ReviseMode, RoleDef, ToolPolicy, CONSISTENCY_CHECKER_AUTHOR};
+use crate::context_builder::{self as cb, FallbackReason};
 use crate::llm_client::{
     unwrap_markdown_fence, ChatMessage, Completion, Expect, Finish, LlmClient, LlmError, StreamSignal, Usage,
     DEFAULT_OUTPUT_TOKENS, OUTPUT_TOKENS_CAP,
 };
 use crate::models::*;
 use crate::prompts::{self, CompanyMode, PlanContext, PromptOpts};
+use crate::sections::Section;
 use crate::{routing, sections, staffing};
 use crate::tools::Toolbox;
 
@@ -85,6 +87,29 @@ enum Authored {
     /// Không tạo được phiên bản mới → vòng họp dừng với trạng thái này
     /// (`Truncated` / `BudgetExhausted`), phiên bản trước vẫn là Final.
     Stopped(SessionStatus),
+}
+
+/// Kết quả 1 lần thử section revise.
+enum SectionRevise {
+    /// Patch hợp lệ → plan đầy đủ đã ghép + các section (id giữ nguyên).
+    Merged(PlanVersion, Vec<Section>),
+    /// Không dùng được → viết lại toàn bộ.
+    Fallback(FallbackReason),
+    /// Không gọi được (hết ngân sách) → vòng họp dừng.
+    Stopped(SessionStatus),
+}
+
+/// Kết quả bước kiểm tra nhất quán.
+enum Gate {
+    Ok,
+    Conflicts(Vec<ConsistencyConflict>),
+    /// Trả sai định dạng 2 lần / bị cắt / hết ngân sách / lỗi → không được coi là hội tụ.
+    Unverified,
+}
+
+/// Tên lý do fallback theo serde ("missing_ids", "ratio"…).
+fn fallback_name(r: FallbackReason) -> String {
+    serde_json::to_value(r).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default()
 }
 
 /// Prompt review đã dựng sẵn (để giữ chỗ ngân sách cho cả nhóm trước khi gọi).
@@ -262,6 +287,8 @@ struct LoopResult {
     rounds: Vec<RoundRecord>,
     status: Option<SessionStatus>,
     final_markdown: Option<String>,
+    /// Mâu thuẫn còn lại khi kiểm tra nhất quán không đạt (đưa vào phụ lục của Final).
+    conflicts: Vec<ConsistencyConflict>,
 }
 
 #[derive(Deserialize)]
@@ -1006,7 +1033,7 @@ impl Council {
             notes.as_deref(),
             true,
         );
-        let v1 = match self.call_author(spec.scope, spec.author, 1, &draft).await? {
+        let v1 = match self.call_author(spec.scope, spec.author, 1, &draft, ReviseKind::Initial).await? {
             Authored::Plan(p) => p,
             Authored::Stopped(status) => {
                 self.finish_loop(out, status);
@@ -1016,6 +1043,8 @@ impl Council {
         if opts.routing && !reviewers.is_empty() && !routing::is_tagged(&v1.markdown) {
             log::info!("[{}] {} không gắn tag reviewer cho section → reviewer đọc toàn bộ plan", spec.scope, spec.author.name);
         }
+        // Section của phiên bản hiện tại, id ổn định giữa các phiên bản (dùng cho section revise).
+        let mut cur_sections = sections::split(&v1.markdown);
         out.plans.push(v1);
 
         if reviewers.is_empty() {
@@ -1031,6 +1060,13 @@ impl Council {
         let mut proposed: Vec<(String, String, String)> = Vec::new();
         // Có reviewer bị cắt output trong vòng họp này → không kết thúc `Converged`.
         let mut loop_truncated = false;
+        // Section revise: chế độ, số lần fallback liên tiếp, đã có vòng dùng section mode chưa.
+        let revise_mode = self.cfg.meeting.revise_mode;
+        let mut consecutive_fallbacks = 0u32;
+        let mut force_full = false;
+        let mut used_section = false;
+        // Mâu thuẫn từ bước kiểm tra nhất quán → vòng chỉnh sửa kế tiếp viết lại toàn bộ để sửa.
+        let mut pending_conflicts: Option<Vec<ConsistencyConflict>> = None;
 
         for round in 1..=spec.max_rounds {
             // ── 1. Thay đổi thành viên ──
@@ -1229,7 +1265,29 @@ impl Council {
 
             let status = if converged {
                 // Từng có reviewer bị cắt output → không khẳng định hội tụ.
-                Some(if loop_truncated { SessionStatus::PartiallyApproved } else { SessionStatus::Converged })
+                let done = if loop_truncated { SessionStatus::PartiallyApproved } else { SessionStatus::Converged };
+                if used_section {
+                    // Plan được ghép từ các section sửa riêng → kiểm tra nhất quán trước khi kết luận hội tụ.
+                    let rounds_left = round < spec.max_rounds;
+                    let mut gate = self.consistency_gate(spec, round, &plan, &cur_sections).await?;
+                    if matches!(gate, Gate::Unverified) && rounds_left {
+                        gate = self.consistency_gate(spec, round, &plan, &cur_sections).await?;
+                    }
+                    match gate {
+                        Gate::Ok => Some(done),
+                        Gate::Conflicts(c) if rounds_left => {
+                            pending_conflicts = Some(c);
+                            None
+                        }
+                        Gate::Conflicts(c) => {
+                            out.conflicts = c;
+                            Some(SessionStatus::Unresolved)
+                        }
+                        Gate::Unverified => Some(SessionStatus::Unresolved),
+                    }
+                } else {
+                    Some(done)
+                }
             } else if !has_reject {
                 // Reviewer còn sống đều APPROVE, reviewer lỗi không có feedback → refine vô nghĩa.
                 Some(SessionStatus::PartiallyApproved)
@@ -1243,21 +1301,73 @@ impl Council {
                 return Ok(());
             }
 
-            let last_round = out.rounds.last().expect("vừa push");
-            let msgs = self.decorate(
-                prompts::author_refine_messages(spec.author, &spec.ctx, request, &plan, last_round, &reviewers, &opts),
-                notes.as_deref(),
-                false,
-            );
-            // Điểm gọi chỉnh sửa plan (vN → vN+1). Wave "section revise" thay prompt ở đây;
-            // `call_author` lo phần cắt cụt / ngân sách và trả `Authored::Stopped` khi phải dừng.
-            match self.call_author(spec.scope, spec.author, plan.version + 1, &msgs).await? {
-                Authored::Plan(next) => out.plans.push(next),
-                Authored::Stopped(status) => {
-                    self.finish_loop(out, status);
-                    return Ok(());
+            // ── 4. Chỉnh sửa plan (vN → vN+1) ──
+            let last_round = out.rounds.last().cloned().expect("vừa push");
+            let conflicts = pending_conflicts.take();
+            let mut fallback: Option<FallbackReason> = None;
+            let mut merged: Option<(PlanVersion, Vec<Section>)> = None;
+            // Section revise từ vòng 2 (v1 chưa có Changelog), trừ vòng sửa mâu thuẫn.
+            if revise_mode != ReviseMode::Full && !force_full && round >= 2 && conflicts.is_none() {
+                match self
+                    .section_revise(spec, request, notes.as_deref(), &plan, &cur_sections, &last_round, &reviewers, revise_mode)
+                    .await?
+                {
+                    SectionRevise::Merged(p, secs) => merged = Some((p, secs)),
+                    SectionRevise::Fallback(r) => fallback = Some(r),
+                    SectionRevise::Stopped(status) => {
+                        self.finish_loop(out, status);
+                        return Ok(());
+                    }
                 }
             }
+            if let Some(reason) = fallback {
+                consecutive_fallbacks += 1;
+                log::info!(
+                    "[{}] section revise không dùng được ({}) → viết lại toàn bộ (liên tiếp {consecutive_fallbacks})",
+                    spec.scope,
+                    fallback_name(reason)
+                );
+                self.emitter.send(CouncilEvent::ReviseFallback {
+                    scope: spec.scope.to_owned(),
+                    round,
+                    reason,
+                    consecutive: consecutive_fallbacks,
+                });
+                if consecutive_fallbacks >= 2 {
+                    // 2 lần liên tiếp → phần còn lại của vòng họp luôn viết lại toàn bộ.
+                    force_full = true;
+                }
+            }
+            let (next, next_sections) = match merged {
+                Some(m) => {
+                    consecutive_fallbacks = 0;
+                    used_section = true;
+                    m
+                }
+                None => {
+                    let base = match &conflicts {
+                        Some(c) => prompts::author_conflict_refine_messages(
+                            spec.author, &spec.ctx, request, &plan, round, c, &reviewers, &opts,
+                        ),
+                        None => prompts::author_refine_messages(spec.author, &spec.ctx, request, &plan, &last_round, &reviewers, &opts),
+                    };
+                    let msgs = self.decorate(base, notes.as_deref(), false);
+                    // `call_author` lo phần cắt cụt / ngân sách và trả `Authored::Stopped` khi phải dừng.
+                    match self.call_author(spec.scope, spec.author, plan.version + 1, &msgs, ReviseKind::Full).await? {
+                        Authored::Plan(mut p) => {
+                            p.fallback_reason = fallback.map(fallback_name);
+                            let secs = sections::inherit_ids(&cur_sections, sections::split(&p.markdown));
+                            (p, secs)
+                        }
+                        Authored::Stopped(status) => {
+                            self.finish_loop(out, status);
+                            return Ok(());
+                        }
+                    }
+                }
+            };
+            cur_sections = next_sections;
+            out.plans.push(next);
         }
         self.finish_loop(out, SessionStatus::MaxRoundsReached);
         Ok(())
@@ -1274,6 +1384,11 @@ impl Council {
         let mut final_md = last.markdown.clone();
         let open_issues = match status {
             SessionStatus::MaxRoundsReached | SessionStatus::PartiallyApproved => out.rounds.last(),
+            SessionStatus::Unresolved => {
+                final_md.push_str(&prompts::stop_appendix(status, last.version));
+                final_md.push_str(&prompts::conflicts_appendix(&out.conflicts));
+                None
+            }
             SessionStatus::Truncated | SessionStatus::BudgetExhausted => {
                 final_md.push_str(&prompts::stop_appendix(status, last.version));
                 // Chỉ liệt kê issue nếu round cuối review đúng phiên bản được giữ làm Final.
@@ -1293,6 +1408,7 @@ impl Council {
         author: &RoleDef,
         version: u32,
         messages: &[ChatMessage],
+        kind: ReviseKind,
     ) -> Result<Authored, Halt> {
         let ep = self.cfg.resolve(&author.id).ok_or_else(|| {
             Halt::Failed(format!("role '{}' không tồn tại", author.id))
@@ -1351,11 +1467,163 @@ impl Council {
             version,
             markdown: markdown.clone(),
         });
-        Ok(Authored::Plan(PlanVersion {
-            version,
-            markdown,
-            created_at: Utc::now(),
-        }))
+        Ok(Authored::Plan(PlanVersion::new(version, markdown, kind)))
+    }
+
+    /// Section revise: chỉ gửi mục lục + các section cần sửa, nhận patch, kiểm tra rồi ghép thành plan đầy đủ.
+    /// Không nối tiếp khi bị cắt: output không kết thúc bình thường → fallback `truncated`.
+    #[allow(clippy::too_many_arguments)]
+    async fn section_revise(
+        &self,
+        spec: &LoopSpec<'_>,
+        request: &str,
+        notes: Option<&str>,
+        plan: &PlanVersion,
+        secs: &[Section],
+        round: &RoundRecord,
+        reviewers: &[&RoleDef],
+        mode: ReviseMode,
+    ) -> Result<SectionRevise, Halt> {
+        // Số mục reviewer REJECT nhắc tới: field `sections` + số mục trong critical issues.
+        let mut numbers: Vec<String> = Vec::new();
+        for r in round.slots.iter().filter_map(|s| s.review.as_ref()).filter(|r| r.verdict == Verdict::Reject) {
+            numbers.extend(r.sections.iter().cloned());
+            for issue in &r.critical_issues {
+                numbers.extend(routing::mentioned_numbers(issue));
+            }
+        }
+        let required = cb::required_set(secs, &numbers);
+        let names_section = secs.iter().any(|s| required.contains(&s.id) && !sections::is_changelog(s));
+        if !names_section {
+            // Reviewer REJECT mà không chỉ ra section nào → không biết sửa đâu, viết lại toàn bộ.
+            return Ok(SectionRevise::Fallback(FallbackReason::Ratio));
+        }
+        if mode == ReviseMode::Auto && !cb::section_mode_ok(secs, &required, self.cfg.meeting.section_mode_max_ratio) {
+            return Ok(SectionRevise::Fallback(FallbackReason::Ratio));
+        }
+
+        let opts = self.prompt_opts();
+        let msgs = self.decorate(
+            prompts::author_section_refine_messages(spec.author, &spec.ctx, request, plan, secs, &required, round, reviewers, &opts),
+            notes,
+            false,
+        );
+        let version = plan.version + 1;
+        let author = spec.author;
+        let ep = self
+            .cfg
+            .resolve(&author.id)
+            .ok_or_else(|| Halt::Failed(format!("role '{}' không tồn tại", author.id)))?;
+        let Some(hold) = self.hold(estimate_call(&msgs, ep.max_tokens)) else {
+            log::warn!("[{}] hết ngân sách token trước plan v{version} (section revise) → dừng", spec.scope);
+            return Ok(SectionRevise::Stopped(SessionStatus::BudgetExhausted));
+        };
+        let raw = {
+            let _permit = self.permit().await?;
+            self.emitter.send(CouncilEvent::AgentThinking {
+                scope: spec.scope.to_owned(),
+                agent: author.id.clone(),
+                round: version,
+                plan_version: version,
+            });
+            // Không chuyển delta lên UI: output là patch, UI chỉ nhận plan đã ghép.
+            self.author_completion(&ep, spec.scope, version, &msgs, false).await?
+        };
+        self.account(hold, spec.scope, &author.id, "plan", raw.usage, msg_chars(&msgs), raw.text.len());
+        if raw.finish != Finish::Stop {
+            return Ok(SectionRevise::Fallback(FallbackReason::Truncated));
+        }
+        let text = unwrap_markdown_fence(&raw.text);
+        let merged = match cb::parse_patch(&text).and_then(|p| cb::validate_and_merge(secs, &required, &p, plan.version)) {
+            Ok(m) => m,
+            Err(reason) => return Ok(SectionRevise::Fallback(reason)),
+        };
+        let markdown = sections::join(&merged);
+        self.emitter.send(CouncilEvent::PlanStreamReset { scope: spec.scope.to_owned(), version });
+        self.emitter.send(CouncilEvent::PlanDelta { scope: spec.scope.to_owned(), version, delta: markdown.clone() });
+        self.emitter.send(CouncilEvent::PlanReady { scope: spec.scope.to_owned(), version, markdown: markdown.clone() });
+        Ok(SectionRevise::Merged(PlanVersion::new(version, markdown, ReviseKind::Section), merged))
+    }
+
+    /// Kiểm tra nhất quán (chỉ đọc) plan đã ghép. Sai định dạng → hỏi lại 1 lần; bị cắt / hết ngân sách /
+    /// lỗi → `Unverified` (không bao giờ coi là hội tụ). Mỗi lần gọi giữ chỗ ngân sách riêng.
+    async fn consistency_gate(&self, spec: &LoopSpec<'_>, round: u32, plan: &PlanVersion, secs: &[Section]) -> Result<Gate, Halt> {
+        let wanted = &self.cfg.meeting.consistency_checker;
+        let checker = if wanted == CONSISTENCY_CHECKER_AUTHOR {
+            spec.author
+        } else {
+            match self.cfg.role(wanted).filter(|r| self.cfg.resolve(&r.id).is_some()) {
+                Some(r) => r,
+                None => {
+                    log::warn!("[{}] người kiểm tra nhất quán '{wanted}' chưa sẵn sàng → dùng người viết plan", spec.scope);
+                    spec.author
+                }
+            }
+        };
+        let mut gate = Gate::Unverified;
+        if let Some(mut ep) = self.cfg.resolve(&checker.id) {
+            ep.max_tokens = Some(prompts::CONSISTENCY_MAX_TOKENS);
+            let known: Vec<&str> = secs.iter().map(|s| s.id.as_str()).collect();
+            let mut msgs = prompts::consistency_messages(plan.version, secs);
+            for attempt in 1..=2 {
+                let Some(hold) = self.hold(estimate_call(&msgs, ep.max_tokens)) else {
+                    self.emit_truncated(spec.scope, &checker.id, "consistency", false, "budget");
+                    break;
+                };
+                let res = {
+                    let _permit = self.permit().await?;
+                    self.emitter.send(CouncilEvent::AgentThinking {
+                        scope: spec.scope.to_owned(),
+                        agent: checker.id.clone(),
+                        round,
+                        plan_version: plan.version,
+                    });
+                    self.llm.chat(&ep, &msgs, Expect::Text, &self.cancel).await
+                };
+                let c = match res {
+                    Ok(c) => c,
+                    Err(LlmError::Cancelled) => return Err(Halt::Cancelled),
+                    Err(LlmError::Truncated { reason }) => {
+                        hold.settle_truncated();
+                        self.emit_truncated(spec.scope, &checker.id, "consistency", false, reason);
+                        break;
+                    }
+                    Err(e) => {
+                        log::warn!("[{}] kiểm tra nhất quán lỗi ({e}) → chưa xác minh", spec.scope);
+                        break;
+                    }
+                };
+                self.account(hold, spec.scope, &checker.id, "consistency", c.usage, msg_chars(&msgs), c.text.len());
+                if c.finish != Finish::Stop {
+                    let reason = if c.finish == Finish::Error { "stream_error" } else { "length" };
+                    self.emit_truncated(spec.scope, &checker.id, "consistency", false, reason);
+                    break;
+                }
+                match cb::parse_consistency(&c.text, &known) {
+                    Some(v) if v.is_empty() => {
+                        gate = Gate::Ok;
+                        break;
+                    }
+                    Some(v) => {
+                        gate = Gate::Conflicts(v);
+                        break;
+                    }
+                    None if attempt == 1 => {
+                        log::info!("[{}] kiểm tra nhất quán trả sai định dạng → hỏi lại 1 lần", spec.scope);
+                        msgs.push(ChatMessage::assistant(c.text));
+                        msgs.push(ChatMessage::user(prompts::consistency_correction()));
+                    }
+                    None => log::warn!("[{}] kiểm tra nhất quán vẫn sai định dạng → chưa xác minh", spec.scope),
+                }
+            }
+        }
+        let (result, conflicts) = match &gate {
+            Gate::Ok => ("ok", vec![]),
+            Gate::Conflicts(c) => ("conflicts", c.clone()),
+            Gate::Unverified => ("unverified", vec![]),
+        };
+        self.emitter.send(CouncilEvent::Consistency { scope: spec.scope.to_owned(), result: result.to_owned(), conflicts });
+        Ok(gate)
     }
 
     /// 1 lần gọi người viết (stream hoặc không). `forward = true` → chuyển delta lên UI;
@@ -2545,5 +2813,435 @@ mod tests {
         assert!(qa.final_markdown.as_deref().unwrap().contains("Phiên dừng sớm"));
         assert_eq!(rec.plans.len(), 2, "cuộc họp chính vẫn chạy với báo cáo của phòng ban");
         assert_eq!(rec.status, SessionStatus::Truncated, "trạng thái phiên = kết quả tệ nhất");
+    }
+
+    // ── Section revise + kiểm tra nhất quán ──
+
+    /// Plan có Changelog từ v2. Id sau khi kế thừa: s1..s5 = mục 1..5, s6 = Changelog.
+    fn sec_plan(v: u32) -> String {
+        let fill = "Nội dung chi tiết của mục này để plan có kích thước thực tế. ".repeat(6);
+        let mut md = format!(
+            "## 1. Overview\nTổng quan v{v}. {fill}\n## 2. Architecture\nKiến trúc. {fill}{fill}\n```mermaid\nflowchart LR\n  A-->B\n```\n\
+## 3. Data Flow\nLuồng dữ liệu v{v}.\n## 4. Tech Stack & Schema\nRedis. {fill}\n## 5. Edge Cases & Trade-offs\nRủi ro. {fill}\n"
+        );
+        if v > 1 {
+            md.push_str(&format!(
+                "## 6. Changelog (v{} → v{v})\n| # | Reviewer | Issue | Resolution | Status |\n|---|---|---|---|---|\n| 1 | Tech Lead | Backpressure | Thêm queue | Fixed |\n",
+                v - 1
+            ));
+        }
+        md
+    }
+
+    fn patch_block(id: &str, base: u32, body: &str) -> String {
+        format!("<!-- section id=\"{id}\" base_version=\"{base}\" -->\n{body}\n<!-- /section -->\n")
+    }
+    const NEW_FLOW: &str = "## 3. Data Flow\nLuồng dữ liệu v3: thêm queue có giới hạn.";
+    const NEW_LOG: &str = "## 6. Changelog (v2 → v3)\n| # | Reviewer | Issue | Resolution | Status |\n|---|---|---|---|---|\n| 1 | Tech Lead | Backpressure | Queue giới hạn | Fixed |";
+
+    fn good_patch() -> String {
+        patch_block("s3", 2, NEW_FLOW) + &patch_block("s6", 2, NEW_LOG)
+    }
+
+    fn is_section_call(body: &Value) -> bool {
+        system_of(body).contains("SECTION REVISE")
+    }
+    fn is_gate(body: &Value) -> bool {
+        system_of(body).starts_with(prompts::CONSISTENCY_MARKER)
+    }
+    fn body_size(body: &Value) -> usize {
+        body["messages"].to_string().len()
+    }
+
+    /// Ghi lại các lần gọi đặc biệt để test kiểm tra.
+    #[derive(Default)]
+    struct Seen {
+        /// Kích thước request section revise.
+        section: Vec<usize>,
+        /// User message của request section revise.
+        section_user: Vec<String>,
+        /// (version, kích thước request) của các lần viết lại toàn bộ (v ≥ 2).
+        full: Vec<(u32, usize)>,
+        conflict_refines: usize,
+        gate: Vec<String>,
+    }
+
+    type Reply = Arc<dyn Fn(usize) -> MockResp + Send + Sync>;
+
+    struct SecScenario {
+        /// Reviewer REJECT các phiên bản ≤ giá trị này.
+        reject_until: u32,
+        /// Field `sections` của review REJECT.
+        sections: Value,
+        /// Câu trả lời cho lần section revise thứ n (từ 1).
+        patch: Reply,
+        /// Câu trả lời cho lần kiểm tra nhất quán thứ n (từ 1).
+        gate: Reply,
+        /// Usage của reviewer theo phiên bản plan (mặc định 100/20).
+        review_usage: Arc<dyn Fn(u32) -> (u32, u32) + Send + Sync>,
+    }
+
+    impl Default for SecScenario {
+        fn default() -> Self {
+            Self {
+                reject_until: 2,
+                sections: json!(["3"]),
+                patch: Arc::new(|_| completion(&good_patch())),
+                gate: Arc::new(|_| completion("OK")),
+                review_usage: Arc::new(|_| (100, 20)),
+            }
+        }
+    }
+
+    fn section_router(sc: SecScenario, seen: Arc<Mutex<Seen>>) -> Handler {
+        let (n_patch, n_gate) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        Arc::new(move |body: &Value| {
+            if is_gate(body) {
+                seen.lock().unwrap().gate.push(all_text(body));
+                return (sc.gate)(n_gate.fetch_add(1, Ordering::SeqCst) + 1);
+            }
+            if is_author(body) {
+                let v = author_version(body);
+                if is_section_call(body) {
+                    let mut s = seen.lock().unwrap();
+                    s.section.push(body_size(body));
+                    s.section_user.push(body["messages"][1]["content"].as_str().unwrap_or_default().to_owned());
+                    drop(s);
+                    return (sc.patch)(n_patch.fetch_add(1, Ordering::SeqCst) + 1);
+                }
+                if v >= 2 {
+                    let mut s = seen.lock().unwrap();
+                    s.full.push((v, body_size(body)));
+                    if all_text(body).contains("Consistency check — REJECT") {
+                        s.conflict_refines += 1;
+                    }
+                }
+                return completion(&sec_plan(v));
+            }
+            let v = plan_version_of(body);
+            let r = if v <= sc.reject_until {
+                json!({"verdict":"REJECT","summary_bubble":"Thiếu backpressure","critical_issues":["Thiếu backpressure ở luồng dữ liệu"],
+                       "sections": sc.sections.clone(),"suggestions":["Thêm queue"]})
+                .to_string()
+            } else {
+                approve()
+            };
+            completion_with(&r, Some("stop"), Some((sc.review_usage)(v)))
+        })
+    }
+
+    async fn run_section(
+        sc: SecScenario,
+        tweak: impl FnOnce(&mut AppConfig),
+    ) -> (SessionRecord, Arc<CollectSink>, Arc<Mutex<Seen>>) {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (rec, sink) = run_with(
+            section_router(sc, seen.clone()),
+            |c| {
+                c.meeting.revise_mode = ReviseMode::Auto;
+                c.max_rounds = 4;
+                tweak(c);
+            },
+            None,
+        )
+        .await;
+        (rec, sink, seen)
+    }
+
+    fn fallbacks(sink: &CollectSink) -> Vec<(String, u32)> {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                CouncilEvent::ReviseFallback { reason, consecutive, .. } => Some((fallback_name(*reason), *consecutive)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn gate_results(sink: &CollectSink) -> Vec<(String, Vec<ConsistencyConflict>)> {
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                CouncilEvent::Consistency { result, conflicts, .. } => Some((result.clone(), conflicts.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn meeting_revise_config_defaults_and_validation() {
+        let mut c = crate::config::tests::with_default_provider("k", "m");
+        assert_eq!(c.meeting.revise_mode, ReviseMode::Full);
+        assert_eq!(c.meeting.section_mode_max_ratio, 0.5);
+        assert_eq!(c.meeting.consistency_checker, "author");
+        let old: crate::config::MeetingConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!((old.revise_mode, old.consistency_checker.as_str()), (ReviseMode::Full, "author"));
+        let m: crate::config::MeetingConfig = serde_json::from_str(r#"{"revise_mode":"section"}"#).unwrap();
+        assert_eq!(m.revise_mode, ReviseMode::Section);
+        c.validate().unwrap();
+        c.meeting.consistency_checker = "scale_reviewer".into();
+        c.validate().unwrap();
+        c.meeting.consistency_checker = "ghost".into();
+        c.meeting.section_mode_max_ratio = 1.5;
+        let e = c.validate().unwrap_err();
+        assert!(e.contains("người kiểm tra nhất quán 'ghost'") && e.contains("0.1..=1.0"), "{e}");
+        c.meeting.consistency_checker = "author".into();
+        c.meeting.section_mode_max_ratio = 0.05;
+        assert!(c.validate().is_err());
+        c.meeting.section_mode_max_ratio = 0.1;
+        c.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn section_mode_round_two_merges_and_sends_smaller_prompt() {
+        let (rec, sink, seen) = run_section(SecScenario::default(), |_| {}).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert_eq!(rec.plans.len(), 3);
+        let kinds: Vec<ReviseKind> = rec.plans.iter().map(|p| p.revise_mode).collect();
+        assert_eq!(kinds, vec![ReviseKind::Initial, ReviseKind::Full, ReviseKind::Section]);
+        assert!(rec.plans.iter().all(|p| p.fallback_reason.is_none()));
+        assert!(fallbacks(&sink).is_empty());
+
+        // Section không cần sửa giữ nguyên từng byte; plan mới là plan đầy đủ hợp lệ.
+        let (v2, v3) = (sections::split(&rec.plans[1].markdown), sections::split(&rec.plans[2].markdown));
+        assert_eq!(v2.len(), v3.len());
+        for i in [0, 1, 3, 4] {
+            assert_eq!(v2[i].text.as_bytes(), v3[i].text.as_bytes(), "section {}", v2[i].heading);
+        }
+        assert!(v3[2].text.starts_with(NEW_FLOW) && v3[5].text.starts_with(NEW_LOG));
+        assert!(!rec.plans[2].markdown.contains("<!--"), "không còn marker trong plan");
+        let ready = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|e| match &e.event {
+                CouncilEvent::PlanReady { version: 3, markdown, .. } => Some(markdown.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(ready, rec.plans[2].markdown);
+
+        // Kiểm tra nhất quán chạy đúng 1 lần, kết quả OK.
+        assert_eq!(gate_results(&sink), vec![("ok".to_owned(), vec![])]);
+        assert_eq!(rec.usage.by_kind["consistency"].calls, 1);
+        let gate_prompt = seen.lock().unwrap().gate[0].clone();
+        assert!(gate_prompt.contains("<section id=\"s3\">\n## 3. Data Flow\nLuồng dữ liệu v3"));
+
+        // Cùng kịch bản ở full mode → request v3 lớn hơn hẳn.
+        let (full_rec, full_sink, full_seen) = run_section(SecScenario::default(), |c| c.meeting.revise_mode = ReviseMode::Full).await;
+        assert_eq!(full_rec.status, SessionStatus::Converged);
+        assert!(gate_results(&full_sink).is_empty(), "full mode không chạy kiểm tra nhất quán");
+        let full_v3 = full_seen.lock().unwrap().full.iter().find(|(v, _)| *v == 3).unwrap().1;
+        let section_v3 = seen.lock().unwrap().section[0];
+        eprintln!("kích thước request v3: section = {section_v3} byte, full = {full_v3} byte");
+        assert!(section_v3 < full_v3, "section {section_v3} ≥ full {full_v3}");
+        // Tập cần sửa điển hình: section reviewer nêu + Changelog.
+        let user = seen.lock().unwrap().section_user[0].clone();
+        let payload_ids: Vec<&str> = ["s1", "s2", "s3", "s4", "s5", "s6"]
+            .into_iter()
+            .filter(|id| user.contains(&format!("<!-- section id=\"{id}\"")))
+            .collect();
+        assert_eq!(payload_ids, vec!["s3", "s6"]);
+        assert!(rec.usage.total.calls >= full_rec.usage.total.calls);
+    }
+
+    #[tokio::test]
+    async fn every_fallback_reason_triggers_a_full_revise() {
+        let blk = |id: &str, body: &str| patch_block(id, 2, body);
+        let flow = || blk("s3", NEW_FLOW);
+        let log = || blk("s6", NEW_LOG);
+        let cases: Vec<(&str, String, &str)> = vec![
+            ("thiếu id", flow(), "missing_ids"),
+            ("thừa id", flow() + &log() + &blk("s4", "## 4. Tech Stack & Schema\nx"), "extra_ids"),
+            ("trùng id", flow() + &flow() + &log(), "duplicate_ids"),
+            ("id lạ", flow() + &log() + &blk("s99", "## 9. Lạ\nx"), "extra_ids"),
+            ("sai base", patch_block("s3", 1, NEW_FLOW) + &patch_block("s6", 1, NEW_LOG), "base_mismatch"),
+            ("không marker", sec_plan(3), "bad_structure"),
+            ("2 heading", blk("s3", "## 3. Data Flow\nx\n### 3.1 Mới\ny") + &log(), "bad_structure"),
+            ("structural", format!("{}\n{}", prompts_marker(), flow()), "structural_change"),
+        ];
+        for (name, patch, reason) in cases {
+            let sc = SecScenario { patch: Arc::new(move |_| completion(&patch)), ..SecScenario::default() };
+            let (rec, sink, seen) = run_section(sc, |_| {}).await;
+            assert_fallback(name, &rec, &sink, &seen, reason);
+        }
+
+        // Bị cắt (finish_reason = length) → truncated.
+        let sc = SecScenario {
+            patch: Arc::new(|_| completion_with(&patch_block("s3", 2, NEW_FLOW), Some("length"), Some((100, 20)))),
+            ..SecScenario::default()
+        };
+        let (rec, sink, seen) = run_section(sc, |_| {}).await;
+        assert_fallback("bị cắt", &rec, &sink, &seen, "truncated");
+
+        // Tỉ lệ: section cần sửa quá lớn so với cả plan → không gọi section revise.
+        let sc = SecScenario { sections: json!(["2"]), ..SecScenario::default() };
+        let (rec, sink, seen) = run_section(sc, |c| c.meeting.section_mode_max_ratio = 0.1).await;
+        assert_fallback("tỉ lệ", &rec, &sink, &seen, "ratio");
+        assert!(seen.lock().unwrap().section.is_empty(), "ratio được kiểm tra TRƯỚC khi gọi");
+
+        // Reviewer REJECT mà không chỉ ra section nào → chỉ còn Changelog → ratio.
+        let sc = SecScenario { sections: json!([]), ..SecScenario::default() };
+        let (rec, sink, seen) = run_section(sc, |_| {}).await;
+        assert_fallback("không nêu section", &rec, &sink, &seen, "ratio");
+        assert!(seen.lock().unwrap().section.is_empty());
+    }
+
+    fn prompts_marker() -> &'static str {
+        cb::STRUCTURAL_CHANGE_MARKER
+    }
+
+    fn assert_fallback(name: &str, rec: &SessionRecord, sink: &CollectSink, seen: &Mutex<Seen>, reason: &str) {
+        assert_eq!(rec.status, SessionStatus::Converged, "{name}: {:?}", rec.error);
+        assert_eq!(fallbacks(sink), vec![(reason.to_owned(), 1)], "{name}");
+        let v3 = &rec.plans[2];
+        assert_eq!((v3.revise_mode, v3.fallback_reason.as_deref()), (ReviseKind::Full, Some(reason)), "{name}");
+        assert_eq!(v3.markdown, sec_plan(3).trim(), "{name}: v3 là bản viết lại toàn bộ");
+        let s = seen.lock().unwrap();
+        assert!(s.full.iter().any(|(v, _)| *v == 3), "{name}: phải viết lại toàn bộ v3");
+        assert!(s.gate.is_empty(), "{name}: không có vòng section mode → không kiểm tra nhất quán");
+        assert!(gate_results(sink).is_empty(), "{name}");
+    }
+
+    #[tokio::test]
+    async fn two_consecutive_fallbacks_force_full_mode() {
+        let sc = SecScenario {
+            reject_until: 4,
+            patch: Arc::new(|_| completion("viết lại hết, không có marker")),
+            ..SecScenario::default()
+        };
+        let (rec, sink, seen) = run_section(sc, |c| c.max_rounds = 5).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert_eq!(rec.plans.len(), 5);
+        assert_eq!(seen.lock().unwrap().section.len(), 2, "sau 2 lần fallback không thử section revise nữa");
+        assert_eq!(fallbacks(&sink), vec![("bad_structure".into(), 1), ("bad_structure".into(), 2)]);
+        let v5 = &rec.plans[4];
+        assert_eq!((v5.revise_mode, v5.fallback_reason.as_deref()), (ReviseKind::Full, None));
+        assert!(gate_results(&sink).is_empty());
+    }
+
+    #[tokio::test]
+    async fn gate_conflict_with_rounds_left_runs_one_full_revise_then_rechecks() {
+        let conflict = "- [s3, s6] Changelog nói dùng queue nhưng Data Flow không có";
+        let sc = SecScenario {
+            gate: Arc::new(move |n| completion(if n == 1 { conflict } else { "OK" })),
+            ..SecScenario::default()
+        };
+        let (rec, sink, seen) = run_section(sc, |c| c.max_rounds = 5).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert_eq!(rec.plans.len(), 4, "1 vòng viết lại toàn bộ để sửa mâu thuẫn");
+        assert_eq!(rec.rounds.len(), 4, "vòng sửa mâu thuẫn tính vào max_rounds");
+        assert_eq!(rec.plans[3].revise_mode, ReviseKind::Full);
+        let s = seen.lock().unwrap();
+        assert_eq!(s.conflict_refines, 1);
+        assert_eq!(s.gate.len(), 2);
+        let results = gate_results(&sink);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, "conflicts");
+        assert_eq!(results[0].1, vec![ConsistencyConflict { sections: vec!["s3".into(), "s6".into()], text: "Changelog nói dùng queue nhưng Data Flow không có".into() }]);
+        assert_eq!(results[1].0, "ok");
+    }
+
+    #[tokio::test]
+    async fn gate_conflict_on_last_round_is_unresolved() {
+        let sc = SecScenario { gate: Arc::new(|_| completion("- [s3] Mâu thuẫn TTL")), ..SecScenario::default() };
+        let (rec, sink, _) = run_section(sc, |c| c.max_rounds = 3).await;
+        assert_eq!(rec.status, SessionStatus::Unresolved, "{:?}", rec.error);
+        assert!(rec.rounds.last().unwrap().converged, "reviewer đều APPROVE nhưng không được Converged");
+        let fin = rec.final_markdown.unwrap();
+        assert!(fin.contains("Phiên dừng sớm") && fin.contains("Mâu thuẫn giữa các section") && fin.contains("- [s3] Mâu thuẫn TTL"), "{fin}");
+        assert_eq!(gate_results(&sink)[0].0, "conflicts");
+        assert!(matches!(sink.0.lock().unwrap().last().unwrap().event, CouncilEvent::Finished { status: SessionStatus::Unresolved, .. }));
+    }
+
+    #[tokio::test]
+    async fn malformed_gate_reply_is_retried_once() {
+        let sc = SecScenario {
+            gate: Arc::new(|n| completion(if n == 1 { "Mình thấy plan ổn, không có mâu thuẫn." } else { "OK" })),
+            ..SecScenario::default()
+        };
+        let (rec, sink, seen) = run_section(sc, |_| {}).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        {
+            let s = seen.lock().unwrap();
+            assert_eq!(s.gate.len(), 2);
+            assert!(s.gate[1].contains("INVALID FORMAT") && s.gate[1].contains("Mình thấy plan ổn"));
+        }
+        assert_eq!(gate_results(&sink), vec![("ok".to_owned(), vec![])]);
+        assert_eq!(rec.usage.by_kind["consistency"].calls, 2);
+
+        // Sai định dạng cả 2 lần ở vòng cuối → unverified → Unresolved.
+        let sc = SecScenario { gate: Arc::new(|_| completion("Không có gì")), ..SecScenario::default() };
+        let (rec, sink, seen) = run_section(sc, |c| c.max_rounds = 3).await;
+        assert_eq!(rec.status, SessionStatus::Unresolved);
+        assert_eq!(seen.lock().unwrap().gate.len(), 2, "không còn vòng → không chạy lại gate");
+        assert_eq!(gate_results(&sink)[0].0, "unverified");
+        assert!(rec.final_markdown.unwrap().contains("Không xác minh được"));
+
+        // Còn vòng → chạy lại gate 1 lần nữa (tối đa 4 lần gọi), vẫn unverified → Unresolved.
+        let sc = SecScenario { gate: Arc::new(|_| completion("Không có gì")), ..SecScenario::default() };
+        let (rec, sink, seen) = run_section(sc, |c| c.max_rounds = 5).await;
+        assert_eq!(rec.status, SessionStatus::Unresolved);
+        assert_eq!(seen.lock().unwrap().gate.len(), 4);
+        assert_eq!(gate_results(&sink).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn gate_budget_denial_is_unverified_not_converged() {
+        // Review của v3 báo usage cực lớn → vượt ngân sách mềm → không giữ được chỗ cho kiểm tra nhất quán.
+        let sc = SecScenario {
+            review_usage: Arc::new(|v| if v == 3 { (400_000, 0) } else { (100, 20) }),
+            ..SecScenario::default()
+        };
+        let (rec, sink, seen) = run_section(sc, |c| {
+            c.max_rounds = 3;
+            c.meeting.max_total_tokens = Some(1_000_000);
+        })
+        .await;
+        assert_eq!(rec.status, SessionStatus::Unresolved, "{:?}", rec.error);
+        assert!(seen.lock().unwrap().gate.is_empty(), "không gọi model khi hết ngân sách");
+        assert_eq!(gate_results(&sink), vec![("unverified".to_owned(), vec![])]);
+        assert!(truncations(&sink).contains(&("architect".into(), "consistency".into(), false, "budget".into())));
+    }
+
+    #[tokio::test]
+    async fn gate_uses_configured_reviewer_as_checker() {
+        let (rec, _, _) = run_section(SecScenario::default(), |c| c.meeting.consistency_checker = "pragmatic_reviewer".into()).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert_eq!(rec.usage.by_kind["consistency"].calls, 1);
+        let by_role = &rec.usage.by_role["pragmatic_reviewer"];
+        assert_eq!(by_role.calls, 4, "3 review + 1 kiểm tra nhất quán");
+    }
+
+    #[tokio::test]
+    async fn gate_is_skipped_without_section_mode_round() {
+        // Mặc định (full): không prompt section, không kiểm tra nhất quán, không event mới.
+        let (rec, sink, seen) = run_section(SecScenario::default(), |c| c.meeting.revise_mode = ReviseMode::Full).await;
+        assert_eq!(rec.status, SessionStatus::Converged);
+        let s = seen.lock().unwrap();
+        assert!(s.section.is_empty() && s.gate.is_empty());
+        let types = sink.types();
+        assert!(!types.iter().any(|t| t == "consistency" || t == "revise_fallback"));
+        assert!(rec.plans.iter().skip(1).all(|p| p.revise_mode == ReviseKind::Full && p.fallback_reason.is_none()));
+        assert_eq!(rec.plans[0].revise_mode, ReviseKind::Initial);
+    }
+
+    #[tokio::test]
+    async fn section_mode_skips_ratio_check() {
+        // revise_mode = section: chỉ fallback khi patch hỏng → vẫn gọi section revise dù tỉ lệ vượt ngưỡng.
+        let (rec, sink, seen) = run_section(SecScenario::default(), |c| {
+            c.meeting.revise_mode = ReviseMode::Section;
+            c.meeting.section_mode_max_ratio = 0.1;
+        })
+        .await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert_eq!(seen.lock().unwrap().section.len(), 1);
+        assert!(fallbacks(&sink).is_empty());
+        assert_eq!(rec.plans[2].revise_mode, ReviseKind::Section);
     }
 }

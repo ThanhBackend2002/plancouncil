@@ -679,7 +679,7 @@ Dùng Redis làm cache.\n\
 Giữ nguyên trong section 2.\n";
 
     fn plan(version: u32, markdown: &str) -> PlanVersion {
-        PlanVersion { version, markdown: markdown.into(), created_at: Utc::now() }
+        PlanVersion { version, markdown: markdown.into(), created_at: Utc::now(), revise_mode: Default::default(), fallback_reason: None }
     }
 
     fn record(prompt: &str, markdown: &str) -> SessionRecord {

@@ -185,7 +185,7 @@ fn after_keyword(before: &[char]) -> bool {
 
 /// Các số mục được nhắc trong văn bản: nằm trong ngoặc tròn, đứng sau "section"/"mục"/"§",
 /// hoặc có dấu chấm (3.3). "2.1-5" → "2.1" (phần sau gạch nối là số thứ tự item).
-fn mentioned_numbers(text: &str) -> Vec<String> {
+pub(crate) fn mentioned_numbers(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut out = Vec::new();
     let mut depth = 0usize;

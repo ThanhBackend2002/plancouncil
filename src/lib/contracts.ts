@@ -13,7 +13,7 @@ export type SessionStatus =
   | "truncated"
   /** Hết ngân sách token (giới hạn mềm) → giữ phiên bản gần nhất. */
   | "budget_exhausted"
-  /** Dành cho wave sau. */
+  /** Mọi reviewer APPROVE nhưng kiểm tra nhất quán còn mâu thuẫn / không xác minh được khi hết vòng. */
   | "unresolved"
   /** Dành cho wave sau. */
   | "interrupted"
@@ -75,7 +75,31 @@ export interface StaffingInfo {
   note: string;
 }
 
-export interface PlanVersion { version: number; markdown: string; created_at: string }
+/** Cách phiên bản plan được tạo: bản nháp đầu, viết lại toàn bộ, hay chỉ sửa section liên quan. */
+export type ReviseKind = "initial" | "full" | "section";
+/** Lý do section revise không dùng được → viết lại toàn bộ. */
+export type FallbackReason =
+  | "missing_ids"
+  | "extra_ids"
+  | "duplicate_ids"
+  | "base_mismatch"
+  | "bad_structure"
+  | "structural_change"
+  | "ratio"
+  | "truncated";
+
+export interface PlanVersion {
+  version: number;
+  markdown: string;
+  created_at: string;
+  /** Bản ghi cũ không có field → "full". */
+  revise_mode?: ReviseKind;
+  fallback_reason?: FallbackReason | null;
+}
+
+/** 1 mâu thuẫn giữa các section (id "s2", "s5"…). */
+export interface ConsistencyConflict { sections: string[]; text: string }
+export type ConsistencyResult = "ok" | "conflicts" | "unverified";
 export interface ReviewSlot { agent: RoleId; review: Review | null; error: string | null }
 export interface RoundRecord { round: number; plan_version: number; slots: ReviewSlot[]; approvals: number; converged: boolean }
 
@@ -249,6 +273,8 @@ export type CouncilEvent =
       recovered: boolean;
       reason: TruncatedReason;
     }
+  | { type: "revise_fallback"; scope: string; round: number; reason: FallbackReason; consecutive: number }
+  | { type: "consistency"; scope: string; result: ConsistencyResult; conflicts: ConsistencyConflict[] }
   | ({ type: "budget" } & BudgetSnapshot)
   | {
       type: "round_completed";
@@ -318,6 +344,8 @@ export interface Department {
 
 export type PlanDepth = "mvp" | "standard" | "enterprise";
 export type StaffingMode = "manual" | "suggest" | "auto";
+/** full = luôn viết lại toàn bộ; auto = section revise + mọi luật fallback; section = chỉ fallback khi patch hỏng. */
+export type ReviseMode = "full" | "auto" | "section";
 
 export interface MeetingConfig {
   chair_id: RoleId;
@@ -334,6 +362,12 @@ export interface MeetingConfig {
   section_routing: boolean;
   /** Ngân sách token mềm cho cả phiên; null = không giới hạn (nếu đặt thì ≥ 1000). */
   max_total_tokens?: number | null;
+  /** Cách chỉnh plan từ vòng 2 (mặc định "full"). */
+  revise_mode: ReviseMode;
+  /** 0.1–1.0; chỉ áp cho "auto". */
+  section_mode_max_ratio: number;
+  /** "author" hoặc id role reviewer. */
+  consistency_checker: string;
 }
 
 /** Thư mục dự án được cấp quyền ĐỌC. */

@@ -325,10 +325,62 @@ pub fn validate_and_merge(
     Ok(out)
 }
 
+/// Đọc NGHIÊM câu trả lời của bước kiểm tra nhất quán.
+/// - `Some(vec![])` = đúng 1 dòng `OK`.
+/// - `Some(conflicts)` = mọi dòng không rỗng có dạng `- [sX, sY] mô tả`, id thuộc `known`, mô tả không rỗng.
+/// - `None` = sai định dạng (caller hỏi lại 1 lần).
+pub fn parse_consistency(text: &str, known: &[&str]) -> Option<Vec<crate::models::ConsistencyConflict>> {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines == ["OK"] {
+        return Some(Vec::new());
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for l in lines {
+        let (ids, desc) = l.strip_prefix("- [")?.split_once(']')?;
+        let ids: Vec<String> = ids.split(',').map(|x| x.trim().to_string()).collect();
+        let valid_id = |id: &String| {
+            id.strip_prefix('s').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                && known.contains(&id.as_str())
+        };
+        let desc = desc.trim();
+        if ids.is_empty() || !ids.iter().all(valid_id) || desc.is_empty() {
+            return None;
+        }
+        out.push(crate::models::ConsistencyConflict { sections: ids, text: desc.to_string() });
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sections::{join, split};
+
+    #[test]
+    fn consistency_reply_is_parsed_strictly() {
+        let known = ["s1", "s2", "s5"];
+        assert_eq!(parse_consistency("  OK \n", &known), Some(vec![]));
+        let c = parse_consistency("- [s2, s5] Cache TTL lệch\n\n- [s1] Tên service khác\n", &known).unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].sections, vec!["s2", "s5"]);
+        assert_eq!(c[0].text, "Cache TTL lệch");
+        for bad in [
+            "",
+            "OK.",
+            "OK\n- [s1] x",
+            "Không có mâu thuẫn",
+            "- [s2, s9] id lạ",
+            "- [2] thiếu s",
+            "- [s1]",
+            "* [s1] sai bullet",
+            "```\nOK\n```",
+        ] {
+            assert_eq!(parse_consistency(bad, &known), None, "{bad:?}");
+        }
+    }
 
     const PLAN: &str = "# Kế hoạch\n\nMô tả chung. Câu thứ hai.\n\n\
 ## 1. Goals\nMục tiêu v1.\n\n\
