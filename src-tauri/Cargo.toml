@@ -39,6 +39,7 @@ serde_json = "1"
 dirs = "6"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+blake3 = "1"                             # hash nội dung section (section revise)
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 
 [dev-dependencies]
