@@ -97,6 +97,51 @@ pub struct RawReview {
     pub out_of_scope: Vec<String>,
     #[serde(default, deserialize_with = "flexible_invites")]
     pub invite: Vec<InviteRequest>,
+    /// Số hiệu heading mà critical_issues nhắc tới ("3.3", "2"); đã chuẩn hoá + bỏ trùng.
+    #[serde(default, alias = "section", deserialize_with = "flexible_sections")]
+    pub sections: Vec<String>,
+}
+
+/// Rút số hiệu heading từ 1 chuỗi: "§3.3", "Section 3.3", "3.3.", "mục 3.3", "3.3 Startup" → "3.3".
+/// Không có chữ số → `None`.
+pub fn normalize_section(s: &str) -> Option<String> {
+    let start = s.find(|c: char| c.is_ascii_digit())?;
+    let run: String = s[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    // Bỏ dấu chấm thừa ở cuối ("3." → "3") và gộp ".." lỡ tay.
+    let parts: Vec<&str> = run.split('.').filter(|p| !p.is_empty()).collect();
+    (!parts.is_empty()).then(|| parts.join("."))
+}
+
+/// Chấp nhận `null`, `"3.3"`, `3`, `["§3.3", 2, "mục 4.1"]`, `"3.3, 4.2"`, `[{"section":"3.3"}]`.
+fn flexible_sections<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    use serde_json::Value;
+    fn collect(v: Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                // "3.3, 4.2" / "3.3; 4.2" → nhiều mục; mỗi mục lấy số hiệu đầu tiên.
+                out.extend(s.split([',', ';']).filter_map(normalize_section));
+            }
+            Value::Number(n) => out.extend(normalize_section(&n.to_string())),
+            Value::Array(a) => a.into_iter().for_each(|it| collect(it, out)),
+            Value::Object(m) => m.into_iter().for_each(|(_, it)| collect(it, out)),
+            Value::Null | Value::Bool(_) => {}
+        }
+    }
+    let mut raw = Vec::new();
+    if let Some(v) = Option::<Value>::deserialize(d)? {
+        collect(v, &mut raw);
+    }
+    let mut out: Vec<String> = Vec::new();
+    for s in raw {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out.truncate(MAX_LIST_ITEMS);
+    Ok(out)
 }
 
 /// Chấp nhận `null`, `"a string"`, `["a", {"issue": "b"}]`.
@@ -145,6 +190,9 @@ pub struct Review {
     /// Chuyên gia reviewer đề nghị mời thêm.
     #[serde(default)]
     pub invites: Vec<InviteRequest>,
+    /// Số hiệu heading (vd "3.3", "2") mà critical_issues nhắc tới. Phiên cũ không có field → rỗng.
+    #[serde(default)]
+    pub sections: Vec<String>,
     /// true = không gọi model: phần reviewer phụ trách không đổi nên giữ nguyên APPROVE vòng trước.
     #[serde(default)]
     pub carried_over: bool,
@@ -185,6 +233,7 @@ impl Review {
             suggestions,
             out_of_scope,
             invites: raw.invite,
+            sections: raw.sections,
             carried_over: false,
             policy_override: None,
         }
@@ -646,6 +695,58 @@ mod tests {
         assert_eq!(r.role, "Security Engineer");
         assert_eq!(r.agent, "chaos_reviewer");
         assert_eq!(r.summary_bubble, "a"); // fallback từ issue đầu tiên
+    }
+
+    #[test]
+    fn section_normalization() {
+        for (s, want) in [
+            ("3.3", Some("3.3")),
+            ("§3.3", Some("3.3")),
+            ("Section 3.3", Some("3.3")),
+            ("3.3.", Some("3.3")),
+            ("mục 3.3", Some("3.3")),
+            ("## 3. Data Flow", Some("3")),
+            ("3.3 Startup", Some("3.3")),
+            ("Overview", None),
+            ("", None),
+        ] {
+            assert_eq!(normalize_section(s).as_deref(), want, "input {s:?}");
+        }
+    }
+
+    #[test]
+    fn raw_review_sections_shapes() {
+        let raw: RawReview = serde_json::from_str(
+            r#"{"verdict":"REJECT","critical_issues":["x"],
+                "sections":["§3.3", 2, "Section 3.3", "mục 4.1", "3.3.", "3.3, 4.2", null, "n/a", {"section":"5"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.sections, vec!["3.3", "2", "4.1", "4.2", "5"]);
+
+        // 1 chuỗi / 1 số thay vì mảng; alias "section".
+        let raw: RawReview = serde_json::from_str(r#"{"verdict":"REJECT","sections":"mục 2"}"#).unwrap();
+        assert_eq!(raw.sections, vec!["2"]);
+        let raw: RawReview = serde_json::from_str(r#"{"verdict":"REJECT","section":3.3}"#).unwrap();
+        assert_eq!(raw.sections, vec!["3.3"]);
+
+        // Thiếu field / null → rỗng; from_raw giữ nguyên.
+        let raw: RawReview = serde_json::from_str(r#"{"verdict":"APPROVE"}"#).unwrap();
+        assert!(raw.sections.is_empty());
+        let raw: RawReview = serde_json::from_str(r#"{"verdict":"APPROVE","sections":null}"#).unwrap();
+        assert!(raw.sections.is_empty());
+        let raw: RawReview =
+            serde_json::from_str(r#"{"verdict":"REJECT","critical_issues":["x"],"sections":["3.3"]}"#).unwrap();
+        assert_eq!(Review::from_raw("a", "A", raw).sections, vec!["3.3"]);
+    }
+
+    #[test]
+    fn old_review_json_has_no_sections() {
+        let old = r#"{"agent":"dba","role":"DBA","verdict":"REJECT","summary_bubble":"s",
+            "critical_issues":["x"],"suggestions":[]}"#;
+        let r: Review = serde_json::from_str(old).unwrap();
+        assert!(r.sections.is_empty());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["sections"], serde_json::json!([]));
     }
 
     #[test]

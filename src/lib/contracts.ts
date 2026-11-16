@@ -25,6 +25,8 @@ export interface Review {
   /** Ý tưởng vượt phạm vi yêu cầu — không phải lý do REJECT. */
   out_of_scope?: string[];
   invites?: InviteRequest[];
+  /** Số hiệu heading (vd "3.3", "2") mà critical_issues nhắc tới. */
+  sections?: string[];
   /** true = không gọi model, giữ nguyên APPROVE vì phần phụ trách không đổi. */
   carried_over?: boolean;
   policy_override?: string;
