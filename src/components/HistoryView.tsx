@@ -99,7 +99,7 @@ export function HistoryView() {
     <div className="mx-auto flex h-full max-w-5xl flex-col p-6">
       <div className="mb-4 flex items-center gap-3">
         <h1 className="text-lg font-semibold">Lịch sử phiên họp</h1>
-        <span className="text-sm text-neutral-500" aria-live="polite">
+        <span className="text-sm text-fg-subtle" aria-live="polite">
           {status}
         </span>
         <Button
@@ -114,7 +114,7 @@ export function HistoryView() {
       </div>
 
       <div className="relative mb-3">
-        <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-neutral-500" />
+        <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-fg-subtle" />
         <input
           ref={inputRef}
           type="search"
@@ -128,14 +128,14 @@ export function HistoryView() {
           aria-controls={RESULTS_ID}
           aria-autocomplete="list"
           aria-activedescendant={searching && hits[active] ? hitId(active) : undefined}
-          className="w-full rounded-lg border border-neutral-800 bg-neutral-900 py-2 pr-20 pl-9 text-sm text-neutral-100 placeholder:text-neutral-500 focus:border-violet-500/60 focus:outline-none [&::-webkit-search-cancel-button]:hidden"
+          className="w-full rounded-lg border border-line bg-surface py-2 pr-20 pl-9 text-sm text-fg placeholder:text-fg-subtle focus:border-accent/60 focus:outline-none [&::-webkit-search-cancel-button]:hidden"
         />
         <div className="absolute top-1/2 right-2 flex -translate-y-1/2 items-center gap-1.5">
-          {searchLoading && <LoaderCircle className="size-3.5 animate-spin text-neutral-500" />}
+          {searchLoading && <LoaderCircle className="size-3.5 animate-spin text-fg-subtle" />}
           {query ? (
             <button
               type="button"
-              className="rounded p-1 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+              className="rounded p-1 text-fg-subtle hover:bg-surface-2 hover:text-fg"
               onClick={() => {
                 clearSearch();
                 inputRef.current?.focus();
@@ -146,25 +146,25 @@ export function HistoryView() {
               <X className="size-3.5" />
             </button>
           ) : (
-            <kbd className="rounded border border-neutral-700 px-1.5 text-[10px] text-neutral-500">{SHORTCUT_LABEL}</kbd>
+            <kbd className="rounded border border-line-strong px-1.5 text-[10px] text-fg-subtle">{SHORTCUT_LABEL}</kbd>
           )}
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-neutral-800">
+      <div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-line">
         {searching ? (
           <SearchResults active={active} setActive={setActive} onOpen={openSession} />
         ) : !loaded && loading ? (
-          <div className="flex items-center justify-center gap-2 p-10 text-sm text-neutral-500">
+          <div className="flex items-center justify-center gap-2 p-10 text-sm text-fg-subtle">
             <LoaderCircle className="size-4 animate-spin" /> Đang tải…
           </div>
         ) : sessions.length === 0 ? (
-          <div className="flex flex-col items-center gap-2 p-12 text-center text-sm text-neutral-500">
-            <FileText className="size-8 text-neutral-700" />
+          <div className="flex flex-col items-center gap-2 p-12 text-center text-sm text-fg-subtle">
+            <FileText className="size-8 text-fg-faint" />
             Chưa có phiên nào. Phiên sẽ được lưu tự động khi kết thúc.
           </div>
         ) : (
-          <ul className="divide-y divide-neutral-800">
+          <ul className="divide-y divide-line">
             {sessions.map((s) => (
               <Row key={s.id} s={s} />
             ))}
@@ -190,32 +190,32 @@ function SearchResults({
 
   if (error) {
     return (
-      <div role="alert" className="flex flex-col items-center gap-2 p-12 text-center text-sm text-neutral-400">
-        <AlertTriangle className="size-8 text-amber-500/70" />
-        <p className="font-medium text-neutral-200">
+      <div role="alert" className="flex flex-col items-center gap-2 p-12 text-center text-sm text-fg-muted">
+        <AlertTriangle className="size-8 text-warn-solid/70" />
+        <p className="font-medium text-fg">
           {error.kind === "index_unavailable" ? "Tìm kiếm chưa khả dụng" : "Không tìm được"}
         </p>
-        <p className="max-w-md text-neutral-500">{error.message}</p>
+        <p className="max-w-md text-fg-subtle">{error.message}</p>
       </div>
     );
   }
   if (hitsFor === null) {
     return (
-      <div className="flex items-center justify-center gap-2 p-10 text-sm text-neutral-500">
+      <div className="flex items-center justify-center gap-2 p-10 text-sm text-fg-subtle">
         <LoaderCircle className="size-4 animate-spin" /> Đang tìm…
       </div>
     );
   }
   if (hits.length === 0) {
     return (
-      <div className="flex flex-col items-center gap-2 p-12 text-center text-sm text-neutral-500">
-        <SearchX className="size-8 text-neutral-700" />
+      <div className="flex flex-col items-center gap-2 p-12 text-center text-sm text-fg-subtle">
+        <SearchX className="size-8 text-fg-faint" />
         Không có kết quả cho “{hitsFor}”. Thử từ khoá khác hoặc ngắn hơn.
       </div>
     );
   }
   return (
-    <ul id={RESULTS_ID} role="listbox" aria-label="Kết quả tìm kiếm" className="divide-y divide-neutral-800">
+    <ul id={RESULTS_ID} role="listbox" aria-label="Kết quả tìm kiếm" className="divide-y divide-line">
       {hits.map((h, i) => (
         <HitRow
           key={`${h.session_id}:${h.scope}:${h.kind}:${h.section_key ?? ""}:${i}`}
@@ -250,28 +250,28 @@ function HitRow({
       aria-selected={selected}
       onMouseMove={selected ? undefined : onHover}
       onClick={onOpen}
-      className={cx("cursor-pointer px-4 py-3", selected ? "bg-neutral-800/70" : "hover:bg-neutral-900/50")}
+      className={cx("cursor-pointer px-4 py-3", selected ? "bg-surface-2/70" : "hover:bg-surface/50")}
     >
       <div className="flex items-center gap-2">
-        <p className="min-w-0 flex-1 truncate text-sm text-neutral-200" title={h.session_title}>
+        <p className="min-w-0 flex-1 truncate text-sm text-fg" title={h.session_title}>
           {h.session_title}
         </p>
         <Badge tone={h.scope === MAIN_SCOPE ? "info" : "neutral"}>
           {h.scope === MAIN_SCOPE ? "Chính" : `Phòng ban: ${h.scope}`}
         </Badge>
         {h.kind === "section" ? (
-          <span className="font-mono text-[11px] text-neutral-500">v{h.version_no}</span>
+          <span className="font-mono text-[11px] text-fg-subtle">v{h.version_no}</span>
         ) : (
           <Badge tone="neutral">Đề bài</Badge>
         )}
       </div>
       {h.kind === "section" && h.heading && (
-        <p className="mt-0.5 truncate text-xs font-medium text-violet-300/90">§ {h.heading}</p>
+        <p className="mt-0.5 truncate text-xs font-medium text-accent-fg">§ {h.heading}</p>
       )}
-      <p className="mt-1 line-clamp-2 text-xs text-neutral-400">
+      <p className="mt-1 line-clamp-2 text-xs text-fg-muted">
         <Snippet text={h.snippet} />
       </p>
-      <p className="mt-0.5 text-[11px] text-neutral-600">{formatDate(h.created_at)}</p>
+      <p className="mt-0.5 text-[11px] text-fg-faint">{formatDate(h.created_at)}</p>
     </li>
   );
 }
@@ -282,7 +282,7 @@ function Snippet({ text }: { text: string }) {
     <>
       {splitSnippet(text).map((p, i) =>
         p.hit ? (
-          <mark key={i} className="rounded-sm bg-amber-400/25 px-0.5 text-amber-100">
+          <mark key={i} className="rounded-sm bg-warn/25 px-0.5 text-warn">
             {p.text}
           </mark>
         ) : (
@@ -310,12 +310,12 @@ function Row({ s }: { s: SessionSummary }) {
   };
 
   return (
-    <li className="flex items-center gap-4 px-4 py-3 hover:bg-neutral-900/50">
+    <li className="flex items-center gap-4 px-4 py-3 hover:bg-surface/50">
       <div className="min-w-0 flex-1">
-        <p className="truncate text-sm text-neutral-200" title={s.prompt_preview}>
+        <p className="truncate text-sm text-fg" title={s.prompt_preview}>
           {s.prompt_preview}
         </p>
-        <p className="mt-0.5 text-xs text-neutral-500">
+        <p className="mt-0.5 text-xs text-fg-subtle">
           {formatDate(s.created_at)} · {s.versions} version · {s.rounds} round
           {s.departments > 0 && ` · ${s.departments} phòng ban`}
           {s.total_tokens > 0 && ` · ${formatTokens(s.total_tokens)} token`}

@@ -91,26 +91,26 @@ export function Dialog({
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={cx(
-          "relative w-full max-w-lg rounded-xl border bg-neutral-900 p-5 shadow-2xl shadow-black/60 focus:outline-none",
-          tone === "warning" ? "border-amber-500/40" : tone === "danger" ? "border-red-500/40" : "border-neutral-700",
+          "relative w-full max-w-lg rounded-xl border bg-surface p-5 shadow-2xl shadow-black/60 focus:outline-none",
+          tone === "warning" ? "border-warn-line" : tone === "danger" ? "border-danger-line" : "border-line-strong",
           className,
         )}
       >
         <div className="mb-3 flex items-start gap-3">
-          <h2 id={titleId} className="min-w-0 flex-1 text-sm font-semibold text-neutral-100">
+          <h2 id={titleId} className="min-w-0 flex-1 text-sm font-semibold text-fg">
             {title}
           </h2>
           <button
             type="button"
             onClick={() => onCloseRef.current()}
-            className="rounded p-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+            className="rounded p-0.5 text-fg-subtle hover:bg-surface-2 hover:text-fg"
             aria-label="Đóng"
           >
             <X className="size-4" />
           </button>
         </div>
         {description && (
-          <div id={descId} className="mb-3 text-xs text-neutral-400">
+          <div id={descId} className="mb-3 text-xs text-fg-muted">
             {description}
           </div>
         )}

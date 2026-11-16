@@ -24,14 +24,14 @@ import { Badge, Button, cx } from "../ui";
 export type Errors = Partial<Record<string, string>>;
 
 export const INPUT =
-  "h-9 w-full rounded-md border border-neutral-700 bg-neutral-950 px-2.5 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-violet-500/60 focus:outline-none";
+  "h-9 w-full rounded-md border border-line-strong bg-canvas px-2.5 text-sm text-fg placeholder:text-fg-faint focus:border-accent/60 focus:outline-none";
 
 export function SectionTitle({ title, desc, children }: { title: string; desc?: string; children?: ReactNode }) {
   return (
     <div className="mb-4 flex items-start gap-3">
       <div className="min-w-0 flex-1">
-        <h2 className="text-sm font-semibold text-neutral-100">{title}</h2>
-        {desc && <p className="mt-0.5 text-xs text-neutral-500">{desc}</p>}
+        <h2 className="text-sm font-semibold text-fg">{title}</h2>
+        {desc && <p className="mt-0.5 text-xs text-fg-subtle">{desc}</p>}
       </div>
       {children}
     </div>
@@ -53,12 +53,12 @@ export function Field({
 }) {
   return (
     <div className={cx("block min-w-0", className)}>
-      <span className="mb-1 block text-xs font-medium text-neutral-400">{label}</span>
+      <span className="mb-1 block text-xs font-medium text-fg-muted">{label}</span>
       {children}
       {error ? (
-        <span className="mt-1 block text-[11px] text-red-400">{error}</span>
+        <span className="mt-1 block text-[11px] text-danger">{error}</span>
       ) : hint ? (
-        <span className="mt-1 block text-[11px] text-neutral-600">{hint}</span>
+        <span className="mt-1 block text-[11px] text-fg-faint">{hint}</span>
       ) : null}
     </div>
   );
@@ -107,7 +107,7 @@ export function TextArea({
       onChange={(e) => onChange(e.target.value)}
       placeholder={placeholder}
       rows={rows}
-      className="w-full resize-y rounded-md border border-neutral-700 bg-neutral-950 px-2.5 py-2 text-sm text-neutral-100 placeholder:text-neutral-600 focus:border-violet-500/60 focus:outline-none"
+      className="w-full resize-y rounded-md border border-line-strong bg-canvas px-2.5 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-accent/60 focus:outline-none"
     />
   );
 }
@@ -154,8 +154,8 @@ export function NumberInput({
 
 export function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: string }) {
   return (
-    <label className="flex h-9 cursor-pointer items-center gap-2 text-sm text-neutral-300">
-      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="size-4 accent-violet-500" />
+    <label className="flex h-9 cursor-pointer items-center gap-2 text-sm text-fg-soft">
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="size-4 accent-accent" />
       {label}
     </label>
   );
@@ -187,7 +187,7 @@ export function KeyInput({
   if (masked) {
     return (
       <div className="flex gap-2">
-        <input readOnly value={value ?? ""} className={cx(INPUT, "font-mono text-neutral-400")} aria-label="API key đã lưu" />
+        <input readOnly value={value ?? ""} className={cx(INPUT, "font-mono text-fg-muted")} aria-label="API key đã lưu" />
         <Button
           onClick={() => {
             onChange("");
@@ -218,7 +218,7 @@ export function KeyInput({
           <button
             type="button"
             onClick={() => setReveal((r) => !r)}
-            className="absolute top-1/2 right-2 -translate-y-1/2 text-neutral-500 hover:text-neutral-200"
+            className="absolute top-1/2 right-2 -translate-y-1/2 text-fg-subtle hover:text-fg"
             aria-label={reveal ? "Ẩn key" : "Hiện key"}
           >
             {reveal ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
@@ -231,7 +231,7 @@ export function KeyInput({
         )}
       </div>
       {hasSaved && !(value ?? "").trim() && (
-        <span className="mt-1 block text-[11px] text-amber-400">Để trống khi lưu sẽ xoá key đã lưu.</span>
+        <span className="mt-1 block text-[11px] text-warn">Để trống khi lưu sẽ xoá key đã lưu.</span>
       )}
     </div>
   );
@@ -302,16 +302,16 @@ export function ModelPicker({ value, models, onChange }: { value: string; models
           aria-expanded={open}
           className={cx(INPUT, "pr-8 font-mono text-[13px]")}
         />
-        <ChevronDown className="pointer-events-none absolute top-1/2 right-2.5 size-4 -translate-y-1/2 text-neutral-500" />
+        <ChevronDown className="pointer-events-none absolute top-1/2 right-2.5 size-4 -translate-y-1/2 text-fg-subtle" />
       </div>
       {open && models.length > 0 && (
         <ul
           ref={listRef}
           role="listbox"
-          className="absolute z-30 mt-1 max-h-64 w-full overflow-y-auto rounded-lg border border-neutral-700 bg-neutral-900 py-1 shadow-xl shadow-black/50"
+          className="absolute z-30 mt-1 max-h-64 w-full overflow-y-auto rounded-lg border border-line-strong bg-surface py-1 shadow-xl shadow-black/50"
         >
           {filtered.length === 0 ? (
-            <li className="px-3 py-1.5 text-xs text-neutral-500">Không có model khớp, sẽ dùng đúng tên bạn nhập.</li>
+            <li className="px-3 py-1.5 text-xs text-fg-subtle">Không có model khớp, sẽ dùng đúng tên bạn nhập.</li>
           ) : (
             filtered.map((m, i) => (
               <li
@@ -325,8 +325,8 @@ export function ModelPicker({ value, models, onChange }: { value: string; models
                 onMouseEnter={() => setActive(i)}
                 className={cx(
                   "cursor-pointer truncate px-3 py-1 font-mono text-[12.5px]",
-                  i === active ? "bg-violet-500/20 text-neutral-50" : "text-neutral-300",
-                  m === value && "text-violet-300",
+                  i === active ? "bg-accent/20 text-fg" : "text-fg-soft",
+                  m === value && "text-accent-fg",
                 )}
               >
                 {m}
@@ -334,11 +334,11 @@ export function ModelPicker({ value, models, onChange }: { value: string; models
             ))
           )}
           {models.length > MAX_OPTIONS && filtered.length === MAX_OPTIONS && (
-            <li className="px-3 py-1 text-[11px] text-neutral-500">Gõ để lọc thêm ({models.length} model)…</li>
+            <li className="px-3 py-1 text-[11px] text-fg-subtle">Gõ để lọc thêm ({models.length} model)…</li>
           )}
         </ul>
       )}
-      {unknown && <span className="mt-1 block text-[11px] text-amber-400">Không có trong danh sách của provider</span>}
+      {unknown && <span className="mt-1 block text-[11px] text-warn">Không có trong danh sách của provider</span>}
     </div>
   );
 }
@@ -405,7 +405,7 @@ export function RoleChips({
             key={id}
             className={cx(
               "inline-flex items-center gap-1.5 rounded-full border py-0.5 pr-1 pl-0.5 text-xs",
-              missing ? "border-red-500/50 text-red-300" : "border-neutral-700 text-neutral-200",
+              missing ? "border-danger-solid/50 text-danger" : "border-line-strong text-fg",
             )}
             title={missing ? "Role không tồn tại" : m.title}
           >
@@ -414,7 +414,7 @@ export function RoleChips({
             <button
               type="button"
               onClick={() => onChange(value.filter((x) => x !== id))}
-              className="rounded-full p-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-neutral-200"
+              className="rounded-full p-0.5 text-fg-subtle hover:bg-surface-2 hover:text-fg"
               aria-label={`Bỏ ${m.name}`}
             >
               <X className="size-3" />
@@ -440,7 +440,7 @@ export function RoleChips({
           <button
             type="button"
             onClick={() => setAdding(true)}
-            className="inline-flex items-center gap-1 rounded-full border border-dashed border-neutral-700 px-2 py-0.5 text-xs text-neutral-400 hover:border-neutral-500 hover:text-neutral-200"
+            className="inline-flex items-center gap-1 rounded-full border border-dashed border-line-strong px-2 py-0.5 text-xs text-fg-muted hover:border-line-heavy hover:text-fg"
           >
             <Plus className="size-3" /> Thêm
           </button>
@@ -609,15 +609,15 @@ export function SecretControls({
         )}
       </div>
       {lockedMsg && (
-        <div className="flex flex-wrap items-center gap-2 text-amber-300">
+        <div className="flex flex-wrap items-center gap-2 text-warn">
           <span className="min-w-0 break-words">Keyring đang khoá hoặc bị từ chối truy cập.</span>
           <Button size="sm" icon={<LockKeyholeOpen className="size-3" />} loading={busy} onClick={() => void store("keyring")}>
             Mở khóa / thử lại
           </Button>
         </div>
       )}
-      {status?.error && !lockedMsg && <span className="block break-words text-amber-400">{status.error}</span>}
-      {error && <span className="block break-words text-red-400">{error}</span>}
+      {status?.error && !lockedMsg && <span className="block break-words text-warn">{status.error}</span>}
+      {error && <span className="block break-words text-danger">{error}</span>}
 
       <Dialog
         open={consent}
@@ -639,10 +639,10 @@ export function SecretControls({
           </>
         }
       >
-        <div className="space-y-2 text-xs text-neutral-300">
+        <div className="space-y-2 text-xs text-fg-soft">
           <p>
             <b>Lưu dạng file</b>: key nằm <b>không mã hoá</b> trong
-            <code className="mx-1 rounded bg-neutral-800 px-1 py-0.5 font-mono text-[11px] break-all text-amber-200">
+            <code className="mx-1 rounded bg-surface-2 px-1 py-0.5 font-mono text-[11px] break-all text-warn">
               {secretsFile ?? "secrets.json"}
             </code>
             (chỉ tài khoản của bạn đọc được). Phần mềm chạy dưới tài khoản này, bản sao lưu máy hoặc thư mục đồng bộ đám mây đều có thể đọc được key.
@@ -679,12 +679,12 @@ export function LeftoverFilesWarning({ files, refresh }: { files: string[]; refr
   };
 
   return (
-    <div className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200" role="alert">
+    <div className="mb-3 rounded-md border border-warn-line bg-warn-subtle px-3 py-2 text-xs text-warn" role="alert">
       <div className="flex items-start gap-2">
         <TriangleAlert className="mt-px size-3.5 shrink-0" />
         <div className="min-w-0 flex-1">
           <div className="font-medium">{files.length} file backup/hỏng vẫn chứa API key dạng plaintext:</div>
-          <ul className="mt-1 space-y-0.5 font-mono text-[11px] break-all text-amber-100/80">
+          <ul className="mt-1 space-y-0.5 font-mono text-[11px] break-all text-warn/80">
             {files.map((f) => (
               <li key={f}>{f}</li>
             ))}
@@ -694,7 +694,7 @@ export function LeftoverFilesWarning({ files, refresh }: { files: string[]; refr
           Xoá
         </Button>
       </div>
-      {error && <p className="mt-1 text-red-300">{error}</p>}
+      {error && <p className="mt-1 text-danger">{error}</p>}
       <Dialog
         open={confirm}
         onClose={() => setConfirm(false)}
@@ -712,7 +712,7 @@ export function LeftoverFilesWarning({ files, refresh }: { files: string[]; refr
           </>
         }
       >
-        <ul className="space-y-0.5 font-mono text-[11px] break-all text-neutral-400">
+        <ul className="space-y-0.5 font-mono text-[11px] break-all text-fg-muted">
           {files.map((f) => (
             <li key={f}>{f}</li>
           ))}

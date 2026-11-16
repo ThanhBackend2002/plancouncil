@@ -164,55 +164,6 @@
   --inline-code-fg: #6b21a8;
 }
 
-/* ── Lớp tương thích tạm thời (light theme) ──
- * Các file chưa chuyển sang token (fields, ProvidersTab, ContextToolsTab, HistoryView,
- * AppearanceEditor…) vẫn dùng neutral-* / màu 100–400 viết cho nền tối. Ở light theme ta đảo
- * palette đó để chúng vẫn đọc được. Xoá khối này khi mọi file đã dùng token. */
-:root[data-theme="light"] {
-  --color-neutral-50: #0a0a0a;
-  --color-neutral-100: #171717;
-  --color-neutral-200: #333333;
-  --color-neutral-300: #404040;
-  --color-neutral-400: #525252;
-  --color-neutral-500: #6b6b6b;
-  --color-neutral-600: #a3a3a3;
-  --color-neutral-700: #d4d4d4;
-  --color-neutral-800: #e8e8e8;
-  --color-neutral-900: #fafafa;
-  --color-neutral-950: #ffffff;
-  --color-violet-200: var(--accent-fg);
-  --color-violet-300: var(--accent-fg);
-  --color-violet-400: var(--accent-fg);
-  --color-emerald-200: var(--success);
-  --color-emerald-300: var(--success);
-  --color-emerald-400: var(--success);
-  --color-amber-200: var(--warn);
-  --color-amber-300: var(--warn);
-  --color-amber-400: var(--warn);
-  --color-red-200: var(--danger);
-  --color-red-300: var(--danger);
-  --color-red-400: var(--danger);
-  --color-sky-300: var(--info);
-  --color-sky-400: var(--info);
-}
-/* Phòng họp pixel luôn là "căn phòng" tối: trả palette gốc cho cảnh (bọc bằng [data-scene]). */
-:root[data-theme="light"] [data-scene] {
-  --color-neutral-50: oklch(98.5% 0 0);
-  --color-neutral-100: oklch(97% 0 0);
-  --color-neutral-200: oklch(92.2% 0 0);
-  --color-neutral-300: oklch(87% 0 0);
-  --color-neutral-400: oklch(70.8% 0 0);
-  --color-neutral-500: oklch(55.6% 0 0);
-  --color-neutral-600: oklch(43.9% 0 0);
-  --color-neutral-700: oklch(37.1% 0 0);
-  --color-neutral-800: oklch(26.9% 0 0);
-  --color-neutral-900: oklch(20.5% 0 0);
-  --color-neutral-950: oklch(14.5% 0 0);
-  --color-emerald-400: oklch(76.5% 0.177 163.223);
-  --color-amber-400: oklch(82.8% 0.189 84.429);
-  --color-red-400: oklch(70.4% 0.191 22.216);
-}
-
 html,
 body,
 #root {
