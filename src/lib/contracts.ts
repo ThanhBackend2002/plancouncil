@@ -411,3 +411,50 @@ export interface ModelHealth {
 // search_history({ query, limit?, offset? }) → HistorySearchHit[] (lỗi "index_unavailable" nếu không có index)
 // test_connection({ agent }) / export_markdown({ content, suggestedName }) → path | null
 // list_models({ providerId, baseUrl?, apiKey? }) → ModelList
+
+// ── API key: nơi lưu (keyring / file / RAM) — mirror src-tauri/src/secrets.rs ──
+export type KeyStorage = "keyring" | "file" | "memory";
+
+// Config trả về có thêm `key_storage` (backend tự quyết; chỉ đổi được qua set_secret).
+export interface Provider { key_storage?: KeyStorage }
+export interface WebSearchConfig { key_storage?: KeyStorage }
+
+export type SecretTargetKind = "provider" | "websearch";
+/** `websearch` dùng id = dịch vụ tìm web đang chọn (vd "tavily"). */
+export interface SecretTarget { kind: SecretTargetKind; id: string }
+
+export type SecretErrorCode = "keyring_unavailable" | "keyring_locked" | "storage" | "invalid";
+
+export interface SecretTargetStatus {
+  target: SecretTarget;
+  /** Nơi key đang thực sự nằm; key plaintext chưa migrate khỏi config.json = "file". */
+  storage: KeyStorage;
+  /** false = key vẫn nằm plaintext trong config.json. */
+  migrated: boolean;
+  has_key: boolean;
+  /** Key đáng lẽ phải có nhưng không có (RAM sau khi mở lại app, keyring khoá…). */
+  missing: boolean;
+  error?: string;
+  error_code?: SecretErrorCode;
+}
+
+export interface SecretStatusReport {
+  targets: SecretTargetStatus[];
+  /** File backup/hỏng còn chứa api_key plaintext. */
+  leftover_files: string[];
+  /** Đường dẫn secrets.json (dùng trong hộp thoại đồng ý lưu dạng file). */
+  secrets_file: string;
+}
+
+export interface SetSecretResult { storage: KeyStorage; masked: string }
+
+/** Lỗi command liên quan tới key (giữ nguyên `kind` từ backend). */
+export interface SecretCommandError {
+  kind: string;
+  message: string;
+  target?: SecretTarget;
+}
+
+// set_secret({ target, api_key, storage }) → SetSecretResult (lỗi keyring_unavailable / keyring_locked)
+// delete_secret({ target }) / secret_status() → SecretStatusReport / delete_leftover_files({ files }) → string[]
+// start_council có thể trả lỗi { kind: "secret_missing", target }

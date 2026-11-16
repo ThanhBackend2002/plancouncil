@@ -15,6 +15,7 @@ mod routing;
 mod search_index;
 #[allow(dead_code)]
 mod sections;
+mod secrets;
 mod staffing;
 mod storage;
 #[cfg(test)] pub(crate) mod test_support;
@@ -34,6 +35,7 @@ use llm_client::{ChatMessage, Expect, LlmClient, LlmError};
 use models::{EventEnvelope, SessionRecord, SessionSummary, COUNCIL_EVENT};
 use history::{HistoryError, HistoryIndex};
 use orchestrator::{ControlAction, Council, EventSink, MeetingControl, SessionExtras};
+use secrets::{SecretError, Secrets, Target};
 use storage::{Storage, StorageError};
 
 const MAX_PROMPT_CHARS: usize = 50_000;
@@ -50,7 +52,10 @@ struct ActiveSession {
 }
 
 pub struct AppState {
-    config: tokio::sync::RwLock<AppConfig>,
+    /// `Arc` để lúc khởi động giữ write-lock (owned) trong lúc hydrate/migrate key ở nền.
+    config: Arc<tokio::sync::RwLock<AppConfig>>,
+    /// API key: keyring / secrets.json / RAM + trạng thái migrate (xem `secrets.rs`).
+    secrets: Arc<Secrets>,
     storage: Storage,
     /// Index SQLite cho lịch sử (`Option<Arc<SearchIndex>>` bên trong); None nếu mở lỗi.
     history: HistoryIndex,
@@ -104,6 +109,12 @@ pub enum CommandError {
     Llm(#[from] LlmError),
     #[error(transparent)]
     History(#[from] HistoryError),
+    /// `keyring_unavailable` / `keyring_locked` / storage / invalid.
+    #[error(transparent)]
+    Secret(#[from] SecretError),
+    /// Key chế độ RAM đã mất sau khi khởi động lại (hoặc keyring khoá) → cần nhập lại trước khi họp.
+    #[error("Thiếu API key của {label} (chỉ lưu trong RAM hoặc keyring đang khoá) — vào Cài đặt để nhập lại")]
+    SecretMissing { target: Target, label: String },
     #[error("lỗi nội bộ: {0}")]
     Internal(String),
 }
@@ -114,8 +125,16 @@ impl Serialize for CommandError {
         struct Wire<'a> {
             kind: &'a str,
             message: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            target: Option<&'a Target>,
         }
+        let target = match self {
+            CommandError::SecretMissing { target, .. } => Some(target),
+            _ => None,
+        };
         let kind = match self {
+            CommandError::Secret(e) => e.code(),
+            CommandError::SecretMissing { .. } => "secret_missing",
             CommandError::Invalid(_) => "invalid",
             CommandError::AlreadyRunning => "already_running",
             CommandError::Storage(StorageError::NotFound(_)) => "not_found",
@@ -128,6 +147,7 @@ impl Serialize for CommandError {
         Wire {
             kind,
             message: self.to_string(),
+            target,
         }
         .serialize(s)
     }
@@ -146,6 +166,18 @@ where
         .map_err(Into::into)
 }
 
+/// Như `blocking` nhưng cho thao tác keyring / secrets (cũng blocking, có thể hiện hộp thoại OS).
+async fn secret_blocking<T, F>(f: F) -> CmdResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, SecretError> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| CommandError::Internal(e.to_string()))?
+        .map_err(Into::into)
+}
+
 // ───────────────────────────── Commands ─────────────────────────────
 
 #[tauri::command]
@@ -157,11 +189,17 @@ async fn get_config(state: State<'_, AppState>) -> CmdResult<AppConfig> {
 async fn save_config(state: State<'_, AppState>, config: AppConfig) -> CmdResult<AppConfig> {
     // Giữ write-lock suốt quá trình merge + persist → 2 lần save đồng thời không ghi đè lẫn nhau.
     let mut guard = state.config.write().await;
+    // Mask không đổi = giữ key; "" = xoá key; key mới → keyring (lỗi → chỉ giữ trong RAM, UI hỏi tiếp).
     let merged = config.merge_secrets(&guard);
     merged.validate().map_err(CommandError::Invalid)?;
-    let storage = state.storage.clone();
-    let to_save = merged.clone();
-    blocking(move || storage.save_config(&to_save)).await?;
+    let secrets = state.secrets.clone();
+    let old = guard.clone();
+    let merged = secret_blocking(move || {
+        let mut m = merged;
+        secrets.persist(&mut m, &old)?;
+        Ok(m)
+    })
+    .await?;
     *guard = merged;
     log::info!("config saved: {:?}", guard.providers); // Debug đã redact key
     Ok(guard.redacted())
@@ -264,6 +302,7 @@ async fn start_council(
         cfg.meeting.plan_depth = depth;
     }
     cfg.validate_ready().map_err(CommandError::Invalid)?;
+    check_secrets_present(&state.secrets, &cfg, opts.web_search)?;
     let mut extras = build_extras(&cfg, &opts).await?;
     extras.auto_staff = opts.auto_staff;
     let control = extras.control.clone();
@@ -543,9 +582,9 @@ async fn list_models(
         if still_same {
             let mut next = guard.clone();
             next.set_models(&provider_id, models.clone(), fetched_at);
-            let storage = state.storage.clone();
+            let secrets = state.secrets.clone();
             let to_save = next.clone();
-            match blocking(move || storage.save_config(&to_save)).await {
+            match secret_blocking(move || secrets.save_config(&to_save)).await {
                 Ok(()) => {
                     *guard = next;
                     cached = true;
@@ -677,6 +716,105 @@ fn sanitize_file_name(raw: &str) -> String {
     }
 }
 
+// ───────────────────────────── API key (secrets) ─────────────────────────────
+
+/// Trước khi họp: key của provider mà role tham gia dùng (và key tìm web nếu bật) phải còn.
+/// Key chế độ RAM mất sau khi khởi động lại → báo `secret_missing {target}` thay vì lỗi 401 giữa chừng.
+fn check_secrets_present(secrets: &Secrets, cfg: &AppConfig, web_search: bool) -> CmdResult<()> {
+    let mut wanted: Vec<Target> = Vec::new();
+    for id in cfg.participants() {
+        if let Some(r) = cfg.role(id) {
+            let t = Target::provider(&r.provider_id);
+            if !wanted.contains(&t) {
+                wanted.push(t);
+            }
+        }
+    }
+    if web_search {
+        wanted.push(Target::websearch(cfg));
+    }
+    match secrets.first_missing(cfg, &wanted) {
+        None => Ok(()),
+        Some(target) => {
+            let label = match target.kind {
+                secrets::TargetKind::Provider => {
+                    let name = cfg.provider(&target.id).map_or(target.id.as_str(), |p| p.name.as_str());
+                    format!("provider \"{name}\"")
+                }
+                secrets::TargetKind::Websearch => format!("dịch vụ tìm web \"{}\"", target.id),
+            };
+            Err(CommandError::SecretMissing { target, label })
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SetSecretResult {
+    storage: config::KeyStorage,
+    /// Giá trị mask mới (`••••abcd`) để form cập nhật — KHÔNG phải key.
+    masked: String,
+}
+
+/// Lưu key cho 1 target. `api_key` = giá trị mask → dùng key hiện tại (đổi nơi lưu / thử lại
+/// migrate / mở khoá keyring). `storage: "file"` chỉ được dùng khi frontend gửi rõ (sau khi
+/// người dùng đồng ý). Lỗi: `keyring_unavailable`, `keyring_locked`, `invalid`, `storage`.
+#[tauri::command(rename_all = "snake_case")]
+async fn set_secret(
+    state: State<'_, AppState>,
+    target: Target,
+    api_key: String,
+    storage: config::KeyStorage,
+) -> CmdResult<SetSecretResult> {
+    let mut guard = state.config.write().await;
+    let secrets = state.secrets.clone();
+    let mut cfg = guard.clone();
+    let t = target.clone();
+    let (cfg, storage) = secret_blocking(move || {
+        let s = secrets.set_secret(&mut cfg, &t, &api_key, storage)?;
+        Ok((cfg, s))
+    })
+    .await?;
+    *guard = cfg;
+    let key = match target.kind {
+        secrets::TargetKind::Provider => guard.provider(&target.id).and_then(|p| p.api_key.as_deref()),
+        secrets::TargetKind::Websearch => guard.web_search.api_key.as_deref(),
+    };
+    log::info!("đã lưu key '{}' ({storage:?})", target.account());
+    Ok(SetSecretResult { storage, masked: key.map(config::mask_key).unwrap_or_default() })
+}
+
+/// Xoá key của target khỏi keyring, secrets.json, RAM (và plaintext còn trong config.json).
+#[tauri::command]
+async fn delete_secret(state: State<'_, AppState>, target: Target) -> CmdResult<()> {
+    let mut guard = state.config.write().await;
+    let secrets = state.secrets.clone();
+    let mut cfg = guard.clone();
+    let t = target.clone();
+    let cfg = secret_blocking(move || {
+        secrets.delete_secret(&mut cfg, &t)?;
+        Ok(cfg)
+    })
+    .await?;
+    *guard = cfg;
+    log::info!("đã xoá key '{}'", target.account());
+    Ok(())
+}
+
+/// Trạng thái từng key (nơi lưu, đã migrate chưa, lỗi) + file sót lại còn chứa key. Không trả key.
+#[tauri::command]
+async fn secret_status(state: State<'_, AppState>) -> CmdResult<secrets::SecretStatusReport> {
+    let cfg = state.config.read().await.clone();
+    let secrets = state.secrets.clone();
+    secret_blocking(move || Ok(secrets.status(&cfg))).await
+}
+
+/// Xoá file backup/hỏng còn chứa key (chỉ file đang nằm trong `leftover_files`). Trả danh sách còn lại.
+#[tauri::command]
+async fn delete_leftover_files(state: State<'_, AppState>, files: Vec<String>) -> CmdResult<Vec<String>> {
+    let secrets = state.secrets.clone();
+    secret_blocking(move || secrets.delete_leftovers(&files)).await
+}
+
 // ───────────────────────────── Entry ─────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -715,8 +853,29 @@ pub fn run() {
                     }
                 });
             }
+            let secrets = Arc::new(Secrets::new(Arc::new(secrets::KeyringStore), storage.root()));
+            let config = Arc::new(tokio::sync::RwLock::new(config));
+            {
+                // Hydrate key từ keyring + migrate key plaintext ở nền (keyring có thể hiện hộp thoại
+                // mở khoá). Lấy write-lock NGAY tại đây → mọi command đọc config đều chờ xong bước này.
+                let mut guard = config.clone().try_write_owned().expect("config lock chưa ai giữ lúc setup");
+                let secrets = secrets.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut cfg = guard.clone();
+                    match tauri::async_runtime::spawn_blocking(move || {
+                        secrets.startup(&mut cfg);
+                        cfg
+                    })
+                    .await
+                    {
+                        Ok(cfg) => *guard = cfg,
+                        Err(e) => log::error!("task nạp API key panic: {e}"),
+                    }
+                });
+            }
             app.manage(AppState {
-                config: tokio::sync::RwLock::new(config),
+                config,
+                secrets,
                 storage,
                 history,
                 http: llm_client::build_http_client()?,
@@ -744,6 +903,10 @@ pub fn run() {
             invite_member,
             dismiss_member,
             export_markdown,
+            set_secret,
+            delete_secret,
+            secret_status,
+            delete_leftover_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running PlanCouncil");
@@ -752,6 +915,19 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::sanitize_file_name;
+
+    #[test]
+    fn secret_errors_have_stable_codes_and_target() {
+        use super::{secrets::SecretError, secrets::Target, CommandError};
+        let v = serde_json::to_value(CommandError::SecretMissing { target: Target::provider("p1"), label: "x".into() }).unwrap();
+        assert_eq!(v["kind"], "secret_missing");
+        assert_eq!(v["target"], serde_json::json!({"kind": "provider", "id": "p1"}));
+        let v = serde_json::to_value(CommandError::Secret(SecretError::Unavailable("no dbus".into()))).unwrap();
+        assert_eq!(v["kind"], "keyring_unavailable");
+        assert!(v.get("target").is_none());
+        let v = serde_json::to_value(CommandError::Secret(SecretError::Locked("cancel".into()))).unwrap();
+        assert_eq!(v["kind"], "keyring_locked");
+    }
 
     #[test]
     fn file_names_are_sanitized() {

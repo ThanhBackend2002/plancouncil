@@ -4,7 +4,21 @@ import type { AppConfig, SearchHit, ToolPolicy, WebSearchProvider, Workspace } f
 import { ipc, isCommandError } from "../../lib/ipc";
 import { toastError } from "../../store/toast";
 import { Button, Panel, cx } from "../ui";
-import { Field, INPUT, KeyInput, NumberInput, SectionTitle, TextArea, TextInput, Toggle, newId, type Errors } from "./fields";
+import {
+  Field,
+  INPUT,
+  KeyInput,
+  NumberInput,
+  SecretControls,
+  SectionTitle,
+  TextArea,
+  TextInput,
+  Toggle,
+  findStatus,
+  newId,
+  useSecretStatus,
+  type Errors,
+} from "./fields";
 
 const CONTEXT_TEMPLATE = `## Tech stack bắt buộc
 - Backend: (vd. Go 1.22, gRPC, PostgreSQL 16, Redis)
@@ -49,6 +63,7 @@ export function ContextToolsTab({
   dirty: boolean;
   update: (f: (c: AppConfig) => AppConfig) => void;
 }) {
+  const secrets = useSecretStatus(saved);
   const set = (patch: Partial<AppConfig>) => update((c) => ({ ...c, ...patch }));
   const setWeb = (patch: Partial<AppConfig["web_search"]>) => update((c) => ({ ...c, web_search: { ...c.web_search, ...patch } }));
   const setCtx = (patch: Partial<AppConfig["company_context"]>) =>
@@ -164,6 +179,15 @@ export function ContextToolsTab({
                 value={web.api_key}
                 saved={saved.web_search.provider === web.provider ? saved.web_search.api_key : null}
                 onChange={(v) => setWeb({ api_key: v })}
+              />
+              <SecretControls
+                target={{ kind: "websearch", id: web.provider }}
+                status={findStatus(secrets.report, { kind: "websearch", id: web.provider })}
+                secretsFile={secrets.report?.secrets_file}
+                value={web.api_key}
+                canStore={saved.web_search.provider === web.provider}
+                update={update}
+                refresh={secrets.refresh}
               />
             </Field>
           )}

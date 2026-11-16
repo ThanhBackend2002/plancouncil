@@ -1,11 +1,25 @@
 // Primitive form dùng chung cho các tab Settings.
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ChevronDown, Eye, EyeOff, Plus, Undo2, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ChevronDown, Eye, EyeOff, KeyRound, LockKeyholeOpen, Plus, RotateCcw, Trash, TriangleAlert, Undo2, X } from "lucide-react";
 import { LEVELS, makeResolver } from "../../lib/agents";
-import { MASK_PREFIX, type RoleDef, type RoleId } from "../../lib/contracts";
+import {
+  MASK_PREFIX,
+  type AppConfig,
+  type KeyStorage,
+  type RoleDef,
+  type RoleId,
+  type SecretCommandError,
+  type SecretStatusReport,
+  type SecretTarget,
+  type SecretTargetStatus,
+} from "../../lib/contracts";
+import { ipc, secretIpc } from "../../lib/ipc";
+import { useConfig } from "../../store/config";
+import { toast } from "../../store/toast";
+import { Dialog } from "../Dialog";
 import { PixelPortrait } from "../PixelCharacter";
-import { Button, cx } from "../ui";
+import { Badge, Button, cx } from "../ui";
 
 export type Errors = Partial<Record<string, string>>;
 
@@ -431,6 +445,279 @@ export function RoleChips({
             <Plus className="size-3" /> Thêm
           </button>
         ))}
+    </div>
+  );
+}
+
+// ───────────────────────────── API key: nơi lưu (keyring / file / RAM) ─────────────────────────────
+
+/** Trạng thái key từ backend; tải lại mỗi khi `dep` (config đã lưu) đổi. */
+export function useSecretStatus(dep: unknown) {
+  const [report, setReport] = useState<SecretStatusReport | null>(null);
+  const refresh = useCallback(async () => {
+    try {
+      setReport(await secretIpc.status());
+    } catch {
+      setReport(null); // ngoài Tauri / backend cũ: ẩn phần trạng thái
+    }
+  }, []);
+  useEffect(() => {
+    void refresh();
+  }, [dep, refresh]);
+  return { report, refresh };
+}
+
+export const sameTarget = (a: SecretTarget, b: SecretTarget) => a.kind === b.kind && a.id === b.id;
+
+export function findStatus(report: SecretStatusReport | null, target: SecretTarget): SecretTargetStatus | undefined {
+  return report?.targets.find((s) => sameTarget(s.target, target));
+}
+
+/** Sau set_secret/delete_secret: cập nhật config đã lưu + đúng target trong bản nháp (không reset form). */
+async function syncTarget(target: SecretTarget, update: (f: (c: AppConfig) => AppConfig) => void) {
+  const fresh = await ipc.getConfig();
+  useConfig.setState({ config: fresh });
+  if (target.kind === "provider") {
+    const p = fresh.providers.find((x) => x.id === target.id);
+    update((c) => ({
+      ...c,
+      providers: c.providers.map((x) => (x.id === target.id ? { ...x, api_key: p?.api_key ?? null, key_storage: p?.key_storage } : x)),
+    }));
+  } else {
+    update((c) =>
+      c.web_search.provider === target.id
+        ? { ...c, web_search: { ...c.web_search, api_key: fresh.web_search.api_key, key_storage: fresh.web_search.key_storage } }
+        : c,
+    );
+  }
+}
+
+const STORAGE_BADGE: Record<KeyStorage, { label: string; tone: "success" | "warning" }> = {
+  keyring: { label: "Keychain", tone: "success" },
+  file: { label: "File (plaintext)", tone: "warning" },
+  memory: { label: "Chỉ trong RAM — mất khi đóng app", tone: "warning" },
+};
+
+export function KeyStorageBadge({ storage }: { storage: KeyStorage }) {
+  const b = STORAGE_BADGE[storage];
+  return (
+    <Badge tone={b.tone} className="gap-1">
+      <KeyRound className="size-3" />
+      {b.label}
+    </Badge>
+  );
+}
+
+const isNewKey = (v: string | null) => !!v && !!v.trim() && !v.startsWith(MASK_PREFIX);
+
+/**
+ * Hàng trạng thái dưới ô API key: badge nơi lưu, lỗi migrate (Thử lại), keyring khoá (Mở khóa / thử lại),
+ * nút "Lưu key" cho key vừa nhập, và hộp thoại đồng ý khi keyring không khả dụng.
+ * `canStore` = target đã có trong cấu hình đã lưu (provider đã lưu, base URL không đổi / đúng dịch vụ).
+ */
+export function SecretControls({
+  target,
+  status,
+  secretsFile,
+  value,
+  canStore,
+  update,
+  refresh,
+}: {
+  target: SecretTarget;
+  status: SecretTargetStatus | undefined;
+  secretsFile: string | undefined;
+  value: string | null;
+  canStore: boolean;
+  update: (f: (c: AppConfig) => AppConfig) => void;
+  refresh: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [consent, setConsent] = useState(false);
+  const [locked, setLocked] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const fresh = isNewKey(value);
+
+  // Lưu cấu hình lúc keyring không khả dụng → key đang chỉ ở RAM: hỏi người dùng 1 lần.
+  const asked = useRef<string | null>(null);
+  useEffect(() => {
+    const k = status && status.has_key && status.error_code === "keyring_unavailable" ? `${target.kind}:${target.id}:${status.error}` : null;
+    if (k && asked.current !== k) {
+      asked.current = k;
+      setConsent(true);
+    }
+  }, [status, target.kind, target.id]);
+
+  const store = async (storage: KeyStorage) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await secretIpc.setSecret(target, fresh && value ? value : MASK_PREFIX, storage);
+      await syncTarget(target, update);
+      setConsent(false);
+      setLocked(null);
+      toast("success", "Đã lưu API key", STORAGE_BADGE[r.storage].label);
+    } catch (e) {
+      const err = e as SecretCommandError;
+      if (err.kind === "keyring_unavailable") setConsent(true);
+      else if (err.kind === "keyring_locked") setLocked(err.message);
+      else setError(err.message);
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  };
+
+  const lockedMsg = locked ?? (status?.error_code === "keyring_locked" ? status.error : null);
+  const showStatus = !!status && (status.has_key || status.missing || !!status.error);
+
+  if (!showStatus && !(fresh && canStore) && !error) return null;
+
+  return (
+    <div className="mt-1.5 space-y-1.5 text-[11px]">
+      <div className="flex flex-wrap items-center gap-1.5">
+        {status?.has_key && <KeyStorageBadge storage={status.storage} />}
+        {status && !status.migrated && (
+          <>
+            <Badge tone="warning">
+              <TriangleAlert className="size-3" /> Key chưa chuyển vào keyring
+            </Badge>
+            <Button size="sm" variant="ghost" icon={<RotateCcw className="size-3" />} loading={busy} onClick={() => void store("keyring")}>
+              Thử lại
+            </Button>
+          </>
+        )}
+        {status?.missing && (
+          <Badge tone="danger">
+            <TriangleAlert className="size-3" /> Thiếu key — nhập lại để họp
+          </Badge>
+        )}
+        {status?.has_key && status.migrated && status.storage !== "keyring" && !fresh && (
+          <Button size="sm" variant="ghost" loading={busy} onClick={() => void store("keyring")}>
+            Chuyển vào keyring
+          </Button>
+        )}
+        {status?.has_key && status.storage === "memory" && status.error_code === "keyring_unavailable" && (
+          <Button size="sm" variant="ghost" onClick={() => setConsent(true)}>
+            Chọn cách lưu…
+          </Button>
+        )}
+        {fresh && canStore && (
+          <Button size="sm" icon={<KeyRound className="size-3" />} loading={busy} onClick={() => void store("keyring")}>
+            Lưu key vào keyring
+          </Button>
+        )}
+      </div>
+      {lockedMsg && (
+        <div className="flex flex-wrap items-center gap-2 text-amber-300">
+          <span className="min-w-0 break-words">Keyring đang khoá hoặc bị từ chối truy cập.</span>
+          <Button size="sm" icon={<LockKeyholeOpen className="size-3" />} loading={busy} onClick={() => void store("keyring")}>
+            Mở khóa / thử lại
+          </Button>
+        </div>
+      )}
+      {status?.error && !lockedMsg && <span className="block break-words text-amber-400">{status.error}</span>}
+      {error && <span className="block break-words text-red-400">{error}</span>}
+
+      <Dialog
+        open={consent}
+        onClose={() => setConsent(false)}
+        tone="warning"
+        title="Keyring của hệ điều hành không khả dụng"
+        description="Không lưu được API key vào Keychain (macOS), Credential Manager (Windows) hoặc Secret Service (Linux)."
+        footer={
+          <>
+            <Button variant="ghost" disabled={busy} onClick={() => void store("keyring")}>
+              Thử lại keyring
+            </Button>
+            <Button disabled={busy} onClick={() => void store("memory")}>
+              Không lưu, nhập mỗi lần mở app
+            </Button>
+            <Button variant="danger" loading={busy} onClick={() => void store("file")}>
+              Lưu dạng file
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-2 text-xs text-neutral-300">
+          <p>
+            <b>Lưu dạng file</b>: key nằm <b>không mã hoá</b> trong
+            <code className="mx-1 rounded bg-neutral-800 px-1 py-0.5 font-mono text-[11px] break-all text-amber-200">
+              {secretsFile ?? "secrets.json"}
+            </code>
+            (chỉ tài khoản của bạn đọc được). Phần mềm chạy dưới tài khoản này, bản sao lưu máy hoặc thư mục đồng bộ đám mây đều có thể đọc được key.
+          </p>
+          <p>
+            <b>Không lưu</b>: key chỉ giữ trong RAM, mất khi đóng app — bạn sẽ phải nhập lại trước khi họp.
+          </p>
+        </div>
+      </Dialog>
+    </div>
+  );
+}
+
+/** Cảnh báo file backup/hỏng còn chứa API key plaintext + nút xoá (có xác nhận). */
+export function LeftoverFilesWarning({ files, refresh }: { files: string[]; refresh: () => Promise<void> }) {
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (files.length === 0) return null;
+
+  const remove = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const left = await secretIpc.deleteLeftoverFiles(files);
+      setConfirm(false);
+      toast(left.length ? "warning" : "success", left.length ? `Còn ${left.length} file chưa xoá được` : "Đã xoá file chứa key cũ");
+    } catch (e) {
+      setError((e as SecretCommandError).message);
+    } finally {
+      setBusy(false);
+      await refresh();
+    }
+  };
+
+  return (
+    <div className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200" role="alert">
+      <div className="flex items-start gap-2">
+        <TriangleAlert className="mt-px size-3.5 shrink-0" />
+        <div className="min-w-0 flex-1">
+          <div className="font-medium">{files.length} file backup/hỏng vẫn chứa API key dạng plaintext:</div>
+          <ul className="mt-1 space-y-0.5 font-mono text-[11px] break-all text-amber-100/80">
+            {files.map((f) => (
+              <li key={f}>{f}</li>
+            ))}
+          </ul>
+        </div>
+        <Button size="sm" variant="danger" icon={<Trash className="size-3" />} onClick={() => setConfirm(true)}>
+          Xoá
+        </Button>
+      </div>
+      {error && <p className="mt-1 text-red-300">{error}</p>}
+      <Dialog
+        open={confirm}
+        onClose={() => setConfirm(false)}
+        tone="danger"
+        title={`Xoá ${files.length} file chứa key cũ?`}
+        description="Các file này là bản backup / file hỏng do app tạo ra trước đây. Xoá rồi không khôi phục được."
+        footer={
+          <>
+            <Button variant="ghost" disabled={busy} onClick={() => setConfirm(false)}>
+              Huỷ
+            </Button>
+            <Button variant="danger" loading={busy} onClick={() => void remove()}>
+              Xoá vĩnh viễn
+            </Button>
+          </>
+        }
+      >
+        <ul className="space-y-0.5 font-mono text-[11px] break-all text-neutral-400">
+          {files.map((f) => (
+            <li key={f}>{f}</li>
+          ))}
+        </ul>
+      </Dialog>
     </div>
   );
 }
