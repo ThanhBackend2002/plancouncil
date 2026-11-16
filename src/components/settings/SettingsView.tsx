@@ -11,10 +11,11 @@ import { DepartmentsTab } from "./DepartmentsTab";
 import { Field, INPUT, NumberInput, SectionTitle, Toggle, type Errors } from "./fields";
 import { InterfaceTab } from "./InterfaceTab";
 import { MeetingTab } from "./MeetingTab";
+import { PricingTab } from "./PricingTab";
 import { ProvidersTab, apiRoot, type FetchState } from "./ProvidersTab";
 import { RolesTab } from "./RolesTab";
 
-type TabId = "providers" | "roles" | "departments" | "meeting" | "context" | "general" | "interface";
+type TabId = "providers" | "roles" | "departments" | "meeting" | "context" | "general" | "interface" | "pricing";
 
 const TABS: { id: TabId; label: string; match: (k: string) => boolean }[] = [
   { id: "roles", label: "Vai trò", match: (k) => k.startsWith("role.") },
@@ -23,6 +24,7 @@ const TABS: { id: TabId; label: string; match: (k: string) => boolean }[] = [
   { id: "context", label: "Bối cảnh & Công cụ", match: (k) => k.startsWith("context.") },
   { id: "general", label: "Chung", match: (k) => k.startsWith("general.") && k !== "general.max_rounds" },
   { id: "providers", label: "Provider", match: (k) => k.startsWith("provider") },
+  { id: "pricing", label: "Giá model", match: (k) => k.startsWith("pricing") },
   // Tuỳ chọn hiển thị trên máy này (localStorage), không thuộc AppConfig → không có lỗi validate.
   { id: "interface", label: "Giao diện", match: () => false },
 ];
@@ -80,6 +82,11 @@ function validate(c: AppConfig): Errors {
   }
   for (const w of c.workspaces) {
     if (!w.name.trim() || !w.path.trim()) e[`context.ws.${w.id}`] = "Cần tên và đường dẫn";
+  }
+
+  for (const [model, p] of Object.entries(c.pricing ?? {})) {
+    const vals = [p.input_per_m, p.cached_per_m, p.output_per_m];
+    if (vals.some((v) => typeof v !== "number" || !Number.isFinite(v) || v < 0)) e[`pricing.${model}`] = "Giá phải là số ≥ 0";
   }
 
   const m = c.meeting;
@@ -289,6 +296,7 @@ export function SettingsView() {
         {tab === "meeting" && <MeetingTab draft={draft} errors={errors} update={update} />}
         {tab === "context" && <ContextToolsTab draft={draft} saved={config} errors={errors} dirty={dirty} update={update} />}
         {tab === "general" && <GeneralTab draft={draft} errors={errors} update={update} />}
+        {tab === "pricing" && <PricingTab draft={draft} errors={errors} update={update} />}
         {tab === "interface" && <InterfaceTab />}
       </div>
     </div>

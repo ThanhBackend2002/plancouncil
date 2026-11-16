@@ -2,13 +2,15 @@
 // ở component cần phím tắt riêng).
 
 import { useEffect, useRef } from "react";
+import { useCouncil } from "../store/council";
 import { useHistory } from "../store/history";
 import { useUi } from "../store/ui";
 
 export interface Hotkey {
   /** Vd "mod+k", "shift+?", "escape". `mod` = Cmd trên macOS, Ctrl ở nơi khác (nhận cả hai). */
   combo: string;
-  handler: (e: KeyboardEvent) => void;
+  /** Trả `false` = không xử lý (không preventDefault, phím đi tiếp cho phần tử khác). */
+  handler: (e: KeyboardEvent) => void | false;
 }
 
 interface Combo {
@@ -45,12 +47,45 @@ export function useHotkeys(hotkeys: Hotkey[]) {
       if (e.isComposing || e.defaultPrevented) return;
       const hk = ref.current.find((h) => matchesCombo(e, h.combo));
       if (!hk) return;
-      e.preventDefault();
-      hk.handler(e);
+      if (hk.handler(e) !== false) e.preventDefault();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+}
+
+// ── Phím tắt tab Phòng họp ──
+// Ctrl/⌘+Enter = bắt đầu họp từ bất kỳ đâu · Esc = dừng phiên đang chạy (có hộp thoại xác nhận).
+
+export interface CouncilKeyContext {
+  tab: string;
+  /** Đang xem phiên cũ (chỉ xem). */
+  viewing: boolean;
+  /** Trạng thái phiên live. */
+  status: string;
+  stopping: boolean;
+}
+
+export const canStartHotkey = (c: CouncilKeyContext): boolean => c.tab === "council" && !c.viewing && c.status !== "running";
+
+/** `inPopup`: phím phát ra từ hộp thoại / dropdown → để chúng tự xử lý Esc (đóng), không dừng họp. */
+export const canStopHotkey = (c: CouncilKeyContext, inPopup: boolean): boolean =>
+  c.tab === "council" && !c.viewing && c.status === "running" && !c.stopping && !inPopup;
+
+const POPUP = '[role="dialog"],[role="listbox"],[role="combobox"],[aria-expanded="true"]';
+
+let startHandler: (() => void) | null = null;
+/** PromptPanel đăng ký hàm bắt đầu (phụ thuộc state nhập liệu). Trả hàm huỷ đăng ký. */
+export function registerStartHandler(fn: () => void): () => void {
+  startHandler = fn;
+  return () => {
+    if (startHandler === fn) startHandler = null;
+  };
+}
+
+function councilContext(): CouncilKeyContext {
+  const st = useCouncil.getState();
+  return { tab: useUi.getState().tab, viewing: st.viewing !== null, status: st.live.status, stopping: st.stopping };
 }
 
 /** Phím tắt cấp app — gọi 1 lần trong App. */
@@ -61,6 +96,21 @@ export function useAppHotkeys() {
       handler: () => {
         useUi.getState().setTab("history");
         useHistory.getState().focusSearch();
+      },
+    },
+    {
+      combo: "mod+enter",
+      handler: () => {
+        if (!canStartHotkey(councilContext()) || !startHandler) return false;
+        startHandler();
+      },
+    },
+    {
+      combo: "escape",
+      handler: (e) => {
+        const t = e.target instanceof Element ? e.target : null;
+        if (!canStopHotkey(councilContext(), !!t?.closest(POPUP))) return false;
+        useUi.getState().setStopConfirmOpen(true);
       },
     },
   ]);

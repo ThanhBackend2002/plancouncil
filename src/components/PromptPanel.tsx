@@ -25,6 +25,8 @@ import { useCouncil } from "../store/council";
 import { hasUsableKeys, providerOf, rolesInMeeting, useConfig, useResolver } from "../store/config";
 import { toastError } from "../store/toast";
 import { useUi } from "../store/ui";
+import { registerStartHandler } from "../lib/useHotkeys";
+import { Dialog } from "./Dialog";
 import { PixelPortrait } from "./PixelCharacter";
 import { RoleSelect } from "./settings/fields";
 import { Button, Panel, StatusBadge, cx } from "./ui";
@@ -38,6 +40,40 @@ function defaultOptions(config: AppConfig): SessionOptions {
     web_search: config.web_search.enabled_by_default,
     company_context: config.company_context.enabled_by_default,
   };
+}
+
+/** Xác nhận dừng họp khi bấm Esc (thay cho window.confirm). */
+function StopConfirmDialog() {
+  const open = useUi((u) => u.stopConfirmOpen);
+  const setOpen = useUi((u) => u.setStopConfirmOpen);
+  const running = useCouncil((c) => c.live.status === "running");
+  // Phiên đã kết thúc trong lúc hộp thoại đang mở → đóng.
+  useEffect(() => {
+    if (open && !running) setOpen(false);
+  }, [open, running, setOpen]);
+  return (
+    <Dialog
+      open={open && running}
+      onClose={() => setOpen(false)}
+      tone="warning"
+      title="Dừng cuộc họp đang chạy?"
+      description="Các vòng đang dở sẽ bị huỷ."
+      footer={
+        <>
+          <Button onClick={() => setOpen(false)}>Tiếp tục họp</Button>
+          <Button
+            variant="danger"
+            onClick={() => {
+              setOpen(false);
+              void useCouncil.getState().stop();
+            }}
+          >
+            Dừng họp
+          </Button>
+        </>
+      }
+    />
+  );
 }
 
 export function PromptPanel() {
@@ -65,28 +101,9 @@ export function PromptPanel() {
   /** Hàm bắt đầu mới nhất cho phím tắt toàn cục (gán lại mỗi lần render bên dưới). */
   const startRef = useRef<() => void>(() => {});
 
-  // Phím tắt ở tab Phòng họp (tạm đặt tại đây; sẽ chuyển sang lib/useHotkeys.ts):
-  // Ctrl/⌘+Enter = bắt đầu họp từ bất kỳ đâu · Esc = dừng phiên đang chạy (có xác nhận).
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.isComposing || useUi.getState().tab !== "council") return;
-      const st = useCouncil.getState();
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-        if (st.viewing || st.live.status === "running") return;
-        e.preventDefault();
-        startRef.current();
-      } else if (e.key === "Escape") {
-        if (st.viewing || st.live.status !== "running" || st.stopping) return;
-        // Esc trong hộp thoại / dropdown để chúng tự xử lý (đóng), không dừng họp.
-        const t = e.target instanceof Element ? e.target : null;
-        if (t?.closest('[role="dialog"],[role="listbox"],[role="combobox"],[aria-expanded="true"]')) return;
-        e.preventDefault();
-        if (window.confirm("Dừng cuộc họp đang chạy? Các vòng đang dở sẽ bị huỷ.")) void st.stop();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  // Phím tắt Ctrl/⌘+Enter (bắt đầu họp) và Esc (dừng họp) nằm ở lib/useHotkeys.ts;
+  // ở đây chỉ đăng ký hàm bắt đầu mới nhất cho phím tắt đó.
+  useEffect(() => registerStartHandler(() => startRef.current()), []);
 
   if (viewing) {
     return (
@@ -169,6 +186,7 @@ export function PromptPanel() {
 
   return (
     <Panel className="shrink-0 p-3">
+      <StopConfirmDialog />
       <label htmlFor="prompt" className="mb-1.5 block text-xs font-medium text-fg-muted">
         Yêu cầu
       </label>

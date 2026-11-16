@@ -1,6 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronRight, FileText, FolderTree, Globe, Link, LoaderCircle, Search, TriangleExclamationPoint, UserMinus, UserPlus, Wrench } from "lucide-react";
+import { X, ChevronDown, ChevronRight, FileText, FolderTree, Globe, Link, LoaderCircle, Search, TriangleExclamationPoint, UserMinus, UserPlus, Wrench } from "lucide-react";
 import { STATUS_META, type RoleResolver } from "../lib/agents";
+import { reviewMentions } from "../lib/sectionStatus";
 import type { MembershipChange, RoleId, ToolActivity } from "../lib/contracts";
 import { useActiveShallow } from "../store/council";
 import type { RoundView, ScopeState, SlotView } from "../store/session";
@@ -71,7 +72,15 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
     resumed: s.resumed,
   }));
   const running = scope.status === "running" && session.status === "running";
-  const msgs = useMemo(() => buildMessages(scope, running), [scope, running]);
+  const filter = useUi((s) => s.sectionFilter);
+  const setFilter = useUi((s) => s.setSectionFilter);
+  // Đổi phiên / nơi họp → bỏ lọc (số hiệu section chỉ có nghĩa trong 1 plan).
+  useEffect(() => setFilter(null), [scope.id, session.id, setFilter]);
+  const msgs = useMemo(() => {
+    const all = buildMessages(scope, running);
+    // Lọc phản hồi: chỉ giữ review nhắc tới section (## phủ ### và ngược lại); các dòng khác giữ nguyên.
+    return filter ? all.filter((m) => m.kind !== "review" || reviewMentions(m.slot.review, filter)) : all;
+  }, [scope, running, filter]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
 
@@ -88,6 +97,20 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
       <LiveAnnouncer scope={scope} resolve={resolve} sessionKey={session.id} />
       <div className="flex items-center gap-2 border-b border-line px-3 py-2 text-xs font-medium text-fg-muted">
         Hội thoại · {scope.name}
+        {filter && (
+          <span className="inline-flex items-center gap-1 rounded-full border border-warn-line bg-warn-subtle py-0.5 pl-2 pr-1 font-normal text-warn">
+            Đang lọc: mục {filter}
+            <button
+              type="button"
+              onClick={() => setFilter(null)}
+              aria-label={`Bỏ lọc mục ${filter}`}
+              title="Bỏ lọc"
+              className="rounded-full p-0.5 hover:bg-surface-2"
+            >
+              <X className="size-3" aria-hidden />
+            </button>
+          </span>
+        )}
         <span className="ml-auto font-normal text-fg-subtle">
           {scope.rounds.length} round · {scope.reviewerIds.length} reviewer
         </span>
@@ -108,7 +131,7 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
         )}
         {msgs.length === 0 && (
           <p className="px-2 py-6 text-center text-xs text-fg-subtle">
-            {running ? `${resolve(scope.authorId).name || "Người viết"} đang chuẩn bị bản nháp…` : "Chưa có hội thoại nào."}
+            {filter ? `Không có phản hồi nào nhắc tới mục ${filter}.` : running ? `${resolve(scope.authorId).name || "Người viết"} đang chuẩn bị bản nháp…` : "Chưa có hội thoại nào."}
           </p>
         )}
         {msgs.map((m) => {

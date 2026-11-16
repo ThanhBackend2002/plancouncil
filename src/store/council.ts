@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { useShallow } from "zustand/react/shallow";
-import { MAIN_SCOPE, type EventEnvelope, type SessionOptions, type SessionRecord } from "../lib/contracts";
+import { MAIN_SCOPE, type CommandError, type EventEnvelope, type SessionOptions, type SessionRecord } from "../lib/contracts";
 import { ipc } from "../lib/ipc";
 import { applyEvent, fromRecord, initialSession, isTerminal, planText, type PlanView, type SessionState } from "./session";
 import { toast, toastError } from "./toast";
@@ -20,6 +20,11 @@ interface CouncilStore {
   nextOptions: SessionOptions | null;
   starting: boolean;
   stopping: boolean;
+  /** Lỗi `secret_missing` của lần start gần nhất (banner "Thiếu API key"); null nếu không có. */
+  startError: CommandError | null;
+  clearStartError: () => void;
+  /** Chuyển sang xem 1 phiên MỚI vừa được backend tạo (chạy tiếp / bắt đầu lại): coi như phiên live đang chạy. */
+  adoptSession: (id: string, prompt?: string) => void;
   ingest: (env: EventEnvelope) => void;
   start: (prompt: string) => Promise<boolean>;
   stop: () => Promise<void>;
@@ -40,6 +45,16 @@ export const useCouncil = create<CouncilStore>((set, get) => ({
   nextOptions: null,
   starting: false,
   stopping: false,
+  startError: null,
+  clearStartError: () => set({ startError: null }),
+  adoptSession: (id, prompt = "") =>
+    set((st) => ({
+      // Event của phiên mới có thể đã tới trước khi lệnh trả về → không ghi đè state đã dựng.
+      live: st.live.id === id ? st.live : { ...initialSession(), id, prompt, status: "running" },
+      viewing: null,
+      scope: "auto",
+      startError: null,
+    })),
 
   ingest: (env) => {
     const prev = get().live;
@@ -54,13 +69,15 @@ export const useCouncil = create<CouncilStore>((set, get) => ({
 
   start: async (prompt) => {
     if (get().live.status === "running" || get().starting) return false;
-    set({ starting: true, live: initialSession(), viewing: null, scope: "auto" });
+    set({ starting: true, live: initialSession(), viewing: null, scope: "auto", startError: null });
     try {
       const id = await ipc.startCouncil(prompt, get().nextDepartments ?? undefined, get().nextOptions ?? undefined);
       const cur = get().live;
       if (cur.id === null) set({ live: { ...cur, id, status: "running", prompt } });
       return true;
     } catch (e) {
+      const err = e as Partial<CommandError> | null;
+      if (err && err.kind === "secret_missing") set({ startError: e as CommandError });
       toastError(e);
       return false;
     } finally {

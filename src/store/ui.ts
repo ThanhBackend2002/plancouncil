@@ -13,6 +13,12 @@ interface UiStore {
   /** Yêu cầu Cài đặt mở 1 tab cụ thể (vd. "providers" từ màn onboarding). `nonce` như planFocus. */
   settingsFocus: { tab: string; nonce: number } | null;
   openSettings: (tab?: string) => void;
+  /** Lọc phản hồi trong Timeline theo số hiệu section (vd "3.3"); null = không lọc. */
+  /** Hộp thoại xác nhận dừng họp (mở bằng Esc). */
+  stopConfirmOpen: boolean;
+  setStopConfirmOpen: (v: boolean) => void;
+  sectionFilter: string | null;
+  setSectionFilter: (n: string | null) => void;
 
   /** Theme người dùng chọn ("system" = theo hệ điều hành). Lưu localStorage. */
   theme: ThemePref;
@@ -72,6 +78,10 @@ export const useUi = create<UiStore>((set) => ({
   planFocus: null,
   focusPlan: (version) => set({ planFocus: { version, nonce: Date.now() } }),
   settingsFocus: null,
+  stopConfirmOpen: false,
+  setStopConfirmOpen: (stopConfirmOpen) => set({ stopConfirmOpen }),
+  sectionFilter: null,
+  setSectionFilter: (sectionFilter) => set({ sectionFilter }),
   openSettings: (tab) => set({ tab: "settings", settingsFocus: tab ? { tab, nonce: Date.now() } : null }),
 
   theme: initialTheme,

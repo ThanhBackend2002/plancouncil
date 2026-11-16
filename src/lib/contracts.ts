@@ -433,11 +433,33 @@ export interface AppConfig {
   web_search: WebSearchConfig;
   tool_policy: ToolPolicy;
   max_tool_steps: number;
+  /** Giá do người dùng tự nhập, theo tên model (USD / 1M token). Không có giá → chi phí hiển thị "—". */
+  pricing?: Record<string, ModelPrice>;
+}
+
+export interface ModelPrice {
+  input_per_m: number;
+  cached_per_m: number;
+  output_per_m: number;
 }
 
 export interface CommandError {
-  kind: "invalid" | "already_running" | "not_found" | "storage" | "llm" | "internal" | "index_unavailable" | "index";
+  kind:
+    | "invalid"
+    | "already_running"
+    | "not_found"
+    | "storage"
+    | "llm"
+    | "internal"
+    | "index_unavailable"
+    | "index"
+    | "no_valid_version"
+    | "missing_roles"
+    | "unsupported_scope"
+    | "secret_missing";
   message: string;
+  /** Chỉ có với `secret_missing`: key nào đang thiếu. */
+  target?: SecretTarget;
 }
 export interface ConnectionTestResult { agent: RoleId; model: string; latency_ms: number; reply: string }
 export interface ModelList { provider_id: string; models: string[]; fetched_at: string; cached: boolean }
@@ -525,3 +547,51 @@ export interface SecretCommandError {
 // set_secret({ target, api_key, storage }) → SetSecretResult (lỗi keyring_unavailable / keyring_locked)
 // delete_secret({ target }) / secret_status() → SecretStatusReport / delete_leftover_files({ files }) → string[]
 // start_council có thể trả lỗi { kind: "secret_missing", target }
+
+// ── Chạy tiếp / bắt đầu lại / chi phí (rerun_from_version, restart_from_request, get_usage) ──
+export interface RerunOverrides {
+  reviewers?: string[];
+  max_rounds?: number;
+  max_total_tokens?: number | null;
+}
+
+export interface RerunArgs {
+  session_id: string;
+  scope: string;
+  version_no: number;
+  dry_run?: boolean;
+  overrides?: RerunOverrides;
+}
+
+export interface RerunResult {
+  /** null khi dry_run. */
+  new_session_id: string | null;
+  /** Section có tag reviewer không còn trong cuộc họp → được coi như `reviewers: all`. */
+  uncovered_sections: string[];
+  missing_roles: string[];
+  available_versions: number[];
+}
+
+export interface UsageRow {
+  /** Id role (by_role) hoặc số round (by_round). */
+  key: string;
+  prompt: number;
+  cached: number;
+  completion: number;
+  cost_usd: number | null;
+}
+
+export interface UsageTotals {
+  prompt: number;
+  cached: number;
+  completion: number;
+  estimated: boolean;
+  cost_usd: number | null;
+}
+
+export interface UsageSummary {
+  by_role: UsageRow[];
+  by_round: UsageRow[];
+  totals: UsageTotals;
+  unpriced_models: string[];
+}

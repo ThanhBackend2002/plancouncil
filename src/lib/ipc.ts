@@ -9,12 +9,15 @@ import type {
   HistorySearchHit,
   ModelHealth,
   ModelList,
+  RerunArgs,
+  RerunResult,
   RoleDef,
   SearchHit,
   SessionOptions,
   SessionRecord,
   StaffingProposal,
   SessionSummary,
+  UsageSummary,
 } from "./contracts";
 import type { KeyStorage, SecretCommandError, SecretStatusReport, SecretTarget, SetSecretResult } from "./contracts";
 
@@ -27,13 +30,22 @@ const KINDS: ReadonlySet<CommandError["kind"]> = new Set([
   "internal",
   "index_unavailable",
   "index",
+  "no_valid_version",
+  "missing_roles",
+  "unsupported_scope",
+  "secret_missing",
 ]);
 
 export function toCommandError(e: unknown): CommandError {
   if (e && typeof e === "object" && "kind" in e && "message" in e) {
     const kind = String((e as { kind: unknown }).kind);
     const message = String((e as { message: unknown }).message);
-    return { kind: KINDS.has(kind as CommandError["kind"]) ? (kind as CommandError["kind"]) : "internal", message };
+    const target = (e as { target?: CommandError["target"] }).target;
+    return {
+      kind: KINDS.has(kind as CommandError["kind"]) ? (kind as CommandError["kind"]) : "internal",
+      message,
+      ...(target ? { target } : {}),
+    };
   }
   if (e instanceof Error) return { kind: "internal", message: e.message };
   return { kind: "internal", message: String(e) };
@@ -90,6 +102,19 @@ export const ipc = {
   listModels: (providerId: string, baseUrl?: string, apiKey?: string | null) =>
     call<ModelList>("list_models", { providerId, baseUrl, apiKey: apiKey ?? undefined }),
   defaultRoles: () => call<RoleDef[]>("default_roles"),
+  /**
+   * Chạy tiếp từ 1 version: tạo phiên MỚI (không resume tại chỗ). `dry_run` chỉ kiểm tra.
+   * Tên tham số Tauri dùng camelCase như các lệnh khác (đổi nếu backend dùng rename_all = "snake_case").
+   */
+  rerunFromVersion: (args: RerunArgs) => call<RerunResult>("rerun_from_version", {
+      sessionId: args.session_id,
+      scope: args.scope,
+      versionNo: args.version_no,
+      dryRun: args.dry_run,
+      overrides: args.overrides,
+    }),
+  restartFromRequest: (sessionId: string) => call<{ new_session_id: string }>("restart_from_request", { sessionId }),
+  getUsage: (sessionId: string) => call<UsageSummary>("get_usage", { sessionId }),
   exportMarkdown: (content: string, suggestedName: string) =>
     call<string | null>("export_markdown", { content, suggestedName }),
 };
