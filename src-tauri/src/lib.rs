@@ -15,6 +15,7 @@ mod roster;
 mod routing;
 #[allow(dead_code)]
 mod search_index;
+#[allow(dead_code)]
 mod sections;
 mod staffing;
 mod storage;
