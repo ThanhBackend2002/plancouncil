@@ -298,7 +298,7 @@ Minor nits belong in suggestions and are not a reason to REJECT.",
         PlanDepth::Enterprise => "ENTERPRISE — production-grade detail is expected",
     };
     let routed_note = if rc.routed {
-        "\nYou receive only the sections tagged for you plus shared sections; omitted sections are reviewed by other experts — do not comment on them."
+        "\nYou receive the sections tagged for you plus shared sections; sections referenced by your previous issues or by Changelog rows addressed to you are also included in full. Omitted sections are reviewed by other experts — do not comment on them, and an omitted section is never by itself a reason to REJECT."
     } else {
         ""
     };

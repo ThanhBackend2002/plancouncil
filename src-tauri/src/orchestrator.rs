@@ -1084,7 +1084,15 @@ impl Council {
             plan_version: plan.version,
         });
         // Review theo section: chỉ gửi phần được gắn tag cho reviewer này (+ phần dùng chung).
-        let routed_view = if opts.routing { routing::view_for(&plan.markdown, &reviewer.id) } else { None };
+        // Mục được issue vòng trước / dòng Changelog gửi reviewer nhắc tới → gửi đầy đủ để kiểm chứng;
+        // không xác định được mục nào → gửi nguyên plan.
+        let routed_view = if opts.routing {
+            let prev_issues = previous.map(|p| p.critical_issues.as_slice()).unwrap_or(&[]);
+            routing::referenced_sections(&plan.markdown, &reviewer.id, &reviewer.name, prev_issues)
+                .and_then(|keep| routing::view_for(&plan.markdown, &reviewer.id, &keep))
+        } else {
+            None
+        };
         if let Some(v) = &routed_view {
             rc.routed = true;
             self.record_saving(spec.scope, &reviewer.id, estimate_tokens(plan.markdown.len().saturating_sub(v.len())), false);
