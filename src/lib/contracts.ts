@@ -188,6 +188,27 @@ export interface SessionSummary {
   total_tokens: number;
 }
 
+/**
+ * 1 kết quả `search_history` (struct `SearchHit` của search_index.rs). Đặt tên khác để không trùng
+ * `SearchHit` của tìm kiếm web.
+ */
+export interface HistorySearchHit {
+  session_id: string;
+  session_title: string;
+  /** "main" hoặc id phòng ban. */
+  scope: string;
+  /** Version plan của section; 0 với kind = "request". */
+  version_no: number;
+  kind: "request" | "section";
+  section_key: string | null;
+  heading: string | null;
+  /** Văn bản gốc, chỗ khớp bọc `[[` … `]]`. */
+  snippet: string;
+  /** bm25: càng nhỏ càng liên quan. */
+  rank: number;
+  created_at: string;
+}
+
 export type CouncilEvent =
   | {
       type: "session_started";
@@ -380,7 +401,10 @@ export interface AppConfig {
   max_tool_steps: number;
 }
 
-export interface CommandError { kind: "invalid" | "already_running" | "not_found" | "storage" | "llm" | "internal"; message: string }
+export interface CommandError {
+  kind: "invalid" | "already_running" | "not_found" | "storage" | "llm" | "internal" | "index_unavailable" | "index";
+  message: string;
+}
 export interface ConnectionTestResult { agent: RoleId; model: string; latency_ms: number; reply: string }
 export interface ModelList { provider_id: string; models: string[]; fetched_at: string; cached: boolean }
 
@@ -417,5 +441,6 @@ export interface ModelHealth {
 // check_models({ roleIds? }) → ModelHealth[]
 // stop_council({ sessionId }) / active_session() / list_sessions({ limit? })
 // load_session({ sessionId }) / delete_session({ sessionId })
+// search_history({ query, limit?, offset? }) → HistorySearchHit[] (lỗi "index_unavailable" nếu không có index)
 // test_connection({ agent }) / export_markdown({ content, suggestedName }) → path | null
 // list_models({ providerId, baseUrl?, apiKey? }) → ModelList

@@ -4,15 +4,17 @@ import type { AppConfig, Provider } from "../../lib/contracts";
 import { ipc, isCommandError } from "../../lib/ipc";
 import { isLocalUrl, useConfig } from "../../store/config";
 import { toast, toastError } from "../../store/toast";
+import { useUi } from "../../store/ui";
 import { Button, Panel, cx } from "../ui";
 import { ContextToolsTab } from "./ContextToolsTab";
 import { DepartmentsTab } from "./DepartmentsTab";
 import { Field, INPUT, NumberInput, SectionTitle, Toggle, type Errors } from "./fields";
+import { InterfaceTab } from "./InterfaceTab";
 import { MeetingTab } from "./MeetingTab";
 import { ProvidersTab, apiRoot, type FetchState } from "./ProvidersTab";
 import { RolesTab } from "./RolesTab";
 
-type TabId = "providers" | "roles" | "departments" | "meeting" | "context" | "general";
+type TabId = "providers" | "roles" | "departments" | "meeting" | "context" | "general" | "interface";
 
 const TABS: { id: TabId; label: string; match: (k: string) => boolean }[] = [
   { id: "roles", label: "Vai trò", match: (k) => k.startsWith("role.") },
@@ -21,6 +23,8 @@ const TABS: { id: TabId; label: string; match: (k: string) => boolean }[] = [
   { id: "context", label: "Bối cảnh & Công cụ", match: (k) => k.startsWith("context.") },
   { id: "general", label: "Chung", match: (k) => k.startsWith("general.") && k !== "general.max_rounds" },
   { id: "providers", label: "Provider", match: (k) => k.startsWith("provider") },
+  // Tuỳ chọn hiển thị trên máy này (localStorage), không thuộc AppConfig → không có lỗi validate.
+  { id: "interface", label: "Giao diện", match: () => false },
 ];
 
 function isUrl(s: string): boolean {
@@ -113,6 +117,14 @@ export function SettingsView() {
     tabInit.current = true;
     if (config.providers.length === 0) setTab("providers");
   }, [config]);
+  // Nơi khác yêu cầu mở thẳng 1 tab (vd. onboarding ở Plan Viewer → Provider).
+  const settingsFocus = useUi((s) => s.settingsFocus);
+  useEffect(() => {
+    if (settingsFocus && TABS.some((t) => t.id === settingsFocus.tab)) {
+      tabInit.current = true;
+      setTab(settingsFocus.tab as TabId);
+    }
+  }, [settingsFocus]);
   const [serverErrors, setServerErrors] = useState<string[]>([]);
   const [fetches, setFetches] = useState<Record<string, FetchState>>({});
   const lastFetched = useRef(new Map<string, string>());
@@ -170,7 +182,7 @@ export function SettingsView() {
 
   if (!draft || !config) {
     return (
-      <div className="flex h-full items-center justify-center gap-3 text-sm text-neutral-500">
+      <div className="flex h-full items-center justify-center gap-3 text-sm text-fg-subtle">
         {loading ? <LoaderCircle className="size-4 animate-spin" /> : null}
         {loading ? "Đang tải cấu hình…" : "Chưa tải được cấu hình."}
         {!loading && (
@@ -195,11 +207,11 @@ export function SettingsView() {
 
   return (
     <div className="h-full overflow-y-auto">
-      <div className="sticky top-0 z-20 border-b border-neutral-900 bg-neutral-950/95 backdrop-blur">
+      <div className="sticky top-0 z-20 border-b border-line bg-canvas/95 backdrop-blur">
         <div className="mx-auto flex max-w-5xl items-center gap-3 px-6 pt-3">
           <h1 className="text-lg font-semibold">Cài đặt</h1>
-          {dirty && <span className="text-xs text-amber-300">Có thay đổi chưa lưu</span>}
-          {errorKeys.length > 0 && dirty && <span className="text-xs text-red-400">Còn {errorKeys.length} lỗi</span>}
+          {dirty && <span className="text-xs text-warn">Có thay đổi chưa lưu</span>}
+          {errorKeys.length > 0 && dirty && <span className="text-xs text-danger">Còn {errorKeys.length} lỗi</span>}
           <div className="ml-auto flex gap-2">
             <Button
               size="sm"
@@ -236,13 +248,13 @@ export function SettingsView() {
                 aria-current={tab === t.id ? "page" : undefined}
                 className={cx(
                   "-mb-px inline-flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm",
-                  tab === t.id ? "border-violet-500 text-neutral-50" : "border-transparent text-neutral-400 hover:text-neutral-200",
+                  tab === t.id ? "border-accent text-fg" : "border-transparent text-fg-muted hover:text-fg-soft",
                 )}
               >
                 {t.label}
-                {t.id === "roles" && <span className="text-[11px] text-neutral-500">{draft.roles.length}</span>}
-                {t.id === "departments" && <span className="text-[11px] text-neutral-500">{draft.departments.length}</span>}
-                {n > 0 && <span className="rounded-full bg-red-500/20 px-1.5 text-[10px] text-red-300">{n}</span>}
+                {t.id === "roles" && <span className="text-[11px] text-fg-subtle">{draft.roles.length}</span>}
+                {t.id === "departments" && <span className="text-[11px] text-fg-subtle">{draft.departments.length}</span>}
+                {n > 0 && <span className="rounded-full bg-danger-subtle px-1.5 text-[10px] text-danger">{n}</span>}
               </button>
             );
           })}
@@ -251,7 +263,7 @@ export function SettingsView() {
 
       <div className="mx-auto max-w-5xl space-y-4 p-6 pb-24">
         {serverErrors.length > 0 && (
-          <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-200" role="alert">
+          <div className="rounded-lg border border-danger-line bg-danger-subtle p-3 text-sm text-danger" role="alert">
             <div className="mb-1 font-medium">Backend từ chối cấu hình:</div>
             <ul className="list-disc space-y-0.5 pl-5 text-xs">
               {serverErrors.map((m, i) => (
@@ -277,6 +289,7 @@ export function SettingsView() {
         {tab === "meeting" && <MeetingTab draft={draft} errors={errors} update={update} />}
         {tab === "context" && <ContextToolsTab draft={draft} saved={config} errors={errors} dirty={dirty} update={update} />}
         {tab === "general" && <GeneralTab draft={draft} errors={errors} update={update} />}
+        {tab === "interface" && <InterfaceTab />}
       </div>
     </div>
   );

@@ -59,11 +59,11 @@ export function MeetingTab({
                 onClick={() => setMeeting({ chair_id: p.chair, reviewer_ids: reviewers })}
                 className={cx(
                   "rounded-lg border px-3 py-2 text-left transition-colors disabled:opacity-40",
-                  active ? "border-violet-500/60 bg-violet-500/10" : "border-neutral-800 hover:border-neutral-600",
+                  active ? "border-accent/60 bg-accent/10" : "border-line hover:border-line-heavy",
                 )}
               >
-                <div className="text-sm font-medium text-neutral-100">{p.name}</div>
-                <div className="text-[11px] text-neutral-500">{p.desc}</div>
+                <div className="text-sm font-medium text-fg">{p.name}</div>
+                <div className="text-[11px] text-fg-subtle">{p.desc}</div>
               </button>
             );
           })}
@@ -111,19 +111,19 @@ export function MeetingTab({
                     }
                     className={cx(
                       "rounded-full border px-2.5 py-1 text-xs",
-                      on ? "border-violet-500/60 bg-violet-500/15 text-violet-200" : "border-neutral-700 text-neutral-400 hover:text-neutral-200",
+                      on ? "border-accent/60 bg-accent-subtle text-accent-fg" : "border-line-strong text-fg-muted hover:text-fg-soft",
                     )}
                   >
                     {d.name}
                   </button>
                 );
               })}
-              {draft.departments.length === 0 && <span className="text-xs text-neutral-500">Chưa có phòng ban.</span>}
+              {draft.departments.length === 0 && <span className="text-xs text-fg-subtle">Chưa có phòng ban.</span>}
             </div>
           </Field>
         </div>
         {m.reviewer_ids.length > 6 && (
-          <p className="mt-3 text-[11px] text-amber-400">
+          <p className="mt-3 text-[11px] text-warn">
             Nhiều reviewer = nhiều request mỗi vòng. Cân nhắc giới hạn song song ở tab Chung để tránh lỗi 429.
           </p>
         )}
@@ -148,11 +148,11 @@ export function MeetingTab({
               onClick={() => setMeeting({ staffing: s.id })}
               className={cx(
                 "rounded-lg border px-3 py-2 text-left",
-                m.staffing === s.id ? "border-violet-500/60 bg-violet-500/10" : "border-neutral-800 hover:border-neutral-600",
+                m.staffing === s.id ? "border-accent/60 bg-accent/10" : "border-line hover:border-line-heavy",
               )}
             >
-              <div className="text-sm font-medium text-neutral-100">{s.label}</div>
-              <div className="mt-0.5 text-[11px] text-neutral-500">{s.desc}</div>
+              <div className="text-sm font-medium text-fg">{s.label}</div>
+              <div className="mt-0.5 text-[11px] text-fg-subtle">{s.desc}</div>
             </button>
           ))}
         </div>

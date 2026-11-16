@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { pairSections, sectionKey, splitSections } from "./sections";
+import vectors from "../../src-tauri/tests-data/sections_vectors.json";
+import { closesFence, fenceOpen, pairSections, sectionKey, splitSections } from "./sections";
 
 const md = (...lines: string[]) => lines.join("\n");
 
@@ -156,5 +157,55 @@ describe("pairSections", () => {
       ["__intro", "removed"],
       ["a", "unchanged"],
     ]);
+  });
+});
+
+describe("fence theo CommonMark", () => {
+  it("``` bên trong ~~~ không đóng fence", () => {
+    const s = splitSections(md("## A", "~~~", "```", "## X", "~~~", "## B"));
+    expect(s.map((x) => x.title)).toEqual(["A", "B"]);
+  });
+
+  it("fence đóng phải cùng ký tự, đủ dài, không có info, thụt ≤ 3", () => {
+    expect(closesFence("````", { ch: "`", len: 3 })).toBe(true);
+    expect(closesFence("``", { ch: "`", len: 3 })).toBe(false);
+    expect(closesFence("~~~", { ch: "`", len: 3 })).toBe(false);
+    expect(closesFence("```rust", { ch: "`", len: 3 })).toBe(false);
+    expect(closesFence("   ```  ", { ch: "`", len: 3 })).toBe(true);
+    expect(closesFence("    ```", { ch: "`", len: 3 })).toBe(false);
+  });
+
+  it("fence mở: thụt ≤ 3; info của fence ` không chứa `", () => {
+    expect(fenceOpen("   ~~~~ md")).toEqual({ ch: "~", len: 4 });
+    expect(fenceOpen("    ```")).toBeNull();
+    expect(fenceOpen("``` a`b")).toBeNull();
+    expect(fenceOpen("~~~ a`b")).toEqual({ ch: "~", len: 3 });
+  });
+});
+
+interface Vector {
+  name: string;
+  md: string;
+  expected: { level: number; number: string | null; heading: string }[];
+}
+
+// Vector dùng chung với Rust (`src-tauri/src/sections.rs`). Splitter TS chỉ tách ở `##` nên chỉ
+// so heading cấp 2 (`###` của Rust là section con, TS để nguyên trong body). Bỏ qua vector có
+// heading `##` rỗng: TS dùng title rỗng làm dấu hiệu phần mở đầu (`__intro`), nên `##` trống
+// không thành section riêng — khác biệt có chủ ý, không phải lỗi.
+describe("vector dùng chung với Rust", () => {
+  const all = vectors as Vector[];
+  const comparable = all.filter((v) => !v.expected.some((e) => e.level === 2 && e.heading === ""));
+
+  it("chỉ loại đúng vector có heading `##` rỗng", () => {
+    expect(all.filter((v) => !comparable.includes(v)).map((v) => v.name)).toEqual(["number_variants"]);
+  });
+
+  it.each(comparable.map((v) => [v.name, v] as const))("%s", (_, v) => {
+    const got = splitSections(v.md)
+      .filter((s) => s.key !== "__intro")
+      .map((s) => s.title);
+    const want = v.expected.filter((e) => e.level === 2).map((e) => e.heading);
+    expect(got).toEqual(want);
   });
 });

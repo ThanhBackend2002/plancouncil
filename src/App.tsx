@@ -6,12 +6,15 @@ import { SettingsView } from "./components/settings/SettingsView";
 import { Toasts } from "./components/Toasts";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useUi } from "./store/ui";
+import { useAppHotkeys } from "./lib/useHotkeys";
 
 export default function App() {
   const tab = useUi((s) => s.tab);
+  const motion = useUi((s) => s.reducedMotion);
+  useAppHotkeys(); // Ctrl/Cmd+K → Lịch sử + focus ô tìm
   return (
-    <MotionConfig reducedMotion="user">
-      <div className="flex h-full flex-col bg-neutral-950 text-neutral-100">
+    <MotionConfig reducedMotion={motion === "on" ? "always" : motion === "off" ? "never" : "user"}>
+      <div className="flex h-full flex-col bg-canvas text-fg">
         <Header />
         {/* Giữ cả 3 view mounted để không mất scroll/state khi đổi tab. */}
         <main className="relative min-h-0 flex-1">

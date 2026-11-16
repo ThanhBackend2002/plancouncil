@@ -1,9 +1,10 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Coins, Copy, Download, FileText, GitCompareArrows, LoaderCircle, Sparkles } from "lucide-react";
+import { Coins, Copy, Download, FileText, GitCompareArrows, KeyRound, LoaderCircle, Sparkles } from "lucide-react";
 import { formatTokens, type RoleResolver } from "../lib/agents";
 import { activeOf, useActive, useActiveShallow, useCouncil, usePlanText } from "../store/council";
 import { ipc } from "../lib/ipc";
 import { planText, type PlanView, type ScopeState, type SessionState } from "../store/session";
+import { providerOf, useConfig } from "../store/config";
 import { useUi } from "../store/ui";
 import { toast, toastError } from "../store/toast";
 import { DiffView, type DiffSource } from "./DiffView";
@@ -102,9 +103,9 @@ export const PlanViewer = memo(function PlanViewer({ scope, resolve }: { scope: 
 
   return (
     <Panel className="flex h-full flex-col overflow-hidden">
-      <div className="flex shrink-0 items-center gap-2 border-b border-neutral-800 px-3 py-2">
+      <div className="flex shrink-0 items-center gap-2 border-b border-line px-3 py-2">
         <div role="tablist" className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
-          {tabs.length === 0 && <span className="px-1 text-xs text-neutral-500">Plan Viewer</span>}
+          {tabs.length === 0 && <span className="px-1 text-xs text-fg-subtle">Plan Viewer</span>}
           {tabs.map((t) => {
             const active = resolved === t.key;
             return (
@@ -115,9 +116,9 @@ export const PlanViewer = memo(function PlanViewer({ scope, resolve }: { scope: 
                 aria-selected={active}
                 onClick={() => setSel(t.key)}
                 className={cx(
-                  "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors",
-                  active ? "bg-neutral-800 text-neutral-50" : "text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200",
-                  t.key === "final" && !active && "text-violet-300",
+                  "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-control px-2.5 text-xs font-medium transition-colors",
+                  active ? "bg-surface-2 text-fg" : "text-fg-muted hover:bg-surface hover:text-fg-soft",
+                  t.key === "final" && !active && "text-accent-fg",
                 )}
               >
                 {t.label}
@@ -128,7 +129,7 @@ export const PlanViewer = memo(function PlanViewer({ scope, resolve }: { scope: 
             <button
               type="button"
               onClick={() => setSel("auto")}
-              className="ml-1 shrink-0 text-[11px] text-sky-400 hover:text-sky-300"
+              className="ml-1 shrink-0 text-[11px] text-info hover:text-info"
               title="Tự chuyển sang version mới nhất"
             >
               Theo dõi trực tiếp
@@ -213,13 +214,13 @@ const PlanBody = memo(function PlanBody({
       {resolved === null ? (
         <EmptyState running={running} />
       ) : content === "" && streaming ? (
-        <div className="flex items-center gap-2 p-8 text-sm text-neutral-500">
+        <div className="flex items-center gap-2 p-8 text-sm text-fg-subtle">
           <LoaderCircle className="size-4 animate-spin" /> Architect đang viết {label}…
         </div>
       ) : (
         <article className="mx-auto max-w-[860px] px-8 py-6">
           {plan && !plan.complete && !running && (
-            <p className="mb-4 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            <p className="mb-4 rounded-control border border-warn-line bg-warn-subtle px-3 py-2 text-xs text-warn">
               Version này chưa viết xong (phiên đã dừng/lỗi giữa chừng).
             </p>
           )}
@@ -231,24 +232,52 @@ const PlanBody = memo(function PlanBody({
 });
 
 function EmptyState({ running }: { running: boolean }) {
+  const config = useConfig((s) => s.config);
+  const openSettings = useUi((s) => s.openSettings);
+  // Chưa có provider, hoặc chưa role nào có provider + model → hướng dẫn cấu hình trước.
+  const needsSetup =
+    !!config && (config.providers.length === 0 || !config.roles.some((r) => !!providerOf(config, r.id) && r.model.trim() !== ""));
   if (running) {
     return (
-      <div className="flex h-full items-center justify-center gap-2 text-sm text-neutral-500">
+      <div className="flex h-full items-center justify-center gap-2 text-sm text-fg-subtle">
         <LoaderCircle className="size-4 animate-spin" /> Đang chờ người viết plan…
+      </div>
+    );
+  }
+  if (needsSetup) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
+        <KeyRound className="size-10 text-accent-fg" aria-hidden />
+        <div>
+          <h2 className="text-base font-semibold text-fg">Bắt đầu: kết nối một provider</h2>
+          <p className="mt-1 max-w-md text-sm text-fg-muted">
+            {config.providers.length === 0
+              ? "Chưa có provider nào. Thêm provider (OpenAI, OpenRouter, Ollama…) và API key để các vai trò có model để họp."
+              : "Chưa có vai trò nào được gán provider và model. Chọn model cho các vai trò sẽ tham gia họp."}
+          </p>
+        </div>
+        <ol className="space-y-1 text-left text-xs text-fg-subtle">
+          <li>1. Cài đặt → Provider: nhập API key, model được kéo về tự động</li>
+          <li>2. Cài đặt → Vai trò: gán provider + model cho chủ trì và reviewer</li>
+          <li>3. Quay lại đây, nhập yêu cầu rồi bấm Start Council</li>
+        </ol>
+        <Button variant="primary" icon={<KeyRound className="size-4" />} onClick={() => openSettings(config.providers.length === 0 ? "providers" : "roles")}>
+          {config.providers.length === 0 ? "Mở Cài đặt → Provider" : "Mở Cài đặt → Vai trò"}
+        </Button>
       </div>
     );
   }
   return (
     <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
-      <FileText className="size-10 text-neutral-700" />
+      <FileText className="size-10 text-fg-faint" aria-hidden />
       <div>
-        <h2 className="text-base font-semibold text-neutral-200">Chưa có plan nào</h2>
-        <p className="mt-1 max-w-md text-sm text-neutral-500">
-          Nhập yêu cầu ở bên trái rồi bấm <b className="text-neutral-300">Start Council</b>. Các phòng ban được chọn họp
+        <h2 className="text-base font-semibold text-fg-soft">Chưa có plan nào</h2>
+        <p className="mt-1 max-w-md text-sm text-fg-subtle">
+          Nhập yêu cầu ở bên trái rồi bấm <b className="text-fg-soft">Start Council</b>. Các phòng ban được chọn họp
           trước, sau đó chủ trì viết plan tổng và các reviewer phản biện cho tới khi cùng APPROVE.
         </p>
       </div>
-      <ol className="space-y-1 text-left text-xs text-neutral-500">
+      <ol className="space-y-1 text-left text-xs text-fg-subtle">
         <li>1. Cài đặt → Provider: nhập API key, model được kéo về tự động</li>
         <li>2. Cài đặt → Vai trò / Phòng ban / Cuộc họp: chọn ai tham gia</li>
         <li>3. Chạy phiên, xem Diff giữa các version, Export .md</li>
