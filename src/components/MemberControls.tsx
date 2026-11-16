@@ -1,17 +1,19 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { UserPlus, X } from "lucide-react";
 import type { RoleResolver } from "../lib/agents";
 import { ipc } from "../lib/ipc";
+import { useActiveShallow } from "../store/council";
 import { providerOf, useConfig } from "../store/config";
-import type { ScopeState, SessionState } from "../store/session";
+import type { ScopeState } from "../store/session";
 import { toast, toastError } from "../store/toast";
 import { PixelPortrait } from "./PixelCharacter";
 import { RoleSelect } from "./settings/fields";
 import { Button, Panel } from "./ui";
 
 /** Mời thêm / mời ra trong lúc họp — áp dụng từ vòng review kế tiếp của nơi họp đang xem. */
-export function MemberControls({ session, scope, resolve }: { session: SessionState; scope: ScopeState; resolve: RoleResolver }) {
+export const MemberControls = memo(function MemberControls({ scope, resolve }: { scope: ScopeState; resolve: RoleResolver }) {
   const config = useConfig((s) => s.config);
+  const session = useActiveShallow((s) => ({ readOnly: s.readOnly, status: s.status, id: s.id }));
   const [pick, setPick] = useState("");
   const [busy, setBusy] = useState(false);
   if (!config || session.readOnly || session.status !== "running" || !session.id || scope.status !== "running") return null;
@@ -42,11 +44,11 @@ export function MemberControls({ session, scope, resolve }: { session: SessionSt
 
   return (
     <Panel className="flex shrink-0 flex-wrap items-center gap-1.5 px-2.5 py-2 text-xs">
-      <span className="mr-1 text-neutral-500">Thành viên {where}:</span>
+      <span className="mr-1 text-fg-subtle">Thành viên {where}:</span>
       {scope.reviewerIds.map((id) => {
         const m = resolve(id);
         return (
-          <span key={id} className="inline-flex items-center gap-1 rounded-full border border-neutral-700 py-0.5 pr-1 pl-0.5 text-neutral-200">
+          <span key={id} className="inline-flex items-center gap-1 rounded-full border border-line-strong py-0.5 pr-1 pl-0.5 text-fg-soft">
             <PixelPortrait meta={m} size={16} />
             {m.name}
             <button
@@ -54,7 +56,8 @@ export function MemberControls({ session, scope, resolve }: { session: SessionSt
               disabled={busy}
               onClick={() => void act("dismiss", id)}
               title="Mời ra khỏi cuộc họp (từ vòng sau)"
-              className="rounded-full p-0.5 text-neutral-500 hover:bg-neutral-800 hover:text-red-300"
+              aria-label={`Mời ${m.name} ra khỏi cuộc họp`}
+              className="rounded-full p-0.5 text-fg-subtle hover:bg-surface-2 hover:text-danger"
             >
               <X className="size-3" />
             </button>
@@ -71,4 +74,4 @@ export function MemberControls({ session, scope, resolve }: { session: SessionSt
       </span>
     </Panel>
   );
-}
+});

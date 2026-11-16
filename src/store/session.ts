@@ -3,6 +3,7 @@
 
 import {
   MAIN_SCOPE,
+  type BudgetSnapshot,
   type CastMember,
   type DepartmentBrief,
   type EventEnvelope,
@@ -16,8 +17,32 @@ import {
   type SessionStatus,
   type ToolActivity,
   type TokenUsage,
+  type TruncatedReason,
+  type FallbackReason,
+  type ConsistencyConflict,
+  type ConsistencyResult,
   type UsageReport,
 } from "../lib/contracts";
+
+const TRUNCATE_REASON: Record<TruncatedReason, string> = {
+  length: "chạm giới hạn token",
+  max_tokens_cap: "chạm trần max_tokens",
+  budget: "hết ngân sách để nối tiếp",
+  stream_error: "stream bị đứt",
+};
+
+const FALLBACK_REASON: Record<FallbackReason, string> = {
+  missing_ids: "thiếu section bắt buộc",
+  extra_ids: "trả thừa / sai id section",
+  duplicate_ids: "trùng id section",
+  base_mismatch: "sai phiên bản gốc",
+  bad_structure: "sai cấu trúc",
+  structural_change: "cần đổi cấu trúc plan",
+  ratio: "phần cần sửa quá lớn / không chỉ rõ section",
+  truncated: "output bị cắt",
+};
+
+const TRUNCATE_KIND: Record<string, string> = { plan: "Plan", review: "Review", consistency: "Kiểm tra nhất quán" };
 
 export type AgentStatus = "idle" | "thinking" | "done" | "error";
 export type Phase = "idle" | SessionStatus;
@@ -87,6 +112,15 @@ export interface ScopeState {
   activities: ToolActivity[];
   /** Thành viên vào / ra giữa chừng. */
   membership: MembershipChange[];
+  /** Dòng thông báo hệ thống trong hội thoại (vd. output bị cắt), gắn với phiên bản plan lúc xảy ra. */
+  notices?: ScopeNotice[];
+}
+
+export interface ScopeNotice {
+  key: string;
+  agentId: RoleId;
+  planVersion: number;
+  text: string;
 }
 
 export interface SessionState {
@@ -98,6 +132,14 @@ export interface SessionState {
   options: SessionInfo | null;
   /** Thành phần do AI chọn (chế độ Tự động). */
   staffing: StaffingInfo | null;
+  /** Ảnh chụp ngân sách token mới nhất (chỉ có khi phiên đặt giới hạn). */
+  budget?: BudgetSnapshot;
+  /** Lần cắt output gần nhất KHÔNG nối tiếp được (cho banner trạng thái). */
+  lastTruncated?: { scope: string; reason: TruncatedReason };
+  /** Kết quả kiểm tra nhất quán gần nhất (cho banner `unresolved`). */
+  consistency?: { scope: string; result: ConsistencyResult; conflicts: ConsistencyConflict[] };
+  /** Số lần revise-theo-section bị loại LIÊN TIẾP gần nhất (cho banner gợi ý revise_mode=full). */
+  fallbackStreak?: number;
   /** Thứ tự hiển thị: "main" trước, rồi các phòng ban. */
   scopeOrder: string[];
   scopes: Record<string, ScopeState>;
@@ -110,6 +152,14 @@ export interface SessionState {
   resumed: boolean;
   readOnly: boolean;
   createdAt: string | null;
+  /**
+   * Text plan đang stream, tách khỏi `scopes` để mỗi `plan_delta` chỉ thay map nhỏ này
+   * (không copy plans/scope/scopes) → component nào không hiển thị text stream sẽ không re-render.
+   * Key = `draftKey(scope, version)`. Bất biến: chỉ có key cho plan đã tồn tại và CHƯA complete;
+   * khi có key thì đây là markdown hiện hành của plan đó (thay cho `PlanView.markdown`).
+   * Đọc qua `planText()`, đừng đọc `PlanView.markdown` trực tiếp cho plan chưa complete.
+   */
+  drafts: Record<string, string>;
 }
 
 const idleAgent = (): AgentView => ({ status: "idle", round: 0, planVersion: 0, review: null, error: null });
@@ -193,6 +243,7 @@ export function initialSession(): SessionState {
     resumed: false,
     readOnly: false,
     createdAt: null,
+    drafts: {},
   };
 }
 
@@ -200,6 +251,23 @@ export const isTerminal = (p: Phase): boolean => p !== "idle" && p !== "running"
 
 export function mainOf(s: SessionState): ScopeState {
   return s.scopes[MAIN_SCOPE] ?? mainScope("", [], 0, s.status);
+}
+
+// ───────────────────────── text plan đang stream ─────────────────────────
+
+export const draftKey = (scope: string, version: number): string => `${scope}#${version}`;
+
+/** Markdown hiện hành của 1 plan: bản nháp đang stream (nếu có) hoặc text đã lưu trong PlanView. */
+export function planText(s: SessionState, scope: string, p: PlanView): string {
+  return p.complete ? p.markdown : (s.drafts[draftKey(scope, p.version)] ?? p.markdown);
+}
+
+/** Bỏ bản nháp của 1 plan (plan bị reset / đã xong). Không có key → trả nguyên state, không copy. */
+function dropDraft(s: SessionState, scope: string, version: number): SessionState {
+  const key = draftKey(scope, version);
+  if (!(key in s.drafts)) return s;
+  const { [key]: _gone, ...rest } = s.drafts;
+  return { ...s, drafts: rest };
 }
 
 // ───────────────────────── helpers bất biến ─────────────────────────
@@ -345,8 +413,8 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
       return next;
     }
 
-    case "agent_thinking":
-      return patchScope(s, env.scope, (sc0) => {
+    case "agent_thinking": {
+      const next = patchScope(s, env.scope, (sc0) => {
         let sc = sc0;
         if (!sc.authorId && env.plan_version > 0 && !sc.reviewerIds.includes(env.agent) && sc.rounds.length === 0) {
           sc = { ...sc, authorId: env.agent }; // scope tạm: call đầu tiên là của người viết
@@ -379,21 +447,41 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
           })),
         };
       });
+      // Nhánh người viết ở trên đã reset markdown của plan → bỏ luôn bản nháp cũ (nếu có).
+      // authorId sau patch đúng bằng authorId mà nhánh trên dùng để chọn nhánh.
+      return env.plan_version > 0 && env.agent === next.scopes[env.scope]?.authorId
+        ? dropDraft(next, env.scope, env.plan_version)
+        : next;
+    }
 
     case "plan_stream_reset":
-      return patchScope(s, env.scope, (sc) => ({
-        ...sc,
-        plans: upsertPlan(sc.plans, env.version, (p) => ({ ...p, markdown: "", complete: false })),
-      }));
+      return dropDraft(
+        patchScope(s, env.scope, (sc) => ({
+          ...sc,
+          plans: upsertPlan(sc.plans, env.version, (p) => ({ ...p, markdown: "", complete: false })),
+        })),
+        env.scope,
+        env.version,
+      );
 
-    case "plan_delta":
+    case "plan_delta": {
+      // Đường nhanh: plan đã có và đang viết dở → chỉ nối vào `drafts`, giữ nguyên tham chiếu
+      // `scopes` / `plans` (Timeline, phòng họp… không re-render). `planText()` cho ra đúng
+      // chuỗi như cách cũ `p.markdown + delta`.
+      const plan = s.scopes[env.scope]?.plans.find((p) => p.version === env.version);
+      if (plan && !plan.complete) {
+        const key = draftKey(env.scope, env.version);
+        return { ...s, drafts: { ...s.drafts, [key]: (s.drafts[key] ?? plan.markdown) + env.delta } };
+      }
+      // Plan chưa có (vd. khôi phục sau reload) hoặc đã complete → giữ nguyên logic cũ.
       return patchScope(s, env.scope, (sc) => ({
         ...sc,
         plans: upsertPlan(sc.plans, env.version, (p) => ({ ...p, markdown: p.markdown + env.delta })),
       }));
+    }
 
-    case "plan_ready":
-      return patchScope(s, env.scope, (sc) => ({
+    case "plan_ready": {
+      const next = patchScope(s, env.scope, (sc) => ({
         ...sc,
         plans: upsertPlan(sc.plans, env.version, () => ({ version: env.version, markdown: env.markdown, complete: true })),
         agents: sc.authorId ? setAgent(sc, sc.authorId, { status: "done", planVersion: env.version, error: null }) : sc.agents,
@@ -410,6 +498,9 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
             )
           : sc.speech,
       }));
+      // plan_ready thay toàn bộ text → bản nháp không còn dùng nữa.
+      return dropDraft(next, env.scope, env.version);
+    }
 
     case "review_ready":
       return patchScope(s, env.scope, (sc0) => {
@@ -441,6 +532,68 @@ function reduce(s: SessionState, env: EventEnvelope): SessionState {
           })),
         };
       });
+
+    case "truncated": {
+      const what = TRUNCATE_KIND[env.call_kind] ?? env.call_kind;
+      const why = TRUNCATE_REASON[env.reason] ?? env.reason;
+      const text = env.recovered
+        ? `${what} bị cắt (${why}) — đã viết tiếp và ghép lại.`
+        : `${what} bị cắt (${why}) — không dùng được.`;
+      const base = env.recovered ? s : { ...s, lastTruncated: { scope: env.scope, reason: env.reason } };
+      return patchScope(base, env.scope, (sc) => ({
+        ...sc,
+        notices: [
+          ...(sc.notices ?? []),
+          { key: `n${env.seq}`, agentId: env.agent, planVersion: sc.plans.at(-1)?.version ?? 0, text },
+        ],
+      }));
+    }
+
+    case "revise_fallback": {
+      const why = FALLBACK_REASON[env.reason] ?? env.reason;
+      s = { ...s, fallbackStreak: env.consecutive };
+      const text =
+        `Không sửa theo section được (${why}) — viết lại toàn bộ plan.` +
+        (env.consecutive >= 2 ? ` ${env.consecutive} lần liên tiếp → các vòng sau luôn viết lại toàn bộ.` : "");
+      return patchScope(s, env.scope, (sc) => ({
+        ...sc,
+        notices: [
+          ...(sc.notices ?? []),
+          { key: `n${env.seq}`, agentId: sc.authorId, planVersion: sc.plans.at(-1)?.version ?? 0, text },
+        ],
+      }));
+    }
+
+    case "consistency": {
+      s = { ...s, consistency: { scope: env.scope, result: env.result, conflicts: env.conflicts } };
+      const list = env.conflicts.map((c) => `[${c.sections.join(", ")}] ${c.text}`).join("; ");
+      const text =
+        env.result === "ok"
+          ? "Kiểm tra nhất quán: các section không mâu thuẫn."
+          : env.result === "conflicts"
+            ? `Kiểm tra nhất quán phát hiện mâu thuẫn: ${list}`
+            : "Kiểm tra nhất quán: không xác minh được (sai định dạng, bị cắt hoặc hết ngân sách).";
+      return patchScope(s, env.scope, (sc) => ({
+        ...sc,
+        notices: [
+          ...(sc.notices ?? []),
+          { key: `n${env.seq}`, agentId: sc.authorId, planVersion: sc.plans.at(-1)?.version ?? 0, text },
+        ],
+      }));
+    }
+
+    case "budget":
+      return {
+        ...s,
+        budget: {
+          used: env.used,
+          reserved: env.reserved,
+          limit: env.limit,
+          estimated: env.estimated,
+          soft: env.soft,
+          state: env.state,
+        },
+      };
 
     case "round_completed":
       return patchScope(s, env.scope, (sc) => ({

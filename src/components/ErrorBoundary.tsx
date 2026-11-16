@@ -22,17 +22,17 @@ export class ErrorBoundary extends Component<{ children: ReactNode; label: strin
     if (!error) return this.props.children;
     return (
       <div className="flex h-full items-center justify-center p-6">
-        <div className="max-w-lg rounded-xl border border-red-500/30 bg-red-500/5 p-5 text-sm">
-          <div className="mb-2 flex items-center gap-2 font-medium text-red-300">
+        <div className="max-w-lg rounded-panel border border-danger-line bg-danger-subtle/50 p-5 text-sm">
+          <div className="mb-2 flex items-center gap-2 font-medium text-danger">
             <TriangleExclamationPoint className="size-4" /> {this.props.label} gặp lỗi hiển thị
           </div>
-          <pre className="mb-4 max-h-40 overflow-auto rounded bg-neutral-950 p-2 text-xs whitespace-pre-wrap text-neutral-400">
+          <pre className="mb-4 max-h-40 overflow-auto rounded bg-canvas p-2 text-xs whitespace-pre-wrap text-fg-muted">
             {error.message}
           </pre>
           <button
             type="button"
             onClick={() => this.setState({ error: null })}
-            className="rounded-md border border-neutral-700 px-3 py-1.5 text-neutral-200 hover:bg-neutral-800"
+            className="rounded-control border border-line-strong px-3 py-1.5 text-fg-soft hover:bg-surface-2"
           >
             Thử lại
           </button>

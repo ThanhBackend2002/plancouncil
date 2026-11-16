@@ -9,8 +9,30 @@ export type SessionStatus =
   | "converged"
   | "max_rounds_reached"
   | "partially_approved"
+  /** Output người viết bị cắt, không nối tiếp được → giữ phiên bản hợp lệ gần nhất. */
+  | "truncated"
+  /** Hết ngân sách token (giới hạn mềm) → giữ phiên bản gần nhất. */
+  | "budget_exhausted"
+  /** Mọi reviewer APPROVE nhưng kiểm tra nhất quán còn mâu thuẫn / không xác minh được khi hết vòng. */
+  | "unresolved"
+  /** Dành cho wave sau. */
+  | "interrupted"
   | "cancelled"
   | "failed";
+
+export type TruncatedCallKind = "plan" | "review" | "consistency";
+export type TruncatedReason = "length" | "max_tokens_cap" | "budget" | "stream_error";
+export type BudgetState = "ok" | "warn" | "exhausted";
+
+/** Ảnh chụp ngân sách token mới nhất (event `budget`). */
+export interface BudgetSnapshot {
+  used: number;
+  reserved: number;
+  limit: number;
+  estimated: boolean;
+  soft: boolean;
+  state: BudgetState;
+}
 
 /** Scope của cuộc họp chính; phòng ban dùng id phòng ban. */
 export const MAIN_SCOPE = "main";
@@ -25,6 +47,8 @@ export interface Review {
   /** Ý tưởng vượt phạm vi yêu cầu — không phải lý do REJECT. */
   out_of_scope?: string[];
   invites?: InviteRequest[];
+  /** Số hiệu heading (vd "3.3", "2") mà critical_issues nhắc tới. */
+  sections?: string[];
   /** true = không gọi model, giữ nguyên APPROVE vì phần phụ trách không đổi. */
   carried_over?: boolean;
   policy_override?: string;
@@ -51,7 +75,31 @@ export interface StaffingInfo {
   note: string;
 }
 
-export interface PlanVersion { version: number; markdown: string; created_at: string }
+/** Cách phiên bản plan được tạo: bản nháp đầu, viết lại toàn bộ, hay chỉ sửa section liên quan. */
+export type ReviseKind = "initial" | "full" | "section";
+/** Lý do section revise không dùng được → viết lại toàn bộ. */
+export type FallbackReason =
+  | "missing_ids"
+  | "extra_ids"
+  | "duplicate_ids"
+  | "base_mismatch"
+  | "bad_structure"
+  | "structural_change"
+  | "ratio"
+  | "truncated";
+
+export interface PlanVersion {
+  version: number;
+  markdown: string;
+  created_at: string;
+  /** Bản ghi cũ không có field → "full". */
+  revise_mode?: ReviseKind;
+  fallback_reason?: FallbackReason | null;
+}
+
+/** 1 mâu thuẫn giữa các section (id "s2", "s5"…). */
+export interface ConsistencyConflict { sections: string[]; text: string }
+export type ConsistencyResult = "ok" | "conflicts" | "unverified";
 export interface ReviewSlot { agent: RoleId; review: Review | null; error: string | null }
 export interface RoundRecord { round: number; plan_version: number; slots: ReviewSlot[]; approvals: number; converged: boolean }
 
@@ -164,6 +212,27 @@ export interface SessionSummary {
   total_tokens: number;
 }
 
+/**
+ * 1 kết quả `search_history` (struct `SearchHit` của search_index.rs). Đặt tên khác để không trùng
+ * `SearchHit` của tìm kiếm web.
+ */
+export interface HistorySearchHit {
+  session_id: string;
+  session_title: string;
+  /** "main" hoặc id phòng ban. */
+  scope: string;
+  /** Version plan của section; 0 với kind = "request". */
+  version_no: number;
+  kind: "request" | "section";
+  section_key: string | null;
+  heading: string | null;
+  /** Văn bản gốc, chỗ khớp bọc `[[` … `]]`. */
+  snippet: string;
+  /** bm25: càng nhỏ càng liên quan. */
+  rank: number;
+  created_at: string;
+}
+
 export type CouncilEvent =
   | {
       type: "session_started";
@@ -196,6 +265,17 @@ export type CouncilEvent =
   | { type: "plan_ready"; scope: string; version: number; markdown: string }
   | { type: "review_ready"; scope: string; round: number; review: Review }
   | { type: "review_failed"; scope: string; round: number; agent: RoleId; error: string }
+  | {
+      type: "truncated";
+      scope: string;
+      agent: RoleId;
+      call_kind: TruncatedCallKind;
+      recovered: boolean;
+      reason: TruncatedReason;
+    }
+  | { type: "revise_fallback"; scope: string; round: number; reason: FallbackReason; consecutive: number }
+  | { type: "consistency"; scope: string; result: ConsistencyResult; conflicts: ConsistencyConflict[] }
+  | ({ type: "budget" } & BudgetSnapshot)
   | {
       type: "round_completed";
       scope: string;
@@ -264,6 +344,8 @@ export interface Department {
 
 export type PlanDepth = "mvp" | "standard" | "enterprise";
 export type StaffingMode = "manual" | "suggest" | "auto";
+/** full = luôn viết lại toàn bộ; auto = section revise + mọi luật fallback; section = chỉ fallback khi patch hỏng. */
+export type ReviseMode = "full" | "auto" | "section";
 
 export interface MeetingConfig {
   chair_id: RoleId;
@@ -278,6 +360,14 @@ export interface MeetingConfig {
   dynamic_membership: boolean;
   max_invites: number;
   section_routing: boolean;
+  /** Ngân sách token mềm cho cả phiên; null = không giới hạn (nếu đặt thì ≥ 1000). */
+  max_total_tokens?: number | null;
+  /** Cách chỉnh plan từ vòng 2 (mặc định "full"). */
+  revise_mode: ReviseMode;
+  /** 0.1–1.0; chỉ áp cho "auto". */
+  section_mode_max_ratio: number;
+  /** "author" hoặc id role reviewer. */
+  consistency_checker: string;
 }
 
 /** Thư mục dự án được cấp quyền ĐỌC. */
@@ -343,9 +433,34 @@ export interface AppConfig {
   web_search: WebSearchConfig;
   tool_policy: ToolPolicy;
   max_tool_steps: number;
+  /** Giá do người dùng tự nhập, theo tên model (USD / 1M token). Không có giá → chi phí hiển thị "—". */
+  pricing?: Record<string, ModelPrice>;
 }
 
-export interface CommandError { kind: "invalid" | "already_running" | "not_found" | "storage" | "llm" | "internal"; message: string }
+export interface ModelPrice {
+  input_per_m: number;
+  cached_per_m: number;
+  output_per_m: number;
+}
+
+export interface CommandError {
+  kind:
+    | "invalid"
+    | "already_running"
+    | "not_found"
+    | "storage"
+    | "llm"
+    | "internal"
+    | "index_unavailable"
+    | "index"
+    | "no_valid_version"
+    | "missing_roles"
+    | "unsupported_scope"
+    | "secret_missing";
+  message: string;
+  /** Chỉ có với `secret_missing`: key nào đang thiếu. */
+  target?: SecretTarget;
+}
 export interface ConnectionTestResult { agent: RoleId; model: string; latency_ms: number; reply: string }
 export interface ModelList { provider_id: string; models: string[]; fetched_at: string; cached: boolean }
 
@@ -382,5 +497,193 @@ export interface ModelHealth {
 // check_models({ roleIds? }) → ModelHealth[]
 // stop_council({ sessionId }) / active_session() / list_sessions({ limit? })
 // load_session({ sessionId }) / delete_session({ sessionId })
+// search_history({ query, limit?, offset? }) → HistorySearchHit[] (lỗi "index_unavailable" nếu không có index)
 // test_connection({ agent }) / export_markdown({ content, suggestedName }) → path | null
 // list_models({ providerId, baseUrl?, apiKey? }) → ModelList
+
+// ── API key: nơi lưu (keyring / file / RAM) — mirror src-tauri/src/secrets.rs ──
+export type KeyStorage = "keyring" | "file" | "memory";
+
+// Config trả về có thêm `key_storage` (backend tự quyết; chỉ đổi được qua set_secret).
+export interface Provider { key_storage?: KeyStorage }
+export interface WebSearchConfig { key_storage?: KeyStorage }
+
+export type SecretTargetKind = "provider" | "websearch";
+/** `websearch` dùng id = dịch vụ tìm web đang chọn (vd "tavily"). */
+export interface SecretTarget { kind: SecretTargetKind; id: string }
+
+export type SecretErrorCode = "keyring_unavailable" | "keyring_locked" | "storage" | "invalid";
+
+export interface SecretTargetStatus {
+  target: SecretTarget;
+  /** Nơi key đang thực sự nằm; key plaintext chưa migrate khỏi config.json = "file". */
+  storage: KeyStorage;
+  /** false = key vẫn nằm plaintext trong config.json. */
+  migrated: boolean;
+  has_key: boolean;
+  /** Key đáng lẽ phải có nhưng không có (RAM sau khi mở lại app, keyring khoá…). */
+  missing: boolean;
+  error?: string;
+  error_code?: SecretErrorCode;
+}
+
+export interface SecretStatusReport {
+  targets: SecretTargetStatus[];
+  /** File backup/hỏng còn chứa api_key plaintext. */
+  leftover_files: string[];
+  /** Đường dẫn secrets.json (dùng trong hộp thoại đồng ý lưu dạng file). */
+  secrets_file: string;
+}
+
+export interface SetSecretResult { storage: KeyStorage; masked: string }
+
+/** Lỗi command liên quan tới key (giữ nguyên `kind` từ backend). */
+export interface SecretCommandError {
+  kind: string;
+  message: string;
+  target?: SecretTarget;
+}
+
+// set_secret({ target, api_key, storage }) → SetSecretResult (lỗi keyring_unavailable / keyring_locked)
+// delete_secret({ target }) / secret_status() → SecretStatusReport / delete_leftover_files({ files }) → string[]
+// start_council có thể trả lỗi { kind: "secret_missing", target }
+
+// ── Crash safety / chạy lại / chi phí (bổ sung — interface trùng tên được TS gộp khai báo) ──
+
+/** Nguồn gốc phiên chạy lại. `version_no = 0` = chạy lại từ yêu cầu gốc (`restart_from_request`). */
+export interface ParentRef {
+  session_id: string;
+  /** "main" (phòng ban hiện báo `unsupported_scope`). */
+  scope: string;
+  version_no: number;
+}
+
+/** Token của 1 lần gọi LLM (`SessionRecord.calls`, tối đa 2000; bản ghi cũ: []). */
+export interface CallUsage {
+  call_id: number;
+  scope: string;
+  agent: RoleId;
+  /** 0 = trước vòng review đầu (chọn thành phần / giao việc / bản nháp). */
+  round: number;
+  kind: UsageKind | "consistency";
+  model: string;
+  prompt: number;
+  cached: number;
+  completion: number;
+  estimated: boolean;
+  finish: "stop" | "length" | "error" | "tool_calls";
+  latency_ms: number;
+}
+
+export interface SessionRecord {
+  /** null = phiên mới / bản ghi cũ. */
+  parent?: ParentRef | null;
+  calls?: CallUsage[];
+}
+
+export interface SessionSummary {
+  parent?: ParentRef | null;
+}
+
+export interface TokenUsage {
+  /** Phần prompt_tokens đọc từ cache của provider (bản ghi cũ: 0 / thiếu). */
+  cached_tokens?: number;
+}
+
+/** USD / 1 triệu token. */
+export interface ModelPrice {
+  input_per_m: number;
+  cached_per_m: number;
+  output_per_m: number;
+}
+/** Tên model (đúng chuỗi `model` của role) → giá. Mặc định rỗng; số hữu hạn ≥ 0. */
+export type Pricing = Record<string, ModelPrice>;
+
+export interface AppConfig {
+  pricing?: Pricing;
+}
+
+/**
+ * Field thêm vào event `usage_updated` (luôn có từ backend mới). Chi phí cộng dồn của phiên theo bảng
+ * giá lúc BẮT ĐẦU phiên; `cost_usd = null` khi có model chưa có giá (`unpriced_models`).
+ */
+export interface UsageUpdatedCost {
+  cached_tokens: number;
+  cost_usd: number | null;
+  unpriced_models: string[];
+}
+export type UsageUpdatedEvent = Extract<CouncilEvent, { type: "usage_updated" }> & UsageUpdatedCost;
+
+export interface RerunOverrides {
+  /** Tập con reviewer của phiên gốc. */
+  reviewers?: RoleId[];
+  /** 1..=10. */
+  max_rounds?: number;
+  /** Thiếu = giữ cấu hình hiện tại; null = không giới hạn; số ≥ 1000. */
+  max_total_tokens?: number | null;
+}
+
+export interface RerunResult {
+  /** null khi dry_run. */
+  new_session_id: string | null;
+  /** Section chỉ gắn tag cho reviewer không còn trong nhóm mới. */
+  uncovered_sections: string[];
+  /** Role của phiên gốc không còn / không có provider-model dùng được. */
+  missing_roles: RoleId[];
+  available_versions: number[];
+}
+
+export interface RestartResult { new_session_id: string }
+
+/** Lỗi của rerun_from_version / restart_from_request / get_usage (giữ nguyên `kind` + payload). */
+export interface RerunCommandError {
+  kind:
+    | "no_valid_version"
+    | "missing_roles"
+    | "unsupported_scope"
+    | "already_running"
+    | "not_found"
+    | "invalid"
+    | "secret_missing"
+    | (string & {});
+  message: string;
+  /** Chỉ với `no_valid_version`. */
+  available_versions?: number[];
+  /** Chỉ với `missing_roles`. */
+  missing_roles?: RoleId[];
+  target?: SecretTarget;
+}
+
+export interface UsageRow {
+  prompt: number;
+  cached: number;
+  completion: number;
+  calls: number;
+  estimated: boolean;
+  cost_usd: number | null;
+}
+export interface RoleUsageRow extends UsageRow { agent: RoleId }
+export interface RoundUsageRow extends UsageRow { scope: string; round: number }
+
+/** get_usage({ session_id }) — chi phí tính bằng bảng giá HIỆN TẠI. Bản ghi cũ: by_round = [], cost null. */
+export interface UsageBreakdown {
+  by_role: RoleUsageRow[];
+  by_round: RoundUsageRow[];
+  totals: { prompt: number; cached: number; completion: number; estimated: boolean; cost_usd: number | null };
+  unpriced_models: string[];
+}
+
+// rerun_from_version({ session_id, scope, version_no, dry_run?, overrides? }) → RerunResult
+// restart_from_request({ session_id }) → RestartResult
+// get_usage({ session_id }) → UsageBreakdown
+
+/** Tham số rerun_from_version phía FE (snake_case — command dùng rename_all = "snake_case"). */
+export interface RerunArgs {
+  session_id: string;
+  scope: string;
+  version_no: number;
+  dry_run?: boolean;
+  overrides?: RerunOverrides;
+}
+export type UsageSummary = UsageBreakdown;
+export type UsageTotals = UsageBreakdown["totals"];

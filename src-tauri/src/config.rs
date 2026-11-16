@@ -9,6 +9,8 @@
 //! - `Debug` được implement thủ công để KHÔNG BAO GIỜ in key ra log.
 //! - `redacted()` che key trước khi gửi lên webview; key thật chỉ sống ở Rust.
 //! - `merge_secrets()`: giá trị mask (`••••abcd`) = giữ key cũ, nhưng chỉ khi base_url không đổi.
+//! - Key thật KHÔNG BAO GIỜ được serialize (`ser_masked_only`): ra ngoài chỉ có giá trị mask hoặc
+//!   `null`. Key nằm trong keyring / `secrets.json` / RAM theo `key_storage` — xem `secrets.rs`.
 //!
 //! Config v1 (endpoint mặc định + override 4 agent) và v2 (4 role cố định) được migrate tự động.
 
@@ -27,6 +29,8 @@ pub const DEFAULT_PROVIDER_ID: &str = "default";
 const DEFAULT_MODEL: &str = "gpt-4.1-mini";
 const DEFAULT_TEMPERATURE: f32 = 0.4;
 pub const MAX_REVIEWERS: usize = 12;
+/// Ngân sách token tối thiểu khi người dùng đặt `meeting.max_total_tokens`.
+pub const MIN_TOTAL_TOKENS: u64 = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +42,32 @@ pub enum JsonMode {
     JsonObject,
 }
 
+// ───────────────────────────── Nơi lưu API key ─────────────────────────────
+
+/// Nơi lưu API key (key thật chỉ sống trong RAM của Rust, không nằm trong config.json).
+/// Config cũ không có trường này → mặc định `keyring`; key plaintext còn sót trong config.json
+/// được `secrets::Secrets::startup` migrate sang keyring (thất bại thì giữ nguyên chỗ cũ).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStorage {
+    /// Keychain (macOS) / Credential Manager (Windows) / Secret Service (Linux).
+    #[default]
+    Keyring,
+    /// `secrets.json` plaintext (0600) — chỉ khi người dùng đồng ý rõ ràng.
+    File,
+    /// Chỉ trong RAM — mất khi đóng app.
+    Memory,
+}
+
+/// Chỉ cho phép serialize giá trị đã mask; key thật → `null` (config.json, webview, log JSON).
+/// Key plaintext chưa migrate được do `secrets.rs` chèn lại vào config.json có chủ đích.
+fn ser_masked_only<S: serde::Serializer>(key: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    match key.as_deref() {
+        Some(k) if k.starts_with(MASK_PREFIX) => s.serialize_some(k),
+        _ => s.serialize_none(),
+    }
+}
+
 // ───────────────────────────── Provider ─────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -46,7 +76,9 @@ pub struct Provider {
     pub id: String,
     pub name: String,
     pub base_url: String,
+    #[serde(serialize_with = "ser_masked_only")]
     pub api_key: Option<String>,
+    pub key_storage: KeyStorage,
     /// Cache kết quả `GET /models` gần nhất để dropdown hiện ngay.
     pub models: Vec<String>,
     pub models_fetched_at: Option<DateTime<Utc>>,
@@ -59,6 +91,7 @@ impl Default for Provider {
             name: "OpenAI".into(),
             base_url: "https://api.openai.com/v1".into(),
             api_key: None,
+            key_storage: KeyStorage::default(),
             models: vec![],
             models_fetched_at: None,
         }
@@ -231,7 +264,33 @@ pub struct MeetingConfig {
     pub max_invites: u32,
     /// Người viết gắn tag reviewer cho từng section → reviewer chỉ đọc phần của mình.
     pub section_routing: bool,
+    /// Ngân sách token MỀM cho cả phiên (None = không giới hạn; nếu đặt thì ≥ 1000).
+    /// Hết chỗ giữ trước lần gọi kế tiếp → vòng họp dừng với `BudgetExhausted`.
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    /// Cách người viết chỉnh plan từ vòng 2: viết lại toàn bộ (mặc định) hay chỉ sửa section liên quan.
+    pub revise_mode: ReviseMode,
+    /// Section revise chỉ dùng khi token các section cần sửa ≤ tỉ lệ này × cả plan (0.1..=1.0; chỉ áp cho `auto`).
+    pub section_mode_max_ratio: f32,
+    /// Ai kiểm tra nhất quán sau section revise: "author" (người viết plan) hoặc id role reviewer.
+    pub consistency_checker: String,
 }
+
+/// Chế độ chỉnh sửa plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviseMode {
+    /// Luôn viết lại toàn bộ plan (hành vi cũ).
+    #[default]
+    Full,
+    /// Section revise + mọi luật fallback (tỉ lệ, patch hỏng, 2 lần fallback liên tiếp).
+    Auto,
+    /// Section revise; chỉ quay về viết lại toàn bộ khi patch không hợp lệ.
+    Section,
+}
+
+/// Giá trị `consistency_checker` mặc định: người viết plan.
+pub const CONSISTENCY_CHECKER_AUTHOR: &str = "author";
 
 impl Default for MeetingConfig {
     fn default() -> Self {
@@ -262,11 +321,25 @@ pub enum WebSearchProvider {
     Searxng,
 }
 
+impl WebSearchProvider {
+    /// Tên ổn định (khớp serde) — dùng làm account keyring `websearch:<provider>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Duckduckgo => "duckduckgo",
+            Self::Tavily => "tavily",
+            Self::Brave => "brave",
+            Self::Searxng => "searxng",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WebSearchConfig {
     pub provider: WebSearchProvider,
+    #[serde(serialize_with = "ser_masked_only")]
     pub api_key: Option<String>,
+    pub key_storage: KeyStorage,
     /// Chỉ dùng cho SearXNG.
     pub base_url: String,
     pub max_results: u32,
@@ -279,6 +352,7 @@ impl Default for WebSearchConfig {
         Self {
             provider: WebSearchProvider::Duckduckgo,
             api_key: None,
+            key_storage: KeyStorage::default(),
             base_url: String::new(),
             max_results: 5,
             enabled_by_default: false,
@@ -311,6 +385,30 @@ pub enum ToolPolicy {
     All,
     Off,
 }
+
+/// Giá của 1 model (USD / 1 triệu token). Người dùng tự nhập — không có bảng giá sẵn, không tải từ mạng.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelPrice {
+    pub input_per_m: f64,
+    /// Giá token prompt đọc từ cache.
+    pub cached_per_m: f64,
+    pub output_per_m: f64,
+}
+
+impl ModelPrice {
+    /// Chi phí 1 lần gọi. `prompt` đã gồm phần `cached` (theo quy ước OpenAI).
+    pub fn cost(&self, prompt: u64, cached: u64, completion: u64) -> f64 {
+        let cached = cached.min(prompt);
+        ((prompt - cached) as f64 * self.input_per_m
+            + cached as f64 * self.cached_per_m
+            + completion as f64 * self.output_per_m)
+            / 1_000_000.0
+    }
+}
+
+/// Bảng giá theo tên model (đúng chuỗi `model` của role).
+pub type Pricing = std::collections::BTreeMap<String, ModelPrice>;
 
 /// Tuỳ chọn riêng cho 1 phiên họp (chọn ở màn Phòng họp).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -355,6 +453,8 @@ pub struct AppConfig {
     pub tool_policy: ToolPolicy,
     /// Số lượt gọi công cụ tối đa mỗi lần nghiên cứu.
     pub max_tool_steps: u32,
+    /// Bảng giá model để ước tính chi phí (mặc định rỗng → chi phí `null`).
+    pub pricing: Pricing,
 }
 
 impl Default for AppConfig {
@@ -379,6 +479,7 @@ impl Default for AppConfig {
             web_search: WebSearchConfig::default(),
             tool_policy: ToolPolicy::Authors,
             max_tool_steps: 6,
+            pricing: Pricing::new(),
         }
     }
 }
@@ -459,6 +560,8 @@ impl AppConfig {
     pub fn merge_secrets(mut self, existing: &AppConfig) -> AppConfig {
         for p in &mut self.providers {
             let old = existing.provider(&p.id);
+            // Nơi lưu key chỉ đổi qua `set_secret` (cần người dùng đồng ý) → lấy theo bản đang lưu.
+            p.key_storage = old.map(|o| o.key_storage).unwrap_or_default();
             p.api_key = match p.api_key.take() {
                 Some(k) if k.starts_with(MASK_PREFIX) => match old {
                     Some(o) if api_root(&o.base_url) == api_root(&p.base_url) => o.api_key.clone(),
@@ -475,6 +578,8 @@ impl AppConfig {
         }
         // Key dịch vụ tìm kiếm: giữ key cũ chỉ khi vẫn cùng dịch vụ.
         let old = &existing.web_search;
+        self.web_search.key_storage =
+            if old.provider == self.web_search.provider { old.key_storage } else { KeyStorage::default() };
         self.web_search.api_key = match self.web_search.api_key.take() {
             Some(k) if k.starts_with(MASK_PREFIX) => {
                 (old.provider == self.web_search.provider).then(|| old.api_key.clone()).flatten()
@@ -523,6 +628,14 @@ impl AppConfig {
         }
         if !(1..=10).contains(&self.web_search.max_results) {
             errs.push("web_search.max_results phải trong khoảng 1..=10".to_owned());
+        }
+        for (model, p) in &self.pricing {
+            if model.trim().is_empty() {
+                errs.push("bảng giá: tên model không được để trống".to_owned());
+            }
+            if [p.input_per_m, p.cached_per_m, p.output_per_m].iter().any(|v| !v.is_finite() || *v < 0.0) {
+                errs.push(format!("bảng giá '{model}': giá phải là số hữu hạn ≥ 0"));
+            }
         }
         if self.company_context.text.chars().count() > 20_000 {
             errs.push("bối cảnh công ty tối đa 20.000 ký tự".to_owned());
@@ -642,6 +755,15 @@ impl AppConfig {
         }
         if m.max_invites > 6 {
             errs.push("số người được mời thêm tối đa 6".to_owned());
+        }
+        if m.max_total_tokens.is_some_and(|t| t < MIN_TOTAL_TOKENS) {
+            errs.push(format!("ngân sách token của phiên phải ≥ {MIN_TOTAL_TOKENS} hoặc để trống"));
+        }
+        if !(0.1..=1.0).contains(&m.section_mode_max_ratio) {
+            errs.push("tỉ lệ tối đa của section revise phải trong 0.1..=1.0".to_owned());
+        }
+        if m.consistency_checker != CONSISTENCY_CHECKER_AUTHOR && !role_ok(&m.consistency_checker) {
+            errs.push(format!("người kiểm tra nhất quán '{}' không tồn tại", m.consistency_checker));
         }
 
         if errs.is_empty() {
@@ -957,6 +1079,7 @@ impl LegacyV1 {
             name: host_name(&d.base_url),
             base_url: d.base_url.trim().to_owned(),
             api_key: non_empty(&d.api_key).map(str::to_owned),
+            key_storage: KeyStorage::default(),
             models: vec![],
             models_fetched_at: None,
         }];
@@ -979,6 +1102,7 @@ impl LegacyV1 {
                         name,
                         base_url: base,
                         api_key: key,
+                        key_storage: KeyStorage::default(),
                         models: vec![],
                         models_fetched_at: None,
                     });
@@ -1028,6 +1152,7 @@ impl fmt::Debug for Provider {
             .field("name", &self.name)
             .field("base_url", &self.base_url)
             .field("api_key", &fmt_key(&self.api_key))
+            .field("key_storage", &self.key_storage)
             .field("models", &self.models.len())
             .finish()
     }
@@ -1142,6 +1267,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn real_keys_are_never_serialized_and_storage_comes_from_saved_config() {
+        let mut stored = with_openrouter();
+        stored.providers[1].key_storage = KeyStorage::File;
+        stored.web_search.provider = WebSearchProvider::Tavily;
+        stored.web_search.api_key = Some("tvly-secret-123456".into());
+        stored.web_search.key_storage = KeyStorage::Memory;
+        let json = serde_json::to_string(&stored).unwrap();
+        assert!(!json.contains("sk-default") && !json.contains("sk-or-") && !json.contains("tvly-"), "{json}");
+        assert!(json.contains(r#""key_storage":"file""#));
+        // Bản mask vẫn đi ra webview được.
+        let view = serde_json::to_value(stored.redacted()).unwrap();
+        assert_eq!(view["providers"][0]["api_key"], "••••3456");
+        assert_eq!(view["web_search"]["key_storage"], "memory");
+
+        // Webview gửi key_storage khác → bỏ qua, chỉ `set_secret` mới đổi được nơi lưu.
+        let mut incoming = stored.redacted();
+        incoming.providers[0].key_storage = KeyStorage::File;
+        incoming.providers[1].key_storage = KeyStorage::Keyring;
+        incoming.web_search.key_storage = KeyStorage::File;
+        let merged = incoming.merge_secrets(&stored);
+        assert_eq!(merged.providers[0].key_storage, KeyStorage::Keyring);
+        assert_eq!(merged.providers[1].key_storage, KeyStorage::File);
+        assert_eq!(merged.web_search.key_storage, KeyStorage::Memory);
+        assert_eq!(merged.web_search.api_key.as_deref(), Some("tvly-secret-123456"));
+
+        // Config cũ (không có key_storage) → mặc định keyring, key plaintext vẫn đọc được để migrate.
+        let (c, _) = AppConfig::from_json(
+            br#"{"schema_version":3,"providers":[{"id":"a","name":"A","base_url":"https://x/v1","api_key":"sk-legacy-1234"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(c.providers[0].key_storage, KeyStorage::Keyring);
+        assert_eq!(c.providers[0].api_key.as_deref(), Some("sk-legacy-1234"));
+    }
+
+    #[test]
     fn masked_key_is_dropped_when_base_url_changes() {
         let stored = with_openrouter();
         let mut incoming = stored.redacted();
@@ -1175,6 +1335,42 @@ pub(crate) mod tests {
         ] {
             assert!(e.contains(needle), "thiếu lỗi '{needle}' trong: {e}");
         }
+    }
+
+    #[test]
+    fn max_total_tokens_defaults_to_none_and_must_be_at_least_1000() {
+        let c = with_default_provider("sk-x", "m");
+        assert_eq!(c.meeting.max_total_tokens, None);
+        let m: MeetingConfig = serde_json::from_str(r#"{"chair_id":"cto"}"#).unwrap();
+        assert_eq!(m.max_total_tokens, None, "config cũ không có field → None");
+        let mut c2 = c.clone();
+        c2.meeting.max_total_tokens = Some(999);
+        assert!(c2.validate().unwrap_err().contains("ngân sách token"));
+        c2.meeting.max_total_tokens = Some(1000);
+        c2.validate().unwrap();
+    }
+
+    #[test]
+    fn pricing_defaults_empty_and_is_validated() {
+        let c = with_default_provider("sk-x", "m");
+        assert!(c.pricing.is_empty());
+        // Config cũ không có field `pricing` → rỗng.
+        let old: AppConfig = serde_json::from_str(r#"{"schema_version":3,"max_rounds":3}"#).unwrap();
+        assert!(old.pricing.is_empty());
+        let mut c2 = c.clone();
+        c2.pricing.insert("m".into(), ModelPrice { input_per_m: 2.0, cached_per_m: 0.5, output_per_m: 8.0 });
+        c2.validate().unwrap();
+        // 1M prompt (trong đó 400k cache) + 100k output.
+        let cost = c2.pricing["m"].cost(1_000_000, 400_000, 100_000);
+        assert!((cost - (1.2 + 0.2 + 0.8)).abs() < 1e-9, "{cost}");
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let mut c3 = c.clone();
+            c3.pricing.insert("m".into(), ModelPrice { input_per_m: 1.0, cached_per_m: bad, output_per_m: 1.0 });
+            assert!(c3.validate().unwrap_err().contains("bảng giá"), "{bad}");
+        }
+        let mut c4 = c.clone();
+        c4.pricing.insert(" ".into(), ModelPrice::default());
+        assert!(c4.validate().is_err());
     }
 
     #[test]

@@ -8,7 +8,13 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
-    "tauri": "tauri"
+    "test": "vitest run",
+    "verify": "cargo test --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && vitest run && tsc -b --noEmit",
+    "tauri": "tauri",
+    "build:mac": "tauri build --bundles app,dmg",
+    "build:mac:universal": "tauri build --target universal-apple-darwin --bundles app,dmg",
+    "build:win": "tauri build --bundles nsis,msi",
+    "build:linux": "tauri build --bundles deb,rpm,appimage"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
@@ -31,6 +37,7 @@
     "@vitejs/plugin-react": "^6.3.0",
     "tailwindcss": "^4.3.5",
     "typescript": "~5.9.3",
-    "vite": "^8.3.8"
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
   }
 }

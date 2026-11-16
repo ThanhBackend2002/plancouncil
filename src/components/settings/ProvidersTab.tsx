@@ -1,10 +1,23 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { ChevronDown, CircleCheck, CircleX, LoaderCircle, Plus, RotateCcw, Server, Trash } from "lucide-react";
 import { formatDate } from "../../lib/agents";
 import { MASK_PREFIX, type AppConfig, type Provider } from "../../lib/contracts";
 import { isLocalUrl } from "../../store/config";
 import { Button, Panel } from "../ui";
-import { Field, INPUT, KeyInput, ModelPicker, SectionTitle, TextInput, newId, type Errors } from "./fields";
+import {
+  Field,
+  INPUT,
+  KeyInput,
+  LeftoverFilesWarning,
+  ModelPicker,
+  SecretControls,
+  SectionTitle,
+  TextInput,
+  findStatus,
+  newId,
+  useSecretStatus,
+  type Errors,
+} from "./fields";
 
 export const PRESETS: { name: string; base_url: string }[] = [
   { name: "OpenAI", base_url: "https://api.openai.com/v1" },
@@ -42,6 +55,8 @@ export function ProvidersTab({
   onFetch: (p: Provider) => void;
   onCommit: (id: string) => void;
 }) {
+  // Trạng thái nơi lưu key — tải lại sau mỗi lần lưu cấu hình.
+  const secrets = useSecretStatus(saved);
   const setProvider = (id: string, patch: Partial<Provider>) =>
     update((c) => ({ ...c, providers: c.providers.map((p) => (p.id === id ? { ...p, ...patch } : p)) }));
 
@@ -84,8 +99,9 @@ export function ProvidersTab({
       >
         <AddProviderMenu onPick={add} />
       </SectionTitle>
+      <LeftoverFilesWarning files={secrets.report?.leftover_files ?? []} refresh={secrets.refresh} />
       {draft.providers.length === 0 && (
-        <p className="mb-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+        <p className="mb-3 rounded-md border border-warn-line bg-warn-subtle px-3 py-2 text-xs text-warn">
           Chưa có provider nào. Bấm <b>Thêm provider</b>, nhập base URL + API key; mọi role sẽ được gán vào provider đầu tiên.
         </p>
       )}
@@ -103,6 +119,20 @@ export function ProvidersTab({
             onFetch={() => onFetch(p)}
             others={draft.providers.filter((x) => x.id !== p.id)}
             onRemove={(target, model) => remove(p.id, target, model)}
+            secret={
+              <SecretControls
+                target={{ kind: "provider", id: p.id }}
+                status={findStatus(secrets.report, { kind: "provider", id: p.id })}
+                secretsFile={secrets.report?.secrets_file}
+                value={p.api_key}
+                canStore={(() => {
+                  const s = saved.providers.find((x) => x.id === p.id);
+                  return !!s && apiRoot(s.base_url) === apiRoot(p.base_url);
+                })()}
+                update={update}
+                refresh={secrets.refresh}
+              />
+            }
           />
         ))}
       </div>
@@ -118,7 +148,7 @@ function AddProviderMenu({ onPick }: { onPick: (p: (typeof PRESETS)[number]) => 
         Thêm provider <ChevronDown className="size-3.5" />
       </Button>
       {open && (
-        <div className="absolute right-0 z-20 mt-1 w-64 overflow-hidden rounded-lg border border-neutral-700 bg-neutral-900 py-1 shadow-xl shadow-black/50">
+        <div className="absolute right-0 z-20 mt-1 w-64 overflow-hidden rounded-lg border border-line-strong bg-surface py-1 shadow-xl shadow-black/50">
           {PRESETS.map((p) => (
             <button
               key={p.name}
@@ -127,10 +157,10 @@ function AddProviderMenu({ onPick }: { onPick: (p: (typeof PRESETS)[number]) => 
                 onPick(p);
                 setOpen(false);
               }}
-              className="flex w-full flex-col items-start px-3 py-1.5 text-left hover:bg-neutral-800"
+              className="flex w-full flex-col items-start px-3 py-1.5 text-left hover:bg-surface-2"
             >
-              <span className="text-sm text-neutral-100">{p.name}</span>
-              {p.base_url && <span className="font-mono text-[11px] text-neutral-500">{p.base_url}</span>}
+              <span className="text-sm text-fg">{p.name}</span>
+              {p.base_url && <span className="font-mono text-[11px] text-fg-subtle">{p.base_url}</span>}
             </button>
           ))}
         </div>
@@ -150,6 +180,7 @@ function ProviderCard({
   onFetch,
   others,
   onRemove,
+  secret,
 }: {
   provider: Provider;
   saved: Provider | undefined;
@@ -161,6 +192,8 @@ function ProviderCard({
   onFetch: () => void;
   others: Provider[];
   onRemove: (target: string | null, model: string) => void;
+  /** Nơi lưu key + thao tác keyring (badge, thử lại, hộp thoại đồng ý). */
+  secret?: ReactNode;
 }) {
   const [removing, setRemoving] = useState(false);
   const [target, setTarget] = useState<string>(others[0]?.id ?? "");
@@ -176,14 +209,14 @@ function ProviderCard({
   }
 
   return (
-    <div className="rounded-lg border border-neutral-800 bg-neutral-950/40 p-3">
+    <div className="rounded-lg border border-line bg-canvas/40 p-3">
       <div className="mb-3 flex items-center gap-2">
-        <span className="grid size-7 place-items-center rounded-md bg-neutral-800">
-          <Server className="size-4 text-neutral-300" />
+        <span className="grid size-7 place-items-center rounded-md bg-surface-2">
+          <Server className="size-4 text-fg-soft" />
         </span>
-        <span className="text-sm font-medium text-neutral-100">{p.name || "Provider mới"}</span>
-        {!saved && <span className="text-[11px] text-amber-300">chưa lưu</span>}
-        <span className="text-[11px] text-neutral-500">{usedBy} role đang dùng</span>
+        <span className="text-sm font-medium text-fg">{p.name || "Provider mới"}</span>
+        {!saved && <span className="text-[11px] text-warn">chưa lưu</span>}
+        <span className="text-[11px] text-fg-subtle">{usedBy} role đang dùng</span>
         <Button
           size="sm"
           variant="ghost"
@@ -195,10 +228,10 @@ function ProviderCard({
         />
       </div>
       {removing && (
-        <div className="mb-3 rounded-md border border-red-500/30 bg-red-500/5 p-3 text-xs">
+        <div className="mb-3 rounded-md border border-danger-line bg-danger-subtle p-3 text-xs">
           {usedBy === 0 ? (
             <div className="flex items-center gap-2">
-              <span className="text-neutral-300">Xoá provider "{p.name || "chưa đặt tên"}"?</span>
+              <span className="text-fg-soft">Xoá provider "{p.name || "chưa đặt tên"}"?</span>
               <Button size="sm" variant="danger" onClick={() => onRemove(null, "")}>
                 Xoá
               </Button>
@@ -208,7 +241,7 @@ function ProviderCard({
             </div>
           ) : (
             <div className="space-y-2">
-              <div className="text-neutral-300">
+              <div className="text-fg-soft">
                 Có <b>{usedBy} role</b> đang dùng provider này. Chuyển các role đó sang:
               </div>
               <div className="grid grid-cols-[1fr_1.6fr] gap-2">
@@ -223,10 +256,10 @@ function ProviderCard({
                 {target ? (
                   <div>
                     <ModelPicker value={newModel} models={targetProvider?.models ?? []} onChange={setNewModel} />
-                    <span className="mt-1 block text-[11px] text-neutral-500">Để trống = giữ tên model hiện tại của từng role.</span>
+                    <span className="mt-1 block text-[11px] text-fg-subtle">Để trống = giữ tên model hiện tại của từng role.</span>
                   </div>
                 ) : (
-                  <span className="self-center text-neutral-500">Các role sẽ chưa có provider/model cho tới khi bạn chọn lại.</span>
+                  <span className="self-center text-fg-subtle">Các role sẽ chưa có provider/model cho tới khi bạn chọn lại.</span>
                 )}
               </div>
               <div className="flex gap-2">
@@ -263,29 +296,30 @@ function ProviderCard({
             placeholder={isLocalUrl(p.base_url) ? "Thường không cần với server local" : "sk-…"}
           />
           {baseChanged && maskedKey && (
-            <span className="mt-1 block text-[11px] text-amber-400">
+            <span className="mt-1 block text-[11px] text-warn">
               Đã đổi base URL: key cũ sẽ không được gửi tới host mới. Hãy nhập lại key.
             </span>
           )}
+          {secret}
         </Field>
       </div>
-      <div className="mt-3 flex items-center gap-3 rounded-md bg-neutral-900/60 px-3 py-2 text-xs">
+      <div className="mt-3 flex items-center gap-3 rounded-md bg-surface/60 px-3 py-2 text-xs">
         {fetch?.loading ? (
-          <span className="inline-flex items-center gap-1.5 text-sky-300">
+          <span className="inline-flex items-center gap-1.5 text-info">
             <LoaderCircle className="size-3.5 animate-spin" /> Đang lấy danh sách model…
           </span>
         ) : fetch?.error ? (
-          <span className="inline-flex min-w-0 items-start gap-1.5 text-red-300">
+          <span className="inline-flex min-w-0 items-start gap-1.5 text-danger">
             <CircleX className="mt-px size-3.5 shrink-0" />
             <span className="break-words">Không lấy được model: {fetch.error}</span>
           </span>
         ) : p.models.length > 0 ? (
-          <span className="inline-flex items-center gap-1.5 text-emerald-300">
+          <span className="inline-flex items-center gap-1.5 text-success">
             <CircleCheck className="size-3.5" /> {p.models.length} model
-            {p.models_fetched_at && <span className="text-neutral-500">· cập nhật {formatDate(p.models_fetched_at)}</span>}
+            {p.models_fetched_at && <span className="text-fg-subtle">· cập nhật {formatDate(p.models_fetched_at)}</span>}
           </span>
         ) : (
-          <span className="text-neutral-500">Chưa có danh sách model. Nhập key rồi bấm "Lấy model".</span>
+          <span className="text-fg-subtle">Chưa có danh sách model. Nhập key rồi bấm "Lấy model".</span>
         )}
         <Button
           size="sm"

@@ -104,7 +104,7 @@ export function RolesTab({
   return (
     <div className="space-y-4">
       {unassigned > 0 && (
-        <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+        <p className="rounded-control border border-warn-line bg-warn-subtle px-3 py-2 text-xs text-warn">
           {unassigned} role chưa chọn provider/model. Dùng <b>Gán model hàng loạt</b> bên dưới để gán nhanh. Role chưa gán vẫn lưu được,
           nhưng không thể tham gia họp.
         </p>
@@ -116,7 +116,7 @@ export function RolesTab({
           desc="Thêm/bớt tự do. Mỗi role có persona (chỉ dẫn chuyên môn) và model riêng. Role được dùng ở phòng ban hoặc cuộc họp."
         >
           <div className="relative w-56">
-            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-neutral-500" />
+            <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-fg-subtle" />
             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Tìm role…" className={cx(INPUT, "h-8 pl-8")} />
           </div>
           <CheckAllButton draft={draft} dirty={dirty} />
@@ -139,7 +139,7 @@ export function RolesTab({
             if (list.length === 0) return null;
             return (
               <div key={lv.id}>
-                <div className="mb-1.5 text-[11px] font-semibold tracking-wide text-neutral-500 uppercase">
+                <div className="mb-1.5 text-[11px] font-semibold tracking-wide text-fg-subtle uppercase">
                   {lv.label} · {list.length}
                 </div>
                 <div className="space-y-1.5">
@@ -161,7 +161,7 @@ export function RolesTab({
               </div>
             );
           })}
-          {visible.length === 0 && <p className="py-6 text-center text-sm text-neutral-500">Không có role nào khớp.</p>}
+          {visible.length === 0 && <p className="py-6 text-center text-sm text-fg-subtle">Không có role nào khớp.</p>}
         </div>
       </Panel>
     </div>
@@ -267,35 +267,35 @@ function RoleRow({
   };
 
   return (
-    <div className={cx("rounded-lg border bg-neutral-950/40", hasError ? "border-red-500/40" : "border-neutral-800")}>
-      <button type="button" onClick={onToggle} aria-expanded={open} className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-neutral-900/50">
-        {open ? <ChevronDown className="size-4 text-neutral-500" /> : <ChevronRight className="size-4 text-neutral-500" />}
+    <div className={cx("rounded-lg border bg-canvas/40", hasError ? "border-danger-solid/40" : "border-line")}>
+      <button type="button" onClick={onToggle} aria-expanded={open} className="flex w-full items-center gap-2.5 px-3 py-2 text-left hover:bg-surface-2/50">
+        {open ? <ChevronDown className="size-4 text-fg-subtle" /> : <ChevronRight className="size-4 text-fg-subtle" />}
         <PixelPortrait meta={meta} size={28} />
         <span className="min-w-0 flex-1">
           <span className="flex items-baseline gap-2">
             <span className="text-sm font-medium" style={{ color: r.color }}>
               {r.name || "(chưa đặt tên)"}
             </span>
-            {r.title && r.title !== r.name && <span className="truncate text-[11px] text-neutral-500">{r.title}</span>}
+            {r.title && r.title !== r.name && <span className="truncate text-[11px] text-fg-subtle">{r.title}</span>}
           </span>
-          <span className="block truncate text-[11px] text-neutral-500">{r.description}</span>
+          <span className="block truncate text-[11px] text-fg-subtle">{r.description}</span>
         </span>
-        <span className="hidden max-w-[220px] shrink-0 truncate font-mono text-[11px] text-neutral-400 lg:block" title={`${provider?.name ?? "?"} · ${r.model}`}>
-          {!provider ? <span className="text-amber-400">chưa chọn provider</span> : r.model || <span className="text-amber-400">chưa chọn model</span>}
+        <span className="hidden max-w-[220px] shrink-0 truncate font-mono text-[11px] text-fg-muted lg:block" title={`${provider?.name ?? "?"} · ${r.model}`}>
+          {!provider ? <span className="text-warn">chưa chọn provider</span> : r.model || <span className="text-warn">chưa chọn model</span>}
         </span>
         <HealthBadge health={fresh} checking={checking} />
         <span className="flex max-w-[240px] shrink-0 flex-wrap justify-end gap-1">
           {usage.slice(0, 2).map((u) => (
-            <span key={u} className="rounded-full bg-violet-500/15 px-1.5 py-px text-[10px] text-violet-300">
+            <span key={u} className="rounded-full bg-accent-subtle px-1.5 py-px text-[10px] text-accent-fg">
               {u}
             </span>
           ))}
-          {usage.length > 2 && <span className="text-[10px] text-neutral-500">+{usage.length - 2}</span>}
+          {usage.length > 2 && <span className="text-[10px] text-fg-subtle">+{usage.length - 2}</span>}
         </span>
       </button>
 
       {open && (
-        <div className="space-y-3 border-t border-neutral-800 p-3">
+        <div className="space-y-3 border-t border-line p-3">
           <div className="grid grid-cols-[1fr_1.4fr_1fr] gap-3">
             <Field label="Tên hiển thị" error={errors[`role.${r.id}.name`]}>
               <TextInput value={r.name} onChange={(v) => onChange({ name: v })} placeholder="VD: CTO" />
@@ -320,7 +320,7 @@ function RoleRow({
                 type="color"
                 value={/^#[0-9a-f]{6}$/i.test(r.color) ? r.color : "#a1a1aa"}
                 onChange={(e) => onChange({ color: e.target.value })}
-                className="h-9 w-12 cursor-pointer rounded border border-neutral-700 bg-neutral-950"
+                className="h-9 w-12 cursor-pointer rounded border border-line-strong bg-canvas"
                 aria-label="Màu role"
               />
             </Field>
@@ -332,13 +332,14 @@ function RoleRow({
                     type="button"
                     onClick={() => onChange({ icon: key })}
                     title={key}
+                    aria-label={`Icon ${key}`}
                     aria-pressed={r.icon === key}
                     className={cx(
-                      "grid size-7 place-items-center rounded-md border",
-                      r.icon === key ? "border-violet-500 bg-violet-500/20" : "border-neutral-800 hover:border-neutral-600",
+                      "grid size-7 place-items-center rounded-control border",
+                      r.icon === key ? "border-accent bg-accent/20" : "border-line hover:border-line-heavy",
                     )}
                   >
-                    <Icon className="size-3.5" style={{ color: r.icon === key ? r.color : "#a1a1aa" }} />
+                    <Icon className="size-3.5" style={{ color: r.icon === key ? r.color : "var(--fg-muted)" }} />
                   </button>
                 ))}
               </div>
@@ -346,7 +347,7 @@ function RoleRow({
           </div>
 
           <Field label="Ngoại hình nhân vật pixel" hint="Để Tự động thì nhân vật được sinh theo id + cấp bậc; mỗi role sẽ khác nhau.">
-            <div className="rounded-lg border border-neutral-800 bg-neutral-900/40 p-3">
+            <div className="rounded-lg border border-line bg-surface/40 p-3">
               <AppearanceEditor role={r} onChange={(appearance) => onChange({ appearance })} />
             </div>
           </Field>
@@ -406,13 +407,13 @@ function RoleRow({
             >
               Xoá
             </Button>
-            {usage.length > 0 && <span className="text-[11px] text-neutral-500">Đang dùng: {usage.join(" · ")}</span>}
+            {usage.length > 0 && <span className="text-[11px] text-fg-subtle">Đang dùng: {usage.join(" · ")}</span>}
           </div>
           {fresh && !checking && (
             <div
               className={cx(
-                "flex items-start gap-2 rounded-md px-2.5 py-1.5 text-xs",
-                fresh.status === "ok" ? "bg-emerald-500/10 text-emerald-200" : "bg-red-500/10 text-red-200",
+                "flex items-start gap-2 rounded-control px-2.5 py-1.5 text-xs",
+                fresh.status === "ok" ? "bg-success-subtle text-success" : "bg-danger-subtle text-danger",
               )}
             >
               {fresh.status === "ok" ? <CircleCheck className="mt-px size-3.5 shrink-0" /> : <CircleX className="mt-px size-3.5 shrink-0" />}

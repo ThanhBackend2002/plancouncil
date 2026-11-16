@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::config::AppConfig;
-use crate::models::{SessionRecord, SessionSummary};
+use crate::models::{SessionRecord, SessionStatus, SessionSummary};
+
+/// Lý do ghi vào phiên bị gián đoạn (app đóng / crash khi đang họp).
+pub const INTERRUPTED_ERROR: &str = "Ứng dụng đóng khi phiên đang chạy; bản nháp đang stream không được lưu";
 
 const APP_DIR: &str = "plancouncil";
 const CONFIG_FILE: &str = "config.json";
@@ -56,9 +59,14 @@ impl Storage {
         self.root.join(CONFIG_FILE)
     }
 
-    fn session_path(&self, id: Uuid) -> PathBuf {
+    /// Thư mục chứa các file `<uuid>.json`.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.root.join(SESSIONS_DIR)
+    }
+
+    pub fn session_path(&self, id: Uuid) -> PathBuf {
         // `id` là Uuid đã parse → không thể path traversal.
-        self.root.join(SESSIONS_DIR).join(format!("{id}.json"))
+        self.sessions_dir().join(format!("{id}.json"))
     }
 
     /// Không bao giờ fail: file thiếu → default; file hỏng → backup rồi default;
@@ -131,28 +139,74 @@ impl Storage {
         }
     }
 
-    /// O(n) file đọc mỗi lần list — chấp nhận được tới vài trăm phiên.
-    /// Long-term: index file hoặc SQLite (xem trade-off trong README).
-    pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, StorageError> {
-        let dir = self.root.join(SESSIONS_DIR);
-        let mut out = Vec::new();
-        for entry in fs::read_dir(&dir)? {
-            let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+    /// Khởi động: phiên còn `running` trên đĩa (app tắt / crash giữa chừng) → `interrupted` kèm
+    /// lý do. Bỏ qua phiên `live` (đang chạy thật trong tiến trình này) và file hỏng.
+    /// Trả về id các phiên đã sửa.
+    pub fn recover_interrupted(&self, live: Option<Uuid>) -> Vec<Uuid> {
+        /// Chỉ cần `status` để lọc — serde bỏ qua phần còn lại.
+        #[derive(serde::Deserialize)]
+        struct Head {
+            status: SessionStatus,
+        }
+        let entries = match fs::read_dir(self.sessions_dir()) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("không quét được thư mục phiên để khôi phục: {e}");
+                return vec![];
+            }
+        };
+        let mut fixed = Vec::new();
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || !path.is_file() {
                 continue;
             }
-            match fs::read(&path)
-                .map_err(StorageError::from)
-                .and_then(|b| serde_json::from_slice::<SessionRecord>(&b).map_err(Into::into))
-            {
+            let Ok(bytes) = fs::read(&path) else { continue };
+            if !matches!(serde_json::from_slice::<Head>(&bytes), Ok(h) if h.status == SessionStatus::Running) {
+                continue;
+            }
+            let mut rec: SessionRecord = match serde_json::from_slice(&bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!("bỏ qua phiên hỏng {}: {e}", path.display());
+                    continue;
+                }
+            };
+            if Some(rec.id) == live || path != self.session_path(rec.id) {
+                continue;
+            }
+            rec.status = SessionStatus::Interrupted;
+            rec.error = Some(INTERRUPTED_ERROR.to_owned());
+            match self.save_session(&rec) {
+                Ok(()) => fixed.push(rec.id),
+                Err(e) => log::warn!("không ghi được trạng thái interrupted cho {}: {e}", rec.id),
+            }
+        }
+        fixed
+    }
+
+    /// O(n) file đọc mỗi lần list — đường dự phòng khi index SQLite (`search_index`) chưa sẵn sàng.
+    /// Thứ tự: mới nhất trước, trùng `created_at` thì theo id tăng dần (giống `SearchIndex::list`).
+    pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, StorageError> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(self.sessions_dir())? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || !path.is_file() {
+                continue;
+            }
+            match read_session_file(&path) {
                 Ok(rec) => out.push(rec.summary()),
                 Err(e) => log::warn!("bỏ qua session hỏng {}: {e}", path.display()),
             }
         }
-        out.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
         out.truncate(limit);
         Ok(out)
     }
+}
+
+/// Đọc + parse 1 file phiên (dùng chung cho `list_sessions` và đồng bộ index).
+pub fn read_session_file(path: &Path) -> Result<SessionRecord, StorageError> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
 /// tmp (cùng thư mục) → fsync → rename. `rename` thay thế file đích atomically trên
@@ -186,7 +240,6 @@ pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::SessionStatus;
 
     fn tmp_storage() -> Storage {
         let dir = std::env::temp_dir().join(format!("plancouncil-test-{}", Uuid::new_v4()));
@@ -227,6 +280,39 @@ mod tests {
         fs::write(s.config_path(), b"{not json").unwrap();
         assert_eq!(s.load_config().max_rounds, 3); // default
         assert!(!s.config_path().exists()); // đã bị move sang .corrupt-*
+        fs::remove_dir_all(s.root()).ok();
+    }
+
+    #[test]
+    fn running_sessions_become_interrupted_on_startup() {
+        let s = tmp_storage();
+        let mk = |status| {
+            let mut r = SessionRecord::new(Uuid::new_v4(), "p".into(), 3);
+            r.status = status;
+            r.plans.push(crate::models::PlanVersion::new(1, "## 1. A\n".into(), Default::default()));
+            s.save_session(&r).unwrap();
+            r
+        };
+        let crashed = mk(SessionStatus::Running);
+        let live = mk(SessionStatus::Running);
+        let others: Vec<_> = [SessionStatus::Converged, SessionStatus::Cancelled, SessionStatus::Failed, SessionStatus::MaxRoundsReached]
+            .into_iter()
+            .map(mk)
+            .collect();
+        let before: Vec<_> = others.iter().map(|r| fs::read(s.session_path(r.id)).unwrap()).collect();
+        fs::write(s.sessions_dir().join("broken.json"), b"{not json").unwrap();
+
+        assert_eq!(s.recover_interrupted(Some(live.id)), vec![crashed.id]);
+        let got = s.load_session(crashed.id).unwrap();
+        assert_eq!(got.status, SessionStatus::Interrupted);
+        assert_eq!(got.error.as_deref(), Some(INTERRUPTED_ERROR));
+        assert_eq!(got.plans.len(), 1, "giữ nguyên plan đã lưu");
+        assert_eq!(s.load_session(live.id).unwrap().status, SessionStatus::Running, "phiên đang chạy không bị đụng");
+        for (r, b) in others.iter().zip(before) {
+            assert_eq!(fs::read(s.session_path(r.id)).unwrap(), b, "{:?} không đổi", r.status);
+        }
+        // Chạy lại: không còn gì để sửa.
+        assert!(s.recover_interrupted(Some(live.id)).is_empty());
         fs::remove_dir_all(s.root()).ok();
     }
 

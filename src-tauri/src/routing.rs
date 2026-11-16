@@ -30,6 +30,10 @@ struct Block {
     text: String,
     /// Thứ tự của `##` (0 = section đầu tiên)
     section_index: usize,
+    /// Số đầu tiêu đề: "## 3. Data Flow" → "3", "### 3.3 Foo" → "3.3"
+    number: Option<String>,
+    /// Số của `##` cha (chỉ với `###`)
+    parent_number: Option<String>,
 }
 
 fn parse_tags(line: &str) -> Option<Vec<String>> {
@@ -49,9 +53,18 @@ fn parse_tags(line: &str) -> Option<Vec<String>> {
 
 fn parse(md: &str) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
-    let mut cur = Block { level: 0, heading: String::new(), tags: None, text: String::new(), section_index: 0 };
+    let mut cur = Block {
+        level: 0,
+        heading: String::new(),
+        tags: None,
+        text: String::new(),
+        section_index: 0,
+        number: None,
+        parent_number: None,
+    };
     let mut in_fence = false;
     let mut parent_tags: Option<Vec<String>> = None;
+    let mut parent_number: Option<String> = None;
     let mut section_no = 0usize;
     let mut expect_tag = false;
 
@@ -72,13 +85,23 @@ fn parse(md: &str) -> Vec<Block> {
         if level > 0 {
             blocks.push(std::mem::replace(
                 &mut cur,
-                Block { level, heading: line.to_owned(), tags: None, text: String::new(), section_index: 0 },
+                Block {
+                    level,
+                    heading: line.to_owned(),
+                    tags: None,
+                    text: String::new(),
+                    section_index: 0,
+                    number: heading_number(line),
+                    parent_number: None,
+                },
             ));
             if level == 2 {
                 section_no += 1;
                 parent_tags = None;
+                parent_number = cur.number.clone();
             } else {
                 cur.tags = parent_tags.clone(); // ### kế thừa tag của ## cha
+                cur.parent_number = parent_number.clone();
             }
             cur.section_index = section_no.saturating_sub(1);
             cur.text.push_str(line);
@@ -115,8 +138,183 @@ pub fn is_tagged(md: &str) -> bool {
     parse(md).iter().any(|b| b.tags.is_some())
 }
 
+/// Section (số tiêu đề; không có số → tên tiêu đề) chỉ được gắn tag cho reviewer KHÔNG có trong
+/// `reviewers` — không ai trong nhóm mới phụ trách. Block không tag / tag `all` không tính.
+/// `###` kế thừa tag của `##` cha nên cũng được liệt kê khi cha bị bỏ trống.
+pub fn uncovered_sections(md: &str, reviewers: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for b in parse(md).iter().filter(|b| b.level > 0) {
+        let Some(tags) = &b.tags else { continue };
+        if tags.iter().any(|t| t.eq_ignore_ascii_case("all") || reviewers.iter().any(|r| r == t)) {
+            continue;
+        }
+        let label = b
+            .number
+            .clone()
+            .unwrap_or_else(|| b.heading.trim().trim_start_matches('#').trim().to_owned());
+        if !out.contains(&label) {
+            out.push(label);
+        }
+    }
+    out
+}
+
+/// Số đầu tiêu đề: "## 3. Data Flow" → "3", "### 3.3 Foo" → "3.3". Không có số → None.
+fn heading_number(heading: &str) -> Option<String> {
+    let rest = heading.trim_start().trim_start_matches('#').trim_start();
+    let chars: Vec<char> = rest.chars().collect();
+    let end = scan_number(&chars, 0);
+    if end == 0 {
+        return None;
+    }
+    // Sau số phải là hết dòng / khoảng trắng / dấu câu ("3D Engine" không phải mục 3).
+    match chars.get(end) {
+        None => {}
+        Some(c) if c.is_whitespace() || matches!(c, '.' | ')' | ':' | '-' | '–' | '—') => {}
+        Some(_) => return None,
+    }
+    Some(chars[..end].iter().collect())
+}
+
+/// Đọc `\d+(\.\d+)*` bắt đầu tại `i`; trả về vị trí kết thúc (= `i` nếu không có số).
+fn scan_number(chars: &[char], mut i: usize) -> usize {
+    let start = i;
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start {
+        return start;
+    }
+    while i + 1 < chars.len() && chars[i] == '.' && chars[i + 1].is_ascii_digit() {
+        i += 1;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// Trước vị trí số (bỏ khoảng trắng / ':') là "section", "mục" hoặc "§".
+fn after_keyword(before: &[char]) -> bool {
+    let mut j = before.len();
+    while j > 0 && (before[j - 1].is_whitespace() || before[j - 1] == ':') {
+        j -= 1;
+    }
+    let tail: String = before[j.saturating_sub(8)..j].iter().collect::<String>().to_lowercase();
+    ["section", "sections", "mục", "§"].iter().any(|k| tail.ends_with(k))
+}
+
+/// Các số mục được nhắc trong văn bản: nằm trong ngoặc tròn, đứng sau "section"/"mục"/"§",
+/// hoặc có dấu chấm (3.3). "2.1-5" → "2.1" (phần sau gạch nối là số thứ tự item).
+pub(crate) fn mentioned_numbers(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth = depth.saturating_sub(1);
+        }
+        if !c.is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let prev = start.checked_sub(1).map(|j| chars[j]);
+        i = scan_number(&chars, start);
+        let token: String = chars[start..i].iter().collect();
+        // Bỏ số thứ tự item sau gạch nối: "2.1-5", "3.3–2".
+        if i + 1 < chars.len() && matches!(chars[i], '-' | '–') && chars[i + 1].is_ascii_digit() {
+            i = scan_number(&chars, i + 1);
+        }
+        let next = chars.get(i).copied();
+        // "v1", "#3", "x2", "1.5x", "3D" → không phải số mục.
+        if prev.is_some_and(|p| p.is_alphanumeric() || matches!(p, '#' | '_' | '.'))
+            || next.is_some_and(|n| n.is_alphanumeric() || n == '_')
+        {
+            continue;
+        }
+        if depth > 0 || token.contains('.') || after_keyword(&chars[..start]) {
+            out.push(token);
+        }
+    }
+    out
+}
+
+/// Các section (theo số tiêu đề, vd "3.3", "4") reviewer phải được đọc đầy đủ dù không được gắn tag:
+/// mục được nhắc trong các dòng Changelog gửi cho reviewer này (cột 2 chứa id/tên) và trong
+/// critical issue vòng trước — để reviewer kiểm chứng được issue của mình đã được sửa.
+///
+/// - `Some(vec![])` = không có gì cần giữ thêm (kể cả khi issue / dòng Changelog không nhắc số mục nào
+///   — issue kiểu "Thiếu idempotency key" thường nằm ngay trong phần reviewer phụ trách).
+/// - `None` = có nhắc số mục nhưng không số nào khớp tiêu đề → không biết phần sửa nằm đâu,
+///   gửi nguyên plan cho chắc.
+pub fn referenced_sections(md: &str, role_id: &str, role_name: &str, prev_issues: &[String]) -> Option<Vec<String>> {
+    let blocks = parse(md);
+    let id = role_id.trim().to_lowercase();
+    let name = role_name.trim().to_lowercase();
+    let addressed = |cell: &str| {
+        let cell = cell.to_lowercase();
+        (!id.is_empty() && cell.contains(&id)) || (!name.is_empty() && cell.contains(&name))
+    };
+
+    let mut refs: Vec<String> = prev_issues.iter().flat_map(|s| mentioned_numbers(s)).collect();
+    let mut parent_changelog = false;
+    for b in &blocks {
+        if b.level == 2 {
+            parent_changelog = is_changelog(&b.heading);
+        }
+        let changelog = is_changelog(&b.heading) || (b.level == 3 && parent_changelog);
+        if !changelog {
+            continue;
+        }
+        for line in b.text.lines() {
+            let row = line.trim();
+            if !row.starts_with('|') {
+                continue;
+            }
+            let cells: Vec<&str> = row.trim_start_matches('|').split('|').collect();
+            if cells.get(1).is_some_and(|c| addressed(c)) {
+                refs.extend(mentioned_numbers(row));
+            }
+        }
+    }
+
+    let numbers: Vec<&str> = blocks.iter().filter_map(|b| b.number.as_deref()).collect();
+    // Số không khớp tiêu đề nào → lùi về mục cha gần nhất ("3.3.1" → "3.3") nếu có (vd mục `####`).
+    let mut resolved: Vec<&str> = Vec::new();
+    for r in &refs {
+        let mut cand = r.as_str();
+        loop {
+            if numbers.contains(&cand) {
+                resolved.push(cand);
+                break;
+            }
+            match cand.rsplit_once('.') {
+                Some((parent, _)) => cand = parent,
+                None => break,
+            }
+        }
+    }
+    if !refs.is_empty() && resolved.is_empty() {
+        return None;
+    }
+    let mut keep: Vec<String> = Vec::new();
+    for n in numbers {
+        if resolved.contains(&n) && !keep.iter().any(|k| k == n) {
+            keep.push(n.to_owned());
+        }
+    }
+    Some(keep)
+}
+
 /// Bản plan rút gọn cho 1 reviewer. None = gửi nguyên văn (không có tag / role không được gắn ở đâu / rút gọn không đáng kể).
-pub fn view_for(md: &str, role_id: &str) -> Option<String> {
+///
+/// `keep` = số tiêu đề luôn gửi đầy đủ (xem `referenced_sections`); số của `##` kéo theo mọi `###` con.
+pub fn view_for(md: &str, role_id: &str, keep: &[String]) -> Option<String> {
     let blocks = parse(md);
     if !blocks.iter().any(|b| b.tags.is_some()) {
         return None;
@@ -129,8 +327,14 @@ pub fn view_for(md: &str, role_id: &str) -> Option<String> {
     }
     let mut out = String::new();
     let mut omitted = 0usize;
+    let kept = |n: &Option<String>| n.as_ref().is_some_and(|n| keep.iter().any(|k| k == n));
     for b in &blocks {
-        if b.level == 0 || (b.level == 2 && b.section_index == 0) || wants(b, role_id) {
+        if b.level == 0
+            || (b.level == 2 && b.section_index == 0)
+            || wants(b, role_id)
+            || kept(&b.number)
+            || kept(&b.parent_number)
+        {
             out.push_str(&b.text);
         } else {
             out.push_str(&b.heading);
@@ -172,6 +376,18 @@ fn is_changelog(heading: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn uncovered_sections_lists_only_sections_without_any_remaining_reviewer() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        // Bỏ frontend_dev: mục 3 chỉ gắn cho họ; mục 5 vẫn còn backend_dev; mục 2 là `all`.
+        assert_eq!(uncovered_sections(PLAN, &s(&["backend_dev"])), s(&["3"]));
+        // Bỏ cả hai → 3, 4, 5 và 5.1 (kế thừa tag của 5).
+        assert_eq!(uncovered_sections(PLAN, &s(&["dba"])), s(&["3", "4", "5", "5.1"]));
+        assert!(uncovered_sections(PLAN, &s(&["frontend_dev", "backend_dev"])).is_empty());
+        // Plan không tag → không có gì bị bỏ trống.
+        assert!(uncovered_sections("## 1. A\nx\n## 2. B\ny\n", &[]).is_empty());
+    }
+
     const PLAN: &str = "## 1. Overview\nTổng quan dùng chung cho mọi người, mô tả mục tiêu.\n\
 ## 2. Architecture\n<!-- reviewers: all -->\nKiến trúc tổng.\n\
 ## 3. Frontend (A)\n<!-- reviewers: frontend_dev -->\nNội dung A rất dài về UI, state, cache phía client và trải nghiệm người dùng.\n\
@@ -182,19 +398,19 @@ mod tests {
 
     #[test]
     fn frontend_reads_a_and_c_only() {
-        let v = view_for(PLAN, "frontend_dev").expect("phải rút gọn");
+        let v = view_for(PLAN, "frontend_dev", &[]).expect("phải rút gọn");
         assert!(v.contains("Nội dung A") && v.contains("Hợp đồng API") && v.contains("Token refresh"));
         assert!(v.contains("Tổng quan") && v.contains("Kiến trúc tổng"), "overview + 'all' luôn có");
         assert!(!v.contains("Nội dung B"), "không gửi phần backend");
         assert!(v.contains("## 4. Backend (B)\n_(lược bớt"), "giữ tiêu đề phần bị lược");
-        let b = view_for(PLAN, "backend_dev").unwrap();
+        let b = view_for(PLAN, "backend_dev", &[]).unwrap();
         assert!(b.contains("Nội dung B") && !b.contains("Nội dung A") && b.contains("Token refresh"));
     }
 
     #[test]
     fn untagged_or_unmentioned_falls_back_to_full_plan() {
-        assert!(view_for("## 1. Overview\nx\n## 2. Y\ny\n", "dba").is_none());
-        assert!(view_for(PLAN, "dba").is_none(), "role chưa được gắn ở đâu → đọc toàn bộ");
+        assert!(view_for("## 1. Overview\nx\n## 2. Y\ny\n", "dba", &[]).is_none());
+        assert!(view_for(PLAN, "dba", &[]).is_none(),"role chưa được gắn ở đâu → đọc toàn bộ");
         assert!(is_tagged(PLAN));
     }
 
@@ -212,7 +428,98 @@ mod tests {
     #[test]
     fn headings_inside_code_fences_are_ignored() {
         let md = "## 1. O\no\n## 2. A\n<!-- reviewers: x -->\n```md\n## not a heading\n```\nnội dung A dài dài dài dài dài dài dài dài dài\n## 3. B\n<!-- reviewers: y -->\nnội dung B dài dài dài dài dài dài dài dài dài dài\n";
-        let v = view_for(md, "x").unwrap();
+        let v = view_for(md, "x", &[]).unwrap();
         assert!(v.contains("## not a heading") && v.contains("nội dung A") && !v.contains("nội dung B"));
+    }
+
+    /// Plan có Changelog trỏ tới mục bị lược với reviewer.
+    fn plan_with_changelog() -> String {
+        let long = "nội dung dài dài dài dài dài dài dài dài dài dài dài dài dài dài. ".repeat(6);
+        format!(
+            "## 1. Overview\nTổng quan.\n\
+## 2. Frontend\n<!-- reviewers: ui_ux_designer, qa -->\nNội dung frontend {long}\n\
+## 3. Data Flow\n<!-- reviewers: backend_dev -->\nMở đầu data flow.\n\
+### 3.1 Queue\nChi tiết queue {long}\n\
+### 3.3 Cache\nChi tiết cache {long}\n\
+## 4. Scale\n<!-- reviewers: scale_reviewer -->\nNội dung scale {long}{long}{long}\n\
+## 5. Changelog (v1 → v2)\n\
+| # | Reviewer | Issue | Resolution | Status |\n\
+|---|---|---|---|---|\n\
+| 1 | ui_ux_designer #3 | Cache cũ | Thêm TTL (3.3) | Fixed |\n\
+| 2 | Scale Reviewer #2 | Queue | xem mục 3.1-2 | Fixed |\n"
+        )
+    }
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn number_extraction() {
+        assert_eq!(heading_number("## 3. Data Flow").as_deref(), Some("3"));
+        assert_eq!(heading_number("### 3.3 Foo").as_deref(), Some("3.3"));
+        assert_eq!(heading_number("## Overview"), None);
+        assert_eq!(heading_number("## 3D Engine"), None);
+        assert_eq!(mentioned_numbers("resolution ... (2.1-2, 5.4)"), s(&["2.1", "5.4"]));
+        assert_eq!(mentioned_numbers("2.1-5 và section 4, mục 6, §7"), s(&["2.1", "4", "6", "7"]));
+        assert!(mentioned_numbers("ui_ux_designer #3, v1 → v2, bước 3, 1.5x").is_empty());
+    }
+
+    #[test]
+    fn changelog_row_unomits_section_only_for_addressed_reviewer() {
+        let p = plan_with_changelog();
+        let keep_x = referenced_sections(&p, "ui_ux_designer", "UI/UX Designer", &[]).unwrap();
+        assert_eq!(keep_x, s(&["3.3"]));
+        let x = view_for(&p, "ui_ux_designer", &keep_x).expect("vẫn phải rút gọn");
+        assert!(x.contains("Chi tiết cache"), "3.3 được Changelog nhắc → gửi đầy đủ");
+        assert!(!x.contains("Chi tiết queue") && !x.contains("Nội dung scale"));
+
+        // Khớp theo tên (không phân biệt hoa thường) + "3.1-2" → "3.1".
+        let keep_y = referenced_sections(&p, "scale_reviewer", "Scale Reviewer", &[]).unwrap();
+        assert_eq!(keep_y, s(&["3.1"]));
+        let y = view_for(&p, "scale_reviewer", &keep_y).unwrap();
+        assert!(y.contains("Chi tiết queue") && !y.contains("Chi tiết cache"), "dòng của X không mở 3.3 cho Y");
+    }
+
+    #[test]
+    fn previous_issue_unomits_section() {
+        let p = plan_with_changelog();
+        assert_eq!(referenced_sections(&p, "qa", "QA", &[]), Some(vec![]));
+        assert!(!view_for(&p, "qa", &[]).unwrap().contains("Chi tiết cache"));
+        let issues = s(&["Cache ở 3.3 không có TTL"]);
+        let keep = referenced_sections(&p, "qa", "QA", &issues).unwrap();
+        assert_eq!(keep, s(&["3.3"]));
+        assert!(view_for(&p, "qa", &keep).unwrap().contains("Chi tiết cache"));
+    }
+
+    #[test]
+    fn unresolvable_reference_means_full_plan() {
+        let p = plan_with_changelog();
+        assert_eq!(referenced_sections(&p, "qa", "QA", &s(&["Thiếu mục 9.9"])), None);
+        assert_eq!(referenced_sections(&p, "qa", "QA", &s(&["Thiếu mục 9.9", "Cache (3.3)"])), Some(s(&["3.3"])));
+        // Issue không nhắc số mục nào → không có gì cần giữ thêm, vẫn rút gọn.
+        assert_eq!(referenced_sections(&p, "qa", "QA", &s(&["Không có idempotency key"])), Some(vec![]));
+        // Mục con không có tiêu đề riêng → lùi về mục cha.
+        assert_eq!(referenced_sections(&p, "qa", "QA", &s(&["(3.3.1) sai"])), Some(s(&["3.3"])));
+    }
+
+    #[test]
+    fn keeping_h2_pulls_in_h3_children() {
+        let p = plan_with_changelog();
+        let v = view_for(&p, "qa", &s(&["3"])).expect("phần scale vẫn bị lược");
+        assert!(v.contains("Mở đầu data flow") && v.contains("Chi tiết queue") && v.contains("Chi tiết cache"));
+        assert!(!v.contains("Nội dung scale"));
+    }
+
+    #[test]
+    fn fingerprint_unaffected_by_referenced_sections() {
+        let p = plan_with_changelog();
+        let changed = p.replace("Chi tiết cache", "Chi tiết cache + TTL");
+        assert_eq!(
+            fingerprint(&p, "ui_ux_designer"),
+            fingerprint(&changed, "ui_ux_designer"),
+            "3.3 chỉ là ngữ cảnh kiểm chứng"
+        );
+        assert_ne!(fingerprint(&p, "backend_dev"), fingerprint(&changed, "backend_dev"));
     }
 }

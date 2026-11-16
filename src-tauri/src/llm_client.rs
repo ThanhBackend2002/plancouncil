@@ -23,6 +23,10 @@ use crate::models::truncate_chars;
 const MAX_ERROR_BODY_CHARS: usize = 500;
 const MAX_SSE_LINE_BYTES: usize = 1 << 20; // 1 MiB: chống server lỗi đẩy 1 dòng vô hạn
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Giả định khi endpoint không đặt `max_tokens` (dùng để tính lần retry khi output bị cắt).
+pub const DEFAULT_OUTPUT_TOKENS: u32 = 4096;
+/// Trần `max_tokens` khi tự nới cho lần retry — không bao giờ xin quá mức này.
+pub const OUTPUT_TOKENS_CAP: u32 = 32768;
 
 // ───────────────────────────── Types ─────────────────────────────
 
@@ -79,6 +83,10 @@ pub enum LlmError {
     InvalidResponse(String),
     #[error("không parse được JSON từ model: {0}")]
     JsonParse(String),
+    /// Output bị cắt: `"length"` (retry với max_tokens lớn hơn vẫn bị cắt) hoặc
+    /// `"max_tokens_cap"` (max_tokens đã chạm `OUTPUT_TOKENS_CAP`, không nới thêm được).
+    #[error("output của model bị cắt ({reason})")]
+    Truncated { reason: &'static str },
 }
 
 impl LlmError {
@@ -104,12 +112,50 @@ impl LlmError {
 }
 
 /// Token tiêu thụ của 1 lần gọi (theo `usage` provider trả về).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
-    #[serde(default)]
     pub prompt_tokens: u64,
-    #[serde(default)]
     pub completion_tokens: u64,
+    /// Phần `prompt_tokens` đọc từ cache của provider (`prompt_tokens_details.cached_tokens`); thiếu → 0.
+    pub cached_tokens: u64,
+}
+
+/// Dạng thô provider trả về; `cached_tokens` nằm trong `prompt_tokens_details` (OpenAI) —
+/// vài proxy đặt thẳng ở cấp ngoài, nên nhận cả hai.
+#[derive(Deserialize)]
+struct RawUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+    #[serde(default)]
+    completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<RawPromptDetails>,
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RawPromptDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for Usage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = RawUsage::deserialize(d)?;
+        let prompt_tokens = raw.prompt_tokens.unwrap_or(0);
+        let cached = raw
+            .prompt_tokens_details
+            .and_then(|p| p.cached_tokens)
+            .or(raw.cached_tokens)
+            .unwrap_or(0);
+        Ok(Usage {
+            prompt_tokens,
+            completion_tokens: raw.completion_tokens.unwrap_or(0),
+            // Cache không thể lớn hơn tổng prompt (provider lỗi số liệu → kẹp lại).
+            cached_tokens: cached.min(prompt_tokens),
+        })
+    }
 }
 
 impl Usage {
@@ -117,6 +163,7 @@ impl Usage {
         Usage {
             prompt_tokens: self.prompt_tokens + o.prompt_tokens,
             completion_tokens: self.completion_tokens + o.completion_tokens,
+            cached_tokens: self.cached_tokens + o.cached_tokens,
         }
     }
 }
@@ -130,11 +177,33 @@ pub fn sum_usage(a: Option<Usage>, b: Option<Usage>) -> Option<Usage> {
     }
 }
 
-/// Kết quả 1 lần gọi chat: nội dung + token (nếu provider báo).
+/// Lý do kết thúc của 1 lần gọi chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Finish {
+    /// Model tự dừng (hoặc provider không báo `finish_reason`).
+    Stop,
+    /// Bị cắt do `max_tokens` (`finish_reason=length`).
+    Length,
+    /// Stream đóng kết nối giữa chừng: không có `[DONE]` lẫn `finish_reason` → text có thể thiếu.
+    Error,
+}
+
+impl Finish {
+    /// `"length"` → `Length`; thiếu hoặc giá trị khác (`stop`, `content_filter`…) → `Stop`.
+    fn from_reason(reason: Option<&str>) -> Self {
+        match reason {
+            Some("length") => Finish::Length,
+            _ => Finish::Stop,
+        }
+    }
+}
+
+/// Kết quả 1 lần gọi chat: nội dung + token (nếu provider báo) + lý do kết thúc.
 #[derive(Debug, Clone)]
 pub struct Completion {
     pub text: String,
     pub usage: Option<Usage>,
+    pub finish: Finish,
 }
 
 /// 1 lượt trong vòng gọi công cụ.
@@ -192,6 +261,8 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: Option<StreamDelta>,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -300,17 +371,47 @@ impl LlmClient {
     }
 
     /// Gọi model và parse JSON thành `T`. Trả về cả raw text (để đưa lại vào hội thoại khi cần sửa).
-    /// Nếu parse fail → gửi lại 1 "repair prompt" kèm lỗi cụ thể.
+    /// - Output bị cắt (`Finish::Length`) → retry 1 lần với max_tokens ×1.5 (tối đa `OUTPUT_TOKENS_CAP`);
+    ///   vẫn bị cắt hoặc đã chạm trần → `LlmError::Truncated`, không cố parse JSON dở dang.
+    /// - Parse fail → gửi lại 1 "repair prompt" kèm lỗi cụ thể.
+    ///
+    /// Usage trả về là tổng của mọi attempt.
     pub async fn chat_json<T: DeserializeOwned>(
         &self,
         ep: &ResolvedEndpoint,
         messages: &[ChatMessage],
         cancel: &CancellationToken,
     ) -> Result<(T, String, Option<Usage>), LlmError> {
-        let first = self.chat(ep, messages, Expect::Json, cancel).await?;
+        let mut first = self.chat(ep, messages, Expect::Json, cancel).await?;
+        let mut usage = first.usage;
+        // Endpoint thực dùng cho các lần gọi sau (đã nới max_tokens nếu lần đầu bị cắt).
+        let mut bumped: Option<ResolvedEndpoint> = None;
+        if first.finish == Finish::Length {
+            let current = ep.max_tokens.unwrap_or(DEFAULT_OUTPUT_TOKENS);
+            if current >= OUTPUT_TOKENS_CAP {
+                log::warn!("model {} bị cắt JSON ở max_tokens={current} (đã chạm trần)", ep.model);
+                return Err(LlmError::Truncated { reason: "max_tokens_cap" });
+            }
+            let next = bumped_max_tokens(current);
+            log::warn!(
+                "model {} bị cắt JSON (finish_reason=length, max_tokens={current}); retry với max_tokens={next}",
+                ep.model
+            );
+            let mut bigger = ep.clone();
+            bigger.max_tokens = Some(next);
+            let retry = self.chat(&bigger, messages, Expect::Json, cancel).await?;
+            usage = sum_usage(usage, retry.usage);
+            if retry.finish == Finish::Length {
+                return Err(LlmError::Truncated { reason: "length" });
+            }
+            first = retry;
+            bumped = Some(bigger);
+        }
+        let ep = bumped.as_ref().unwrap_or(ep);
+
         let text = first.text;
         let first_err = match parse_json_lenient::<T>(&text) {
-            Ok(v) => return Ok((v, text, first.usage)),
+            Ok(v) => return Ok((v, text, usage)),
             Err(e) => e,
         };
         log::warn!(
@@ -325,7 +426,10 @@ impl LlmClient {
              Reply again with ONLY one valid JSON object matching the schema. No markdown fences, no prose."
         )));
         let second = self.chat(ep, &repair, Expect::Json, cancel).await?;
-        let usage = sum_usage(first.usage, second.usage);
+        let usage = sum_usage(usage, second.usage);
+        if second.finish == Finish::Length {
+            return Err(LlmError::Truncated { reason: "length" });
+        }
         parse_json_lenient::<T>(&second.text)
             .map(|v| (v, second.text, usage))
             .map_err(LlmError::JsonParse)
@@ -378,6 +482,8 @@ impl LlmClient {
     {
         let mut body = self.build_body(ep, messages, true, false);
         let mut attempt = 0u32;
+        // Usage của các attempt đã đứt giữa chừng (hiếm khi có, vì usage thường nằm ở chunk cuối).
+        let mut failed_usage: Option<Usage> = None;
         loop {
             on(StreamSignal::Reset);
             // Không đặt total-timeout cho stream: plan dài có thể chạy vài phút. Dùng idle-timeout.
@@ -400,10 +506,15 @@ impl LlmClient {
                 }
                 Err(e) => return Err(e),
             };
-            match self.consume_stream(resp, cancel, &mut on).await {
-                Ok(text) => return Ok(text),
+            let mut acc = StreamAcc::default();
+            match self.consume_stream(resp, cancel, &mut on, &mut acc).await {
+                Ok(mut c) => {
+                    c.usage = sum_usage(failed_usage, c.usage);
+                    return Ok(c);
+                }
                 Err(LlmError::Cancelled) => return Err(LlmError::Cancelled),
                 Err(e) if e.is_retryable() && attempt < self.max_retries => {
+                    failed_usage = sum_usage(failed_usage, acc.usage);
                     attempt += 1;
                     let delay = backoff(attempt);
                     log::warn!(
@@ -481,11 +592,13 @@ impl LlmClient {
         }
     }
 
+    /// Đọc 1 response SSE vào `acc` (do caller tạo để vẫn lấy được usage khi attempt lỗi).
     async fn consume_stream<F>(
         &self,
         resp: reqwest::Response,
         cancel: &CancellationToken,
         on: &mut F,
+        acc: &mut StreamAcc,
     ) -> Result<Completion, LlmError>
     where
         F: FnMut(StreamSignal<'_>) + Send,
@@ -504,8 +617,6 @@ impl LlmClient {
 
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-        let mut out = String::new();
-        let mut usage: Option<Usage> = None;
 
         'outer: loop {
             let next = tokio::select! {
@@ -524,37 +635,94 @@ impl LlmClient {
             // '\n' không bao giờ nằm giữa 1 ký tự UTF-8 multi-byte → split theo byte an toàn.
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
-                match parse_sse_line(&line)? {
-                    SseLine::Delta(d) => {
-                        out.push_str(&d);
-                        on(StreamSignal::Delta(&d));
-                    }
-                    SseLine::Usage(u) => usage = Some(u),
-                    SseLine::Done => break 'outer,
-                    SseLine::Skip => {}
+                if acc.push_line(&line, on)? {
+                    break 'outer;
                 }
             }
             if buf.len() > MAX_SSE_LINE_BYTES {
                 return Err(LlmError::InvalidResponse("dòng SSE vượt quá 1 MiB".into()));
             }
         }
-        if !buf.is_empty() {
-            match parse_sse_line(&buf)? {
-                SseLine::Delta(d) => {
-                    out.push_str(&d);
-                    on(StreamSignal::Delta(&d));
-                }
-                SseLine::Usage(u) => usage = Some(u),
-                _ => {}
-            }
+        if !buf.is_empty() && !acc.done {
+            acc.push_line(&buf, on)?;
         }
-        if out.trim().is_empty() {
+        acc.take_completion()
+    }
+}
+
+/// Trạng thái gom của 1 attempt stream — tách riêng để test thuần không cần HTTP.
+#[derive(Debug, Default)]
+struct StreamAcc {
+    out: String,
+    usage: Option<Usage>,
+    /// `finish_reason` cuối cùng thấy được (chunk cuối thường có delta rỗng).
+    finish: Option<Finish>,
+    /// Đã gặp `data: [DONE]`.
+    done: bool,
+}
+
+impl StreamAcc {
+    /// Xử lý 1 dòng SSE. Trả về `true` khi gặp `[DONE]`.
+    fn push_line<G>(&mut self, line: &[u8], on: &mut G) -> Result<bool, LlmError>
+    where
+        G: FnMut(StreamSignal<'_>),
+    {
+        match parse_sse_line(line)? {
+            SseLine::Data(d) => {
+                if !d.delta.is_empty() {
+                    self.out.push_str(&d.delta);
+                    on(StreamSignal::Delta(&d.delta));
+                }
+                if d.usage.is_some() {
+                    self.usage = d.usage;
+                }
+                if d.finish.is_some() {
+                    self.finish = d.finish;
+                }
+                Ok(false)
+            }
+            SseLine::Done => {
+                self.done = true;
+                Ok(true)
+            }
+            SseLine::Skip => Ok(false),
+        }
+    }
+
+    /// Kết thúc attempt:
+    /// - không có text → lỗi `InvalidResponse` (như trước);
+    /// - có `[DONE]` → `finish_reason` đã thấy, không thấy thì `Stop` (nhiều proxy không gửi);
+    /// - đóng kết nối không có `[DONE]` → `finish_reason` đã thấy nếu có, không thì `Finish::Error`
+    ///   (trước đây trả text như bình thường, giờ đánh dấu rõ là có thể thiếu).
+    fn take_completion(&mut self) -> Result<Completion, LlmError> {
+        if self.out.trim().is_empty() {
             return Err(LlmError::InvalidResponse(
                 "stream kết thúc mà không có nội dung".into(),
             ));
         }
-        Ok(Completion { text: out, usage })
+        let finish = match (self.done, self.finish) {
+            (_, Some(f)) => f,
+            (true, None) => Finish::Stop,
+            (false, None) => {
+                log::warn!("stream đóng kết nối khi chưa có [DONE] / finish_reason; output có thể thiếu");
+                Finish::Error
+            }
+        };
+        if finish == Finish::Length {
+            log::warn!("output stream bị cắt do max_tokens (finish_reason=length)");
+        }
+        Ok(Completion {
+            text: std::mem::take(&mut self.out),
+            usage: self.usage,
+            finish,
+        })
     }
+}
+
+/// max_tokens cho lần retry khi bị cắt: ceil(current × 1.5), tối đa `OUTPUT_TOKENS_CAP`.
+fn bumped_max_tokens(current: u32) -> u32 {
+    let next = (u64::from(current) * 3).div_ceil(2);
+    next.min(u64::from(OUTPUT_TOKENS_CAP)) as u32
 }
 
 /// Parse 1 response non-stream có thể chứa `tool_calls`.
@@ -621,8 +789,13 @@ async fn read_completion(
         _ = cancel.cancelled() => return Err(LlmError::Cancelled),
         t = resp.text() => t.map_err(LlmError::from_reqwest)?,
     };
-    let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
-        LlmError::InvalidResponse(format!("{e}; body: {}", truncate_chars(&text, 200)))
+    parse_completion(&text)
+}
+
+/// Parse body non-stream: `choices[0].message.content` + usage + `finish_reason`.
+fn parse_completion(text: &str) -> Result<Completion, LlmError> {
+    let parsed: ChatResponse = serde_json::from_str(text).map_err(|e| {
+        LlmError::InvalidResponse(format!("{e}; body: {}", truncate_chars(text, 200)))
     })?;
     if let Some(err) = parsed.error {
         return Err(LlmError::InvalidResponse(format!(
@@ -636,23 +809,36 @@ async fn read_completion(
         .into_iter()
         .next()
         .ok_or_else(|| LlmError::InvalidResponse("không có choices".into()))?;
-    if choice.finish_reason.as_deref() == Some("length") {
+    let finish = Finish::from_reason(choice.finish_reason.as_deref());
+    if finish == Finish::Length {
         log::warn!("output bị cắt do max_tokens (finish_reason=length)");
     }
     let content = choice.message.and_then(|m| m.content).unwrap_or_default();
     if content.trim().is_empty() {
         return Err(LlmError::InvalidResponse("content rỗng".into()));
     }
-    Ok(Completion { text: content, usage })
+    Ok(Completion {
+        text: content,
+        usage,
+        finish,
+    })
 }
 
 // ───────────────────────────── SSE ─────────────────────────────
 
+/// 1 chunk `data: {...}` có ít nhất 1 trong: text, usage, finish_reason.
+#[derive(Debug, Default, PartialEq)]
+struct SseData {
+    delta: String,
+    /// Chunk cuối (khi gửi `stream_options.include_usage`).
+    usage: Option<Usage>,
+    /// `Some` khi chunk có `finish_reason` (thường là chunk có delta rỗng).
+    finish: Option<Finish>,
+}
+
 #[derive(Debug, PartialEq)]
 enum SseLine {
-    Delta(String),
-    /// Chunk cuối (khi gửi `stream_options.include_usage`).
-    Usage(Usage),
+    Data(SseData),
     Done,
     Skip,
 }
@@ -685,18 +871,23 @@ fn parse_sse_line(line: &[u8]) -> Result<SseLine, LlmError> {
         )));
     }
     let usage = chunk.usage;
-    let delta = chunk
-        .choices
-        .into_iter()
-        .next()
-        .and_then(|c| c.delta)
-        .and_then(|d| d.content)
-        .unwrap_or_default();
-    Ok(match (delta.is_empty(), usage) {
-        (false, _) => SseLine::Delta(delta),
-        (true, Some(u)) => SseLine::Usage(u),
-        (true, None) => SseLine::Skip,
-    })
+    let (delta, finish) = match chunk.choices.into_iter().next() {
+        Some(c) => (
+            c.delta.and_then(|d| d.content).unwrap_or_default(),
+            c.finish_reason
+                .as_deref()
+                .map(|r| Finish::from_reason(Some(r))),
+        ),
+        None => (String::new(), None),
+    };
+    if delta.is_empty() && usage.is_none() && finish.is_none() {
+        return Ok(SseLine::Skip);
+    }
+    Ok(SseLine::Data(SseData {
+        delta,
+        usage,
+        finish,
+    }))
 }
 
 // ───────────────────────────── JSON extraction ─────────────────────────────
@@ -939,7 +1130,7 @@ mod tests {
     fn sse_lines() {
         assert_eq!(
             parse_sse_line(b"data: {\"choices\":[{\"delta\":{\"content\":\"Xin\"}}]}\r\n").unwrap(),
-            SseLine::Delta("Xin".into())
+            SseLine::Data(SseData { delta: "Xin".into(), ..Default::default() })
         );
         assert_eq!(parse_sse_line(b"data: [DONE]\n").unwrap(), SseLine::Done);
         assert_eq!(
@@ -953,8 +1144,144 @@ mod tests {
         assert!(parse_sse_line(b"data: {\"error\":{\"message\":\"overloaded\"}}\n").is_err());
         assert_eq!(
             parse_sse_line(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n").unwrap(),
-            SseLine::Usage(Usage { prompt_tokens: 12, completion_tokens: 3 })
+            SseLine::Data(SseData {
+                usage: Some(Usage { prompt_tokens: 12, completion_tokens: 3, cached_tokens: 0 }),
+                ..Default::default()
+            })
         );
+    }
+
+    #[test]
+    fn sse_finish_chunk_with_empty_delta() {
+        // Chunk cuối kiểu OpenAI: delta rỗng, chỉ có finish_reason.
+        assert_eq!(
+            parse_sse_line(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n").unwrap(),
+            SseLine::Data(SseData { finish: Some(Finish::Stop), ..Default::default() })
+        );
+        assert_eq!(
+            parse_sse_line(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n").unwrap(),
+            SseLine::Data(SseData { finish: Some(Finish::Length), ..Default::default() })
+        );
+        // finish_reason: null (các chunk giữa) không tính là đã kết thúc.
+        assert_eq!(
+            parse_sse_line(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":null}]}\n").unwrap(),
+            SseLine::Data(SseData { delta: "a".into(), ..Default::default() })
+        );
+        // Lý do khác (content_filter…) → Stop.
+        assert_eq!(
+            parse_sse_line(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n").unwrap(),
+            SseLine::Data(SseData { finish: Some(Finish::Stop), ..Default::default() })
+        );
+    }
+
+    /// Đẩy cả body SSE qua `StreamAcc` giống `consume_stream` (không cần HTTP).
+    fn run_stream(body: &str) -> (Result<Completion, LlmError>, String) {
+        let mut acc = StreamAcc::default();
+        let mut seen = String::new();
+        let mut on = |s: StreamSignal<'_>| {
+            if let StreamSignal::Delta(d) = s {
+                seen.push_str(d);
+            }
+        };
+        for line in body.split_inclusive('\n') {
+            if acc.push_line(line.as_bytes(), &mut on).unwrap() {
+                break;
+            }
+        }
+        (acc.take_completion(), seen)
+    }
+
+    #[test]
+    fn stream_length_maps_to_length() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"a\\\":\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (c, seen) = run_stream(body);
+        let c = c.unwrap();
+        assert_eq!(c.finish, Finish::Length);
+        assert_eq!(c.text, "{\"a\":");
+        assert_eq!(seen, c.text);
+        assert_eq!(c.usage, Some(Usage { prompt_tokens: 5, completion_tokens: 7, cached_tokens: 0 }));
+    }
+
+    #[test]
+    fn stream_done_without_reason_is_stop() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Xin \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"chào\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let c = run_stream(body).0.unwrap();
+        assert_eq!(c.finish, Finish::Stop);
+        assert_eq!(c.text, "Xin chào");
+        assert_eq!(c.usage, None);
+    }
+
+    #[test]
+    fn stream_closed_without_done() {
+        // Không [DONE], không finish_reason → Error (text có thể thiếu).
+        let c = run_stream("data: {\"choices\":[{\"delta\":{\"content\":\"dở\"}}]}\n").0.unwrap();
+        assert_eq!(c.finish, Finish::Error);
+        assert_eq!(c.text, "dở");
+        // Có finish_reason nhưng proxy không gửi [DONE] → tin finish_reason.
+        let c = run_stream("data: {\"choices\":[{\"delta\":{\"content\":\"xong\"},\"finish_reason\":\"stop\"}]}\n")
+            .0
+            .unwrap();
+        assert_eq!(c.finish, Finish::Stop);
+        // Không có text → vẫn lỗi như cũ.
+        assert!(run_stream("data: [DONE]\n").0.is_err());
+    }
+
+    #[test]
+    fn non_stream_finish_reason() {
+        let c = parse_completion(
+            r#"{"choices":[{"message":{"content":"{\"a\":"},"finish_reason":"length"}],
+                "usage":{"prompt_tokens":9,"completion_tokens":4096}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.finish, Finish::Length);
+        assert_eq!(c.usage, Some(Usage { prompt_tokens: 9, completion_tokens: 4096, cached_tokens: 0 }));
+        let c = parse_completion(r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#).unwrap();
+        assert_eq!(c.finish, Finish::Stop);
+        // Thiếu finish_reason → Stop.
+        let c = parse_completion(r#"{"choices":[{"message":{"content":"ok"}}]}"#).unwrap();
+        assert_eq!(c.finish, Finish::Stop);
+    }
+
+    #[test]
+    fn cached_tokens_are_parsed_and_summed() {
+        let c = parse_completion(
+            r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":100,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":64}}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.usage, Some(Usage { prompt_tokens: 100, completion_tokens: 7, cached_tokens: 64 }));
+        // details = null / thiếu cached_tokens → 0; cached > prompt → kẹp lại.
+        let u: Usage = serde_json::from_str(r#"{"prompt_tokens":5,"completion_tokens":1,"prompt_tokens_details":null}"#).unwrap();
+        assert_eq!(u.cached_tokens, 0);
+        let u: Usage = serde_json::from_str(r#"{"prompt_tokens":5,"prompt_tokens_details":{"cached_tokens":9}}"#).unwrap();
+        assert_eq!((u.cached_tokens, u.completion_tokens), (5, 0));
+        // Chunk usage cuối của stream cũng đọc được cache.
+        let s = run_stream(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n\
+             data: [DONE]\n\n",
+        )
+        .0
+        .unwrap();
+        assert_eq!(s.usage.map(|u| u.cached_tokens), Some(4));
+        let sum = sum_usage(s.usage, c.usage).unwrap();
+        assert_eq!((sum.prompt_tokens, sum.cached_tokens, sum.completion_tokens), (110, 68, 9));
+    }
+
+    #[test]
+    fn bumped_max_tokens_caps() {
+        assert_eq!(bumped_max_tokens(DEFAULT_OUTPUT_TOKENS), 6144);
+        assert_eq!(bumped_max_tokens(1001), 1502); // ceil(1501.5)
+        assert_eq!(bumped_max_tokens(30_000), OUTPUT_TOKENS_CAP);
     }
 
     #[test]
@@ -968,7 +1295,7 @@ mod tests {
         assert_eq!(t.tool_calls.len(), 1);
         assert_eq!(t.tool_calls[0].name, "read_file");
         assert_eq!(t.tool_calls[0].arguments, r#"{"path":"README.md"}"#);
-        assert_eq!(t.usage, Some(Usage { prompt_tokens: 50, completion_tokens: 5 }));
+        assert_eq!(t.usage, Some(Usage { prompt_tokens: 50, completion_tokens: 5, cached_tokens: 0 }));
         assert!(t.content.is_none());
         assert_eq!(t.assistant_message["tool_calls"][0]["id"], "c1");
 

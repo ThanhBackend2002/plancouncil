@@ -551,5 +551,9 @@ pub fn default_meeting() -> MeetingConfig {
         dynamic_membership: true,
         max_invites: 2,
         section_routing: true,
+        max_total_tokens: None,
+        revise_mode: crate::config::ReviseMode::Full,
+        section_mode_max_ratio: 0.5,
+        consistency_checker: crate::config::CONSISTENCY_CHECKER_AUTHOR.into(),
     }
 }

@@ -49,9 +49,26 @@ plancouncil/
 # Windows 11: WebView2 có sẵn; cần MSVC Build Tools
 npm install
 npm run tauri dev
-cd src-tauri && cargo test     # 63 test, gồm mock LLM server cho toàn bộ vòng lặp
+npm run verify                 # cargo test + clippy + vitest + tsc
 ```
+
+## Build bộ cài
+
+Mỗi OS build trên chính OS đó (Tauri không cross-compile ổn định):
+
+| OS | Lệnh | Kết quả trong `src-tauri/target/.../release/bundle/` |
+|---|---|---|
+| macOS (máy đang dùng) | `npm run build:mac` | `macos/PlanCouncil.app`, `dmg/*.dmg` |
+| macOS (Intel + Apple Silicon) | `rustup target add x86_64-apple-darwin aarch64-apple-darwin` rồi `npm run build:mac:universal` | `universal-apple-darwin/release/bundle/dmg/*.dmg` |
+| Windows 11 | `npm run build:win` (cần MSVC Build Tools) | `nsis/*-setup.exe`, `msi/*.msi` |
+| Ubuntu | cài gói ở mục Chạy (+ `libgtk-3-dev libxdo-dev patchelf`) rồi `npm run build:linux` | `deb/*.deb`, `rpm/*.rpm`, `appimage/*.AppImage` |
+
+**Build cả 3 OS cùng lúc:** push code lên GitHub → tab Actions → **Build apps** → Run workflow (hoặc push tag `v0.1.0`). Bộ cài nằm ở mục Artifacts của lần chạy.
+
+Bộ cài **chưa ký số**:
+- macOS: lần đầu mở bằng chuột phải → Open, hoặc `xattr -cr /Applications/PlanCouncil.app`. Bản chưa ký sẽ hỏi lại quyền Keychain sau mỗi lần cài bản mới.
+- Windows: SmartScreen cảnh báo → More info → Run anyway.
 
 **WSL (Ubuntu) với `node_modules` cài từ Windows:** chạy `npm run build` bên Windows, rồi trong WSL chạy `bash scripts/wsl-run.sh` (build Rust ở `~/.cache/plancouncil-target`, nhúng sẵn `dist/`, mở cửa sổ qua WSLg).
 
-Dữ liệu: `~/.config/plancouncil/` (Linux) · `%APPDATA%\plancouncil\` (Windows). Log: thư mục log của app (tauri-plugin-log).
+Dữ liệu: `~/.config/plancouncil/` (Linux) · `%APPDATA%\plancouncil\` (Windows) · `~/Library/Application Support/plancouncil/` (macOS). Log: thư mục log của app (tauri-plugin-log).

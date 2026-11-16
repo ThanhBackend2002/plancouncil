@@ -1,7 +1,8 @@
 import { create } from "zustand";
-import { MAIN_SCOPE, type EventEnvelope, type SessionOptions, type SessionRecord } from "../lib/contracts";
+import { useShallow } from "zustand/react/shallow";
+import { MAIN_SCOPE, type CommandError, type EventEnvelope, type SessionOptions, type SessionRecord } from "../lib/contracts";
 import { ipc } from "../lib/ipc";
-import { applyEvent, fromRecord, initialSession, isTerminal, type SessionState } from "./session";
+import { applyEvent, fromRecord, initialSession, isTerminal, planText, type PlanView, type SessionState } from "./session";
 import { toast, toastError } from "./toast";
 
 /** "auto" = tự chọn scope đáng xem (phòng ban đang họp → cuộc họp chính khi tới lượt). */
@@ -19,6 +20,11 @@ interface CouncilStore {
   nextOptions: SessionOptions | null;
   starting: boolean;
   stopping: boolean;
+  /** Lỗi `secret_missing` của lần start gần nhất (banner "Thiếu API key"); null nếu không có. */
+  startError: CommandError | null;
+  clearStartError: () => void;
+  /** Chuyển sang xem 1 phiên MỚI vừa được backend tạo (chạy tiếp / bắt đầu lại): coi như phiên live đang chạy. */
+  adoptSession: (id: string, prompt?: string) => void;
   ingest: (env: EventEnvelope) => void;
   start: (prompt: string) => Promise<boolean>;
   stop: () => Promise<void>;
@@ -39,6 +45,16 @@ export const useCouncil = create<CouncilStore>((set, get) => ({
   nextOptions: null,
   starting: false,
   stopping: false,
+  startError: null,
+  clearStartError: () => set({ startError: null }),
+  adoptSession: (id, prompt = "") =>
+    set((st) => ({
+      // Event của phiên mới có thể đã tới trước khi lệnh trả về → không ghi đè state đã dựng.
+      live: st.live.id === id ? st.live : { ...initialSession(), id, prompt, status: "running" },
+      viewing: null,
+      scope: "auto",
+      startError: null,
+    })),
 
   ingest: (env) => {
     const prev = get().live;
@@ -53,13 +69,15 @@ export const useCouncil = create<CouncilStore>((set, get) => ({
 
   start: async (prompt) => {
     if (get().live.status === "running" || get().starting) return false;
-    set({ starting: true, live: initialSession(), viewing: null, scope: "auto" });
+    set({ starting: true, live: initialSession(), viewing: null, scope: "auto", startError: null });
     try {
       const id = await ipc.startCouncil(prompt, get().nextDepartments ?? undefined, get().nextOptions ?? undefined);
       const cur = get().live;
       if (cur.id === null) set({ live: { ...cur, id, status: "running", prompt } });
       return true;
     } catch (e) {
+      const err = e as Partial<CommandError> | null;
+      if (err && err.kind === "secret_missing") set({ startError: e as CommandError });
       toastError(e);
       return false;
     } finally {
@@ -110,7 +128,29 @@ export const useCouncil = create<CouncilStore>((set, get) => ({
   setNextOptions: (o) => set({ nextOptions: o }),
 }));
 
-export const useActiveSession = () => useCouncil((s) => s.viewing ?? s.live);
+/** Phiên đang hiển thị: phiên cũ đang xem hoặc phiên live. */
+export const activeOf = (s: Pick<CouncilStore, "live" | "viewing">): SessionState => s.viewing ?? s.live;
+
+/**
+ * Lấy cả phiên → re-render theo MỌI event (kể cả từng plan_delta). Chỉ dùng khi thật cần;
+ * component nên dùng `useActive` / `useActiveShallow` với selector hẹp.
+ */
+export const useActiveSession = () => useCouncil(activeOf);
+
+/** Selector hẹp trên phiên đang hiển thị. Selector phải trả giá trị nguyên thuỷ hoặc tham chiếu có sẵn trong state. */
+export function useActive<T>(sel: (s: SessionState) => T): T {
+  return useCouncil((s) => sel(activeOf(s)));
+}
+
+/** Như `useActive` nhưng so sánh nông → selector được trả object/mảng mới gom từ các field. */
+export function useActiveShallow<T>(sel: (s: SessionState) => T): T {
+  return useCouncil(useShallow((s: CouncilStore) => sel(activeOf(s))));
+}
+
+/** Text hiện hành của 1 plan (kể cả bản nháp đang stream). Chỉ component hiển thị text mới nên dùng. */
+export function usePlanText(scopeId: string, plan: PlanView | undefined): string {
+  return useActive((s) => (plan ? planText(s, scopeId, plan) : ""));
+}
 
 /** Scope thực sự hiển thị. "auto": cuộc họp chính nếu đã bắt đầu/kết thúc, ngược lại phòng ban đầu tiên còn đang họp. */
 export function resolveScope(s: SessionState, sel: ScopeSelection): string {

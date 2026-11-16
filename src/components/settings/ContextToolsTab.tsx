@@ -4,7 +4,21 @@ import type { AppConfig, SearchHit, ToolPolicy, WebSearchProvider, Workspace } f
 import { ipc, isCommandError } from "../../lib/ipc";
 import { toastError } from "../../store/toast";
 import { Button, Panel, cx } from "../ui";
-import { Field, INPUT, KeyInput, NumberInput, SectionTitle, TextArea, TextInput, Toggle, newId, type Errors } from "./fields";
+import {
+  Field,
+  INPUT,
+  KeyInput,
+  NumberInput,
+  SecretControls,
+  SectionTitle,
+  TextArea,
+  TextInput,
+  Toggle,
+  findStatus,
+  newId,
+  useSecretStatus,
+  type Errors,
+} from "./fields";
 
 const CONTEXT_TEMPLATE = `## Tech stack bắt buộc
 - Backend: (vd. Go 1.22, gRPC, PostgreSQL 16, Redis)
@@ -49,6 +63,7 @@ export function ContextToolsTab({
   dirty: boolean;
   update: (f: (c: AppConfig) => AppConfig) => void;
 }) {
+  const secrets = useSecretStatus(saved);
   const set = (patch: Partial<AppConfig>) => update((c) => ({ ...c, ...patch }));
   const setWeb = (patch: Partial<AppConfig["web_search"]>) => update((c) => ({ ...c, web_search: { ...c.web_search, ...patch } }));
   const setCtx = (patch: Partial<AppConfig["company_context"]>) =>
@@ -100,11 +115,11 @@ export function ContextToolsTab({
             onChange={(v) => setCtx({ enabled_by_default: v })}
             label="Mặc định áp dụng cho phiên mới"
           />
-          <span className={cx("ml-auto tabular-nums", ctxLen > 20_000 ? "text-red-400" : "text-neutral-600")}>
+          <span className={cx("ml-auto tabular-nums", ctxLen > 20_000 ? "text-danger" : "text-fg-faint")}>
             {ctxLen.toLocaleString("vi-VN")}/20.000 · ~{Math.ceil(ctxLen / 3).toLocaleString("vi-VN")} token mỗi lần gọi
           </span>
         </div>
-        {errors["context.text"] && <p className="mt-1 text-xs text-red-400">{errors["context.text"]}</p>}
+        {errors["context.text"] && <p className="mt-1 text-xs text-danger">{errors["context.text"]}</p>}
       </Panel>
 
       <Panel className="p-4">
@@ -123,7 +138,7 @@ export function ContextToolsTab({
                 <TextInput value={w.name} onChange={(v) => setWs(w.id, { name: v })} />
               </Field>
               <Field label="Đường dẫn">
-                <input readOnly value={w.path} title={w.path} className={cx(INPUT, "font-mono text-[12px] text-neutral-400")} />
+                <input readOnly value={w.path} title={w.path} className={cx(INPUT, "font-mono text-[12px] text-fg-muted")} />
               </Field>
               <Button icon={<FolderOpen className="size-3.5" />} onClick={() => void pick(w.id)}>
                 Đổi
@@ -137,11 +152,11 @@ export function ContextToolsTab({
             </div>
           ))}
           {draft.workspaces.length === 0 && (
-            <p className="py-3 text-center text-xs text-neutral-500">Chưa có workspace. Chọn workspace cho từng phiên ở màn Phòng họp.</p>
+            <p className="py-3 text-center text-xs text-fg-subtle">Chưa có workspace. Chọn workspace cho từng phiên ở màn Phòng họp.</p>
           )}
         </div>
-        <p className="mt-3 flex items-start gap-1.5 text-[11px] text-neutral-500">
-          <ShieldCheck className="mt-px size-3.5 shrink-0 text-emerald-500" />
+        <p className="mt-3 flex items-start gap-1.5 text-[11px] text-fg-subtle">
+          <ShieldCheck className="mt-px size-3.5 shrink-0 text-success-solid" />
           Nội dung file được đọc sẽ được gửi tới provider model của role đó. Đừng cấp quyền thư mục chứa dữ liệu bạn không muốn chia sẻ với provider.
         </p>
       </Panel>
@@ -164,6 +179,15 @@ export function ContextToolsTab({
                 value={web.api_key}
                 saved={saved.web_search.provider === web.provider ? saved.web_search.api_key : null}
                 onChange={(v) => setWeb({ api_key: v })}
+              />
+              <SecretControls
+                target={{ kind: "websearch", id: web.provider }}
+                status={findStatus(secrets.report, { kind: "websearch", id: web.provider })}
+                secretsFile={secrets.report?.secrets_file}
+                value={web.api_key}
+                canStore={saved.web_search.provider === web.provider}
+                update={update}
+                refresh={secrets.refresh}
               />
             </Field>
           )}
@@ -193,11 +217,11 @@ export function ContextToolsTab({
               onClick={() => set({ tool_policy: p.id })}
               className={cx(
                 "rounded-lg border px-3 py-2 text-left",
-                draft.tool_policy === p.id ? "border-violet-500/60 bg-violet-500/10" : "border-neutral-800 hover:border-neutral-600",
+                draft.tool_policy === p.id ? "border-accent/60 bg-accent/10" : "border-line hover:border-line-heavy",
               )}
             >
-              <div className="text-sm font-medium text-neutral-100">{p.label}</div>
-              <div className="mt-0.5 text-[11px] text-neutral-500">{p.desc}</div>
+              <div className="text-sm font-medium text-fg">{p.label}</div>
+              <div className="mt-0.5 text-[11px] text-fg-subtle">{p.desc}</div>
             </button>
           ))}
         </div>
@@ -206,7 +230,7 @@ export function ContextToolsTab({
             <NumberInput value={draft.max_tool_steps} onChange={(v) => set({ max_tool_steps: v ?? Number.NaN })} />
           </Field>
         </div>
-        <p className="mt-2 text-[11px] text-neutral-500">
+        <p className="mt-2 text-[11px] text-fg-subtle">
           Model cần hỗ trợ tool calling (OpenAI function calling). Model không hỗ trợ sẽ tự bỏ qua bước nghiên cứu, vẫn họp bình thường.
         </p>
       </Panel>
@@ -234,10 +258,10 @@ function WebTest({ dirty }: { dirty: boolean }) {
   };
 
   return (
-    <div className="mt-4 rounded-md border border-neutral-800 bg-neutral-950/50 p-3">
+    <div className="mt-4 rounded-md border border-line bg-canvas/50 p-3">
       <div className="flex gap-2">
         <div className="relative flex-1">
-          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-neutral-500" />
+          <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-fg-subtle" />
           <input value={query} onChange={(e) => setQuery(e.target.value)} className={cx(INPUT, "pl-8")} />
         </div>
         <Button
@@ -250,22 +274,22 @@ function WebTest({ dirty }: { dirty: boolean }) {
         </Button>
       </div>
       {error && (
-        <p className="mt-2 flex items-start gap-1.5 text-xs text-red-300">
+        <p className="mt-2 flex items-start gap-1.5 text-xs text-danger">
           <CircleX className="mt-px size-3.5 shrink-0" />
           {error}
         </p>
       )}
       {hits && (
         <ul className="mt-2 space-y-1.5 text-xs">
-          {hits.length === 0 && <li className="text-neutral-500">Không có kết quả.</li>}
+          {hits.length === 0 && <li className="text-fg-subtle">Không có kết quả.</li>}
           {hits.map((h, i) => (
             <li key={i}>
-              <div className="flex items-center gap-1 text-neutral-200">
-                <ExternalLink className="size-3 shrink-0 text-neutral-500" />
+              <div className="flex items-center gap-1 text-fg">
+                <ExternalLink className="size-3 shrink-0 text-fg-subtle" />
                 <span className="truncate font-medium">{h.title}</span>
               </div>
-              <div className="truncate font-mono text-[10px] text-sky-400/80">{h.url}</div>
-              <div className="line-clamp-2 text-neutral-500">{h.snippet}</div>
+              <div className="truncate font-mono text-[10px] text-info/80">{h.url}</div>
+              <div className="line-clamp-2 text-fg-subtle">{h.snippet}</div>
             </li>
           ))}
         </ul>

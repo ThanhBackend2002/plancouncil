@@ -1,4 +1,4 @@
-import type { AppConfig, PlanDepth, RoleId, StaffingMode } from "../../lib/contracts";
+import type { AppConfig, PlanDepth, ReviseMode, RoleId, StaffingMode } from "../../lib/contracts";
 import { Button, Panel, cx } from "../ui";
 import { Field, INPUT, NumberInput, RoleChips, RoleSelect, SectionTitle, Toggle, type Errors } from "./fields";
 
@@ -59,11 +59,11 @@ export function MeetingTab({
                 onClick={() => setMeeting({ chair_id: p.chair, reviewer_ids: reviewers })}
                 className={cx(
                   "rounded-lg border px-3 py-2 text-left transition-colors disabled:opacity-40",
-                  active ? "border-violet-500/60 bg-violet-500/10" : "border-neutral-800 hover:border-neutral-600",
+                  active ? "border-accent/60 bg-accent/10" : "border-line hover:border-line-heavy",
                 )}
               >
-                <div className="text-sm font-medium text-neutral-100">{p.name}</div>
-                <div className="text-[11px] text-neutral-500">{p.desc}</div>
+                <div className="text-sm font-medium text-fg">{p.name}</div>
+                <div className="text-[11px] text-fg-subtle">{p.desc}</div>
               </button>
             );
           })}
@@ -111,19 +111,19 @@ export function MeetingTab({
                     }
                     className={cx(
                       "rounded-full border px-2.5 py-1 text-xs",
-                      on ? "border-violet-500/60 bg-violet-500/15 text-violet-200" : "border-neutral-700 text-neutral-400 hover:text-neutral-200",
+                      on ? "border-accent/60 bg-accent-subtle text-accent-fg" : "border-line-strong text-fg-muted hover:text-fg-soft",
                     )}
                   >
                     {d.name}
                   </button>
                 );
               })}
-              {draft.departments.length === 0 && <span className="text-xs text-neutral-500">Chưa có phòng ban.</span>}
+              {draft.departments.length === 0 && <span className="text-xs text-fg-subtle">Chưa có phòng ban.</span>}
             </div>
           </Field>
         </div>
         {m.reviewer_ids.length > 6 && (
-          <p className="mt-3 text-[11px] text-amber-400">
+          <p className="mt-3 text-[11px] text-warn">
             Nhiều reviewer = nhiều request mỗi vòng. Cân nhắc giới hạn song song ở tab Chung để tránh lỗi 429.
           </p>
         )}
@@ -148,11 +148,11 @@ export function MeetingTab({
               onClick={() => setMeeting({ staffing: s.id })}
               className={cx(
                 "rounded-lg border px-3 py-2 text-left",
-                m.staffing === s.id ? "border-violet-500/60 bg-violet-500/10" : "border-neutral-800 hover:border-neutral-600",
+                m.staffing === s.id ? "border-accent/60 bg-accent/10" : "border-line hover:border-line-heavy",
               )}
             >
-              <div className="text-sm font-medium text-neutral-100">{s.label}</div>
-              <div className="mt-0.5 text-[11px] text-neutral-500">{s.desc}</div>
+              <div className="text-sm font-medium text-fg">{s.label}</div>
+              <div className="mt-0.5 text-[11px] text-fg-subtle">{s.desc}</div>
             </button>
           ))}
         </div>
@@ -189,6 +189,50 @@ export function MeetingTab({
             <Toggle checked={m.section_routing} onChange={(v) => setMeeting({ section_routing: v })} label="Bật (tiết kiệm token)" />
           </Field>
         </div>
+        <div className="mt-4 grid grid-cols-3 gap-4">
+          <Field label="Cách chỉnh sửa plan" hint="Từ vòng 2: chỉ viết lại section reviewer nêu + Changelog, phần còn lại giữ nguyên">
+            <select
+              value={m.revise_mode ?? "full"}
+              onChange={(e) => setMeeting({ revise_mode: e.target.value as ReviseMode })}
+              className={INPUT}
+            >
+              <option value="full">Viết lại toàn bộ (mặc định)</option>
+              <option value="auto">Tự động — sửa theo section, quay về toàn bộ khi cần</option>
+              <option value="section">Theo section — chỉ quay về toàn bộ khi patch hỏng</option>
+            </select>
+          </Field>
+          <Field label="Tỉ lệ tối đa phần cần sửa" error={errors["meeting.section_mode_max_ratio"]} hint="Chế độ Tự động: phần cần sửa vượt tỉ lệ này → viết lại toàn bộ">
+            <select
+              value={String(m.section_mode_max_ratio ?? 0.5)}
+              onChange={(e) => setMeeting({ section_mode_max_ratio: Number(e.target.value) })}
+              disabled={m.revise_mode !== "auto"}
+              className={INPUT}
+            >
+              {RATIOS.map((r) => (
+                <option key={r} value={String(r)}>
+                  {Math.round(r * 100)}% plan
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Người kiểm tra nhất quán" hint="Đọc plan đã ghép, tìm mâu thuẫn giữa các section trước khi kết luận hội tụ">
+            <select
+              value={m.consistency_checker ?? "author"}
+              onChange={(e) => setMeeting({ consistency_checker: e.target.value })}
+              disabled={(m.revise_mode ?? "full") === "full"}
+              className={INPUT}
+            >
+              <option value="author">Người viết plan</option>
+              {draft.roles
+                .filter((r) => m.reviewer_ids.includes(r.id) || r.id === m.consistency_checker)
+                .map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name}
+                  </option>
+                ))}
+            </select>
+          </Field>
+        </div>
       </Panel>
     </div>
   );
@@ -199,3 +243,5 @@ const STAFFING: { id: StaffingMode; label: string; desc: string }[] = [
   { id: "suggest", label: "Đề xuất rồi duyệt", desc: "AI đề xuất kèm lý do, bạn bật/tắt rồi mới họp. Khuyên dùng." },
   { id: "auto", label: "Tự động", desc: "AI chọn rồi họp luôn, lý do hiện trong phiên." },
 ];
+
+const RATIOS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1];
