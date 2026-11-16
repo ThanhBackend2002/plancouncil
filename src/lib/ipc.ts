@@ -6,6 +6,7 @@ import type {
   RoleId,
   CommandError,
   ConnectionTestResult,
+  HistorySearchHit,
   ModelHealth,
   ModelList,
   RoleDef,
@@ -23,6 +24,8 @@ const KINDS: ReadonlySet<CommandError["kind"]> = new Set([
   "storage",
   "llm",
   "internal",
+  "index_unavailable",
+  "index",
 ]);
 
 export function toCommandError(e: unknown): CommandError {
@@ -78,6 +81,9 @@ export const ipc = {
   listSessions: (limit?: number) => call<SessionSummary[]>("list_sessions", { limit }),
   loadSession: (sessionId: string) => call<SessionRecord>("load_session", { sessionId }),
   deleteSession: (sessionId: string) => call<boolean>("delete_session", { sessionId }),
+  /** Tìm trong lịch sử, không phân biệt dấu. Câu rỗng → []. */
+  searchHistory: (query: string, limit?: number, offset?: number) =>
+    call<HistorySearchHit[]>("search_history", { query, limit, offset }),
   testConnection: (agent: RoleId) => call<ConnectionTestResult>("test_connection", { agent }),
   /** `baseUrl`/`apiKey` cho phép thử provider đang sửa dở; bỏ trống = dùng bản đã lưu. */
   listModels: (providerId: string, baseUrl?: string, apiKey?: string | null) =>

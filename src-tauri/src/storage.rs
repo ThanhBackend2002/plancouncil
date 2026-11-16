@@ -56,9 +56,14 @@ impl Storage {
         self.root.join(CONFIG_FILE)
     }
 
-    fn session_path(&self, id: Uuid) -> PathBuf {
+    /// Thư mục chứa các file `<uuid>.json`.
+    pub fn sessions_dir(&self) -> PathBuf {
+        self.root.join(SESSIONS_DIR)
+    }
+
+    pub fn session_path(&self, id: Uuid) -> PathBuf {
         // `id` là Uuid đã parse → không thể path traversal.
-        self.root.join(SESSIONS_DIR).join(format!("{id}.json"))
+        self.sessions_dir().join(format!("{id}.json"))
     }
 
     /// Không bao giờ fail: file thiếu → default; file hỏng → backup rồi default;
@@ -131,28 +136,29 @@ impl Storage {
         }
     }
 
-    /// O(n) file đọc mỗi lần list — chấp nhận được tới vài trăm phiên.
-    /// Long-term: index file hoặc SQLite (xem trade-off trong README).
+    /// O(n) file đọc mỗi lần list — đường dự phòng khi index SQLite (`search_index`) chưa sẵn sàng.
+    /// Thứ tự: mới nhất trước, trùng `created_at` thì theo id tăng dần (giống `SearchIndex::list`).
     pub fn list_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>, StorageError> {
-        let dir = self.root.join(SESSIONS_DIR);
         let mut out = Vec::new();
-        for entry in fs::read_dir(&dir)? {
+        for entry in fs::read_dir(self.sessions_dir())? {
             let path = entry?.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || !path.is_file() {
                 continue;
             }
-            match fs::read(&path)
-                .map_err(StorageError::from)
-                .and_then(|b| serde_json::from_slice::<SessionRecord>(&b).map_err(Into::into))
-            {
+            match read_session_file(&path) {
                 Ok(rec) => out.push(rec.summary()),
                 Err(e) => log::warn!("bỏ qua session hỏng {}: {e}", path.display()),
             }
         }
-        out.sort_by_key(|s| std::cmp::Reverse(s.created_at));
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
         out.truncate(limit);
         Ok(out)
     }
+}
+
+/// Đọc + parse 1 file phiên (dùng chung cho `list_sessions` và đồng bộ index).
+pub fn read_session_file(path: &Path) -> Result<SessionRecord, StorageError> {
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
 /// tmp (cùng thư mục) → fsync → rename. `rename` thay thế file đích atomically trên

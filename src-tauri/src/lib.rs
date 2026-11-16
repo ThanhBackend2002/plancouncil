@@ -4,16 +4,14 @@ mod config;
 #[allow(dead_code)]
 mod context_builder;
 mod health;
+mod history;
 mod llm_client;
 mod models;
-// Chưa nối vào command — module index tìm kiếm (SQLite) đang được xây riêng.
-#[allow(dead_code)]
 mod normalize;
 mod orchestrator;
 mod prompts;
 mod roster;
 mod routing;
-#[allow(dead_code)]
 mod search_index;
 #[allow(dead_code)]
 mod sections;
@@ -34,6 +32,7 @@ use uuid::Uuid;
 use config::{api_root, AppConfig, SessionOptions, MASK_PREFIX};
 use llm_client::{ChatMessage, Expect, LlmClient, LlmError};
 use models::{EventEnvelope, SessionRecord, SessionSummary, COUNCIL_EVENT};
+use history::{HistoryError, HistoryIndex};
 use orchestrator::{ControlAction, Council, EventSink, MeetingControl, SessionExtras};
 use storage::{Storage, StorageError};
 
@@ -53,6 +52,8 @@ struct ActiveSession {
 pub struct AppState {
     config: tokio::sync::RwLock<AppConfig>,
     storage: Storage,
+    /// Index SQLite cho lịch sử (`Option<Arc<SearchIndex>>` bên trong); None nếu mở lỗi.
+    history: HistoryIndex,
     http: reqwest::Client,
     /// v1: 1 phiên tại 1 thời điểm (tránh tự DDoS quota provider). Đổi thành HashMap nếu cần multi-session.
     active: Mutex<Option<ActiveSession>>,
@@ -101,6 +102,8 @@ pub enum CommandError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Llm(#[from] LlmError),
+    #[error(transparent)]
+    History(#[from] HistoryError),
     #[error("lỗi nội bộ: {0}")]
     Internal(String),
 }
@@ -118,6 +121,8 @@ impl Serialize for CommandError {
             CommandError::Storage(StorageError::NotFound(_)) => "not_found",
             CommandError::Storage(_) => "storage",
             CommandError::Llm(_) => "llm",
+            CommandError::History(HistoryError::Unavailable) => "index_unavailable",
+            CommandError::History(HistoryError::Index(_)) => "index",
             CommandError::Internal(_) => "internal",
         };
         Wire {
@@ -287,6 +292,7 @@ async fn start_council(
         extras,
     );
     let storage = state.storage.clone();
+    let history = state.history.clone();
 
     tauri::async_runtime::spawn(async move {
         let guard = ActiveGuard {
@@ -296,7 +302,7 @@ async fn start_council(
         let record = council.run(prompt).await;
         drop(guard); // giải phóng slot ngay khi họp xong, trước khi I/O persist
 
-        let ok = match tauri::async_runtime::spawn_blocking(move || storage.save_session(&record))
+        let ok = match tauri::async_runtime::spawn_blocking(move || history.save_session(&storage, &record))
             .await
         {
             Ok(Ok(())) => true,
@@ -397,8 +403,25 @@ async fn list_sessions(
     limit: Option<usize>,
 ) -> CmdResult<Vec<SessionSummary>> {
     let storage = state.storage.clone();
+    let history = state.history.clone();
     let limit = limit.unwrap_or(100).clamp(1, 500);
-    blocking(move || storage.list_sessions(limit)).await
+    blocking(move || history.list_sessions(&storage, limit)).await
+}
+
+/// Tìm trong lịch sử (không phân biệt dấu / hoa thường). Câu rỗng → `[]`;
+/// không có index → lỗi `index_unavailable`.
+#[tauri::command]
+async fn search_history(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> CmdResult<Vec<search_index::SearchHit>> {
+    let history = state.history.clone();
+    tauri::async_runtime::spawn_blocking(move || history.search(&query, limit, offset))
+        .await
+        .map_err(|e| CommandError::Internal(e.to_string()))?
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -418,7 +441,8 @@ async fn delete_session(state: State<'_, AppState>, session_id: Uuid) -> CmdResu
         ));
     }
     let storage = state.storage.clone();
-    blocking(move || storage.delete_session(session_id)).await
+    let history = state.history.clone();
+    blocking(move || history.delete_session(&storage, session_id)).await
 }
 
 #[derive(Serialize)]
@@ -672,9 +696,29 @@ pub fn run() {
             let storage = Storage::new()?;
             let config = storage.load_config();
             log::info!("PlanCouncil data dir: {}", storage.root().display());
+            let history = HistoryIndex::open(&storage);
+            {
+                // Đồng bộ index nền — không chặn khởi động; trong lúc chờ, list_sessions quét file.
+                let (history, storage) = (history.clone(), storage.clone());
+                tauri::async_runtime::spawn(async move {
+                    let t0 = Instant::now();
+                    match tauri::async_runtime::spawn_blocking(move || history.sync(&storage)).await {
+                        Ok(Some(r)) => log::info!(
+                            "sync index: {} index lại, {} xoá, {} lỗi ({} ms)",
+                            r.indexed,
+                            r.removed,
+                            r.failed.len(),
+                            t0.elapsed().as_millis()
+                        ),
+                        Ok(None) => {}
+                        Err(e) => log::error!("task sync index panic: {e}"),
+                    }
+                });
+            }
             app.manage(AppState {
                 config: tokio::sync::RwLock::new(config),
                 storage,
+                history,
                 http: llm_client::build_http_client()?,
                 active: Mutex::new(None),
             });
@@ -689,6 +733,7 @@ pub fn run() {
             list_sessions,
             load_session,
             delete_session,
+            search_history,
             test_connection,
             list_models,
             default_roles,
