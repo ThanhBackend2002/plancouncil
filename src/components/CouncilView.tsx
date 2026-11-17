@@ -3,6 +3,8 @@ import { MAIN_SCOPE } from "../lib/contracts";
 import { activeOf, resolveScope, useActive, useActiveShallow, useCouncil } from "../store/council";
 import { useConfig, useResolver } from "../store/config";
 import { initialSession, mainOf, type ScopeState } from "../store/session";
+import { useUi } from "../store/ui";
+import { Building } from "./Building";
 import { MeetingRoom } from "./MeetingRoom";
 import { MemberControls } from "./MemberControls";
 import { PlanViewer } from "./PlanViewer";
@@ -37,6 +39,11 @@ export function CouncilView() {
     return base;
   }, [found, status, id, config]);
   const title = scope.id === MAIN_SCOPE ? "HỌP CHÍNH" : scope.name.toUpperCase();
+  const roomView = useUi((s) => s.roomView);
+  const setRoomView = useUi((s) => s.setRoomView);
+  const setScope = useCouncil((s) => s.setScope);
+  // Chưa có phiên: toà nhà vẽ cuộc họp chính theo bản xem trước của cấu hình.
+  const mainPreview = status === "idle" && !id && scope.id === MAIN_SCOPE ? scope : null;
 
   return (
     <div className="grid h-full grid-cols-[minmax(440px,2fr)_3fr] gap-3 p-3">
@@ -46,12 +53,27 @@ export function CouncilView() {
         <ScopeBar active={scope.id} />
         {/* data-scene: đánh dấu cảnh pixel (luôn tối, dùng palette Tailwind gốc, không dùng token). */}
         <div data-scene className="contents">
-          <MeetingRoom
-            scope={scope}
-            resolve={resolve}
-            title={title}
-            idleCaption={status === "idle" ? "PHÒNG HỌP TRỐNG" : undefined}
-          />
+          {roomView === "building" ? (
+            <Building
+              resolve={resolve}
+              mainOverride={mainPreview}
+              activeId={scope.id}
+              sessionKey={id ?? "preview"}
+              onEnter={(sid) => {
+                setScope(sid);
+                setRoomView("room");
+              }}
+              onRoomView={() => setRoomView("room")}
+            />
+          ) : (
+            <MeetingRoom
+              scope={scope}
+              resolve={resolve}
+              title={title}
+              idleCaption={status === "idle" ? "PHÒNG HỌP TRỐNG" : undefined}
+              onBuilding={() => setRoomView("building")}
+            />
+          )}
         </div>
         <MemberControls scope={scope} resolve={resolve} />
         <ProgressBar />

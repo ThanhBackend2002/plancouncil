@@ -90,6 +90,7 @@ export function ContextToolsTab({
   const web = draft.web_search;
   const provider = PROVIDERS.find((p) => p.id === web.provider);
 
+  const unlimited = draft.max_tool_steps === 0;
   return (
     <div className="space-y-4">
       <Panel className="p-4">
@@ -225,11 +226,36 @@ export function ContextToolsTab({
             </button>
           ))}
         </div>
-        <div className="mt-3 w-60">
-          <Field label="Số lần gọi công cụ tối đa / lần nghiên cứu" error={errors["context.max_tool_steps"]} hint="1–12">
-            <NumberInput value={draft.max_tool_steps} onChange={(v) => set({ max_tool_steps: v ?? Number.NaN })} />
-          </Field>
+        <div className="mt-3 flex flex-wrap items-end gap-4">
+          <div className="w-60">
+            <Field
+              label="Số lần gọi công cụ tối đa / lần nghiên cứu"
+              error={unlimited ? undefined : errors["context.max_tool_steps"]}
+              hint={unlimited ? "Không giới hạn" : "1–12"}
+            >
+              {unlimited ? (
+                <div className="flex h-8 items-center rounded-control border border-line bg-surface-2/50 px-2.5 text-sm text-fg-muted">∞</div>
+              ) : (
+                <NumberInput value={draft.max_tool_steps} onChange={(v) => set({ max_tool_steps: v ?? Number.NaN })} />
+              )}
+            </Field>
+          </div>
+          <label className="mb-1.5 inline-flex cursor-pointer items-center gap-2 text-sm text-fg-soft">
+            <input
+              type="checkbox"
+              checked={unlimited}
+              onChange={(e) => set({ max_tool_steps: e.target.checked ? 0 : 6 })}
+              className="accent-[var(--accent)]"
+            />
+            Không giới hạn
+          </label>
         </div>
+        {unlimited && (
+          <p className="mt-2 rounded-control border border-warn-line bg-warn-subtle px-2.5 py-1.5 text-[11px] text-warn">
+            Model nghiên cứu tới khi tự thấy đủ (ghi chú tối đa ~600 từ) — hợp với plan cần tìm hiểu sâu nhưng tốn thêm thời gian và token.
+            Vẫn dừng khi bấm Stop, hết ngân sách token của phiên, hoặc khi phần đã đọc quá dài (~100k token) để không vượt ngữ cảnh của model.
+          </p>
+        )}
         <p className="mt-2 text-[11px] text-fg-subtle">
           Model cần hỗ trợ tool calling (OpenAI function calling). Model không hỗ trợ sẽ tự bỏ qua bước nghiên cứu, vẫn họp bình thường.
         </p>

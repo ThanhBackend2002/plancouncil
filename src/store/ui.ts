@@ -3,6 +3,8 @@ import { create } from "zustand";
 export type Tab = "council" | "history" | "settings";
 export type ThemePref = "system" | "dark" | "light";
 export type MotionPref = "system" | "on" | "off";
+/** Cảnh bên trái: 1 phòng họp (nhìn thẳng) hay cả toà nhà (mọi nơi họp + sảnh). */
+export type RoomView = "room" | "building";
 
 interface UiStore {
   tab: Tab;
@@ -19,6 +21,9 @@ interface UiStore {
   setStopConfirmOpen: (v: boolean) => void;
   sectionFilter: string | null;
   setSectionFilter: (n: string | null) => void;
+  /** Lưu localStorage. */
+  roomView: RoomView;
+  setRoomView: (v: RoomView) => void;
 
   /** Theme người dùng chọn ("system" = theo hệ điều hành). Lưu localStorage. */
   theme: ThemePref;
@@ -34,6 +39,7 @@ interface UiStore {
 
 const THEME_KEY = "plancouncil.theme";
 const MOTION_KEY = "plancouncil.reducedMotion";
+const ROOM_VIEW_KEY = "plancouncil.roomView";
 
 function readPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
   try {
@@ -82,6 +88,11 @@ export const useUi = create<UiStore>((set) => ({
   setStopConfirmOpen: (stopConfirmOpen) => set({ stopConfirmOpen }),
   sectionFilter: null,
   setSectionFilter: (sectionFilter) => set({ sectionFilter }),
+  roomView: readPref<RoomView>(ROOM_VIEW_KEY, ["room", "building"], "room"),
+  setRoomView: (roomView) => {
+    writePref(ROOM_VIEW_KEY, roomView);
+    set({ roomView });
+  },
   openSettings: (tab) => set({ tab: "settings", settingsFocus: tab ? { tab, nonce: Date.now() } : null }),
 
   theme: initialTheme,

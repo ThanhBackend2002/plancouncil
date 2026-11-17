@@ -28,24 +28,70 @@ pub enum Verdict {
     Abstain,
 }
 
-/// Deserialize "khoan dung": LLM hay trả `approve`, `APPROVED`, ` Reject `, `abstain`...
-impl<'de> Deserialize<'de> for Verdict {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(d)?;
+impl Verdict {
+    /// Đọc "khoan dung": `approve`, `APPROVED`, ` Reject `, `needs_revision`, `abstain`…; câu văn có
+    /// đúng 1 loại từ khoá ("I REJECT this because…") cũng nhận. Không nhận ra → None.
+    pub fn parse_loose(raw: &str) -> Option<Self> {
         let norm = raw.trim().to_ascii_uppercase().replace([' ', '-'], "_");
         // Ý "cần sửa" (needs_revision, request_changes, revise…) = REJECT: plan chưa đạt.
         const REJECT_LIKE: [&str; 6] = ["REJECT", "NEED", "REVIS", "REQUEST_CHANGE", "CHANGES_REQUESTED", "DENY"];
         if norm.starts_with("APPROV") || norm == "ACCEPT" || norm == "ACCEPTED" || norm == "LGTM" {
-            Ok(Verdict::Approve)
-        } else if REJECT_LIKE.iter().any(|p| norm.starts_with(p)) {
-            Ok(Verdict::Reject)
-        } else if norm.starts_with("ABSTAIN") || norm.starts_with("NOT_RELEVANT") || norm == "SKIP" {
-            Ok(Verdict::Abstain)
-        } else {
-            Err(serde::de::Error::custom(format!(
-                "invalid verdict {raw:?}, expected \"APPROVE\" | \"REJECT\" | \"ABSTAIN\""
-            )))
+            return Some(Verdict::Approve);
         }
+        if REJECT_LIKE.iter().any(|p| norm.starts_with(p)) {
+            return Some(Verdict::Reject);
+        }
+        if norm.starts_with("ABSTAIN") || norm.starts_with("NOT_RELEVANT") || norm == "SKIP" {
+            return Some(Verdict::Abstain);
+        }
+        // Câu văn: tìm từ khoá nguyên từ; chỉ nhận khi đúng 1 loại xuất hiện (tránh "not APPROVE, REJECT").
+        let mut found: Option<Verdict> = None;
+        for w in raw.split(|c: char| !c.is_alphanumeric()).map(str::to_ascii_uppercase) {
+            let v = match w.as_str() {
+                "APPROVE" | "APPROVED" => Verdict::Approve,
+                "REJECT" | "REJECTED" => Verdict::Reject,
+                "ABSTAIN" => Verdict::Abstain,
+                _ => continue,
+            };
+            match found {
+                Some(f) if f != v => return None,
+                _ => found = Some(v),
+            }
+        }
+        found
+    }
+}
+
+impl<'de> Deserialize<'de> for Verdict {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Verdict::parse_loose(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!("invalid verdict {raw:?}, expected \"APPROVE\" | \"REJECT\" | \"ABSTAIN\""))
+        })
+    }
+}
+
+/// `verdict` trong output của reviewer: giá trị nhận ra được, hoặc câu văn model viết nhầm vào đó
+/// (vd. Haiku trả cả nhận xét tiếng Việt) — không làm hỏng cả lượt review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawVerdict {
+    Known(Verdict),
+    Prose(String),
+}
+
+impl<'de> Deserialize<'de> for RawVerdict {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        let text = match v {
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Null => return Err(serde::de::Error::custom("verdict is null")),
+            other => other.to_string(),
+        };
+        Ok(match Verdict::parse_loose(&text) {
+            Some(v) => RawVerdict::Known(v),
+            None if text.trim().is_empty() => return Err(serde::de::Error::custom("verdict is empty")),
+            None => RawVerdict::Prose(text.trim().to_owned()),
+        })
     }
 }
 
@@ -88,7 +134,7 @@ pub struct RawReview {
     #[serde(default)]
     #[allow(dead_code)]
     pub role: Option<String>,
-    pub verdict: Verdict,
+    pub verdict: RawVerdict,
     #[serde(default)]
     pub summary_bubble: Option<String>,
     #[serde(default, deserialize_with = "flexible_string_list")]
@@ -211,15 +257,29 @@ impl Review {
                 .map(|s| truncate_chars(&s, MAX_ITEM_CHARS))
                 .collect()
         };
-        let critical_issues = clamp(raw.critical_issues);
+        let mut critical_issues = clamp(raw.critical_issues);
         let suggestions = clamp(raw.suggestions);
         let out_of_scope = clamp(raw.out_of_scope);
+        // Verdict là câu văn không rõ ý → REJECT (không bao giờ hội tụ nhầm); câu đó thành issue nếu chưa có.
+        let (verdict, policy_override) = match raw.verdict {
+            RawVerdict::Known(v) => (v, None),
+            RawVerdict::Prose(text) => {
+                if critical_issues.is_empty() {
+                    critical_issues.push(truncate_chars(&text, MAX_ITEM_CHARS));
+                }
+                let note = format!(
+                    "Model ghi nhận xét vào ô verdict thay vì APPROVE/REJECT/ABSTAIN (\"{}\") — hệ thống coi là REJECT.",
+                    truncate_chars(&text, 120)
+                );
+                (Verdict::Reject, Some(note))
+            }
+        };
 
         let bubble_src = raw
             .summary_bubble
             .filter(|s| !s.trim().is_empty())
             .or_else(|| critical_issues.first().cloned())
-            .unwrap_or_else(|| match raw.verdict {
+            .unwrap_or_else(|| match verdict {
                 Verdict::Approve => "Plan ổn, không còn vấn đề nghiêm trọng.".into(),
                 Verdict::Reject => "Còn vấn đề cần xử lý.".into(),
                 Verdict::Abstain => "Nội dung không thuộc chuyên môn của tôi, xin phép rút.".into(),
@@ -229,7 +289,7 @@ impl Review {
             agent: agent.to_owned(),
             // Không tin `role` do LLM tự khai — dùng tên server biết chắc.
             role: display_name.to_owned(),
-            verdict: raw.verdict,
+            verdict,
             summary_bubble: truncate_words(&bubble_src, SUMMARY_BUBBLE_MAX_WORDS),
             critical_issues,
             suggestions,
@@ -237,7 +297,7 @@ impl Review {
             invites: raw.invite,
             sections: raw.sections,
             carried_over: false,
-            policy_override: None,
+            policy_override,
         }
     }
 
@@ -913,6 +973,31 @@ mod tests {
             assert_eq!(serde_json::from_str::<Verdict>(s).unwrap(), v);
         }
         assert!(serde_json::from_str::<Verdict>("\"MAYBE\"").is_err());
+        // Câu văn có đúng 1 loại từ khoá → nhận; có cả 2 loại → không đoán.
+        assert_eq!(Verdict::parse_loose("I REJECT this plan because of X"), Some(Verdict::Reject));
+        assert_eq!(Verdict::parse_loose("Not APPROVED — REJECT"), None);
+    }
+
+    #[test]
+    fn prose_verdict_becomes_reject_instead_of_failing_the_review() {
+        // Đúng output Haiku từng trả: nhận xét tiếng Việt nằm trong ô verdict.
+        let prose = "Kế hoạch phù hợp làm bản phác thảo ban đầu, nhưng cần làm rõ yêu cầu nghiệp vụ, mô hình dữ liệu, phân quyền và bảo mật trước khi chốt thiết kế hoặc bắt đầu phát triển.";
+        let raw: RawReview = serde_json::from_value(serde_json::json!({ "verdict": prose, "summary_bubble": "Cần làm rõ" })).unwrap();
+        let r = Review::from_raw("perf", "Performance Engineer", raw);
+        assert_eq!(r.verdict, Verdict::Reject);
+        assert_eq!(r.critical_issues, vec![prose.to_owned()], "câu văn thành issue để người viết xử lý");
+        assert!(r.policy_override.as_deref().unwrap().contains("coi là REJECT"));
+
+        // Đã có critical_issues → giữ nguyên, không chèn thêm câu văn.
+        let raw: RawReview = serde_json::from_value(serde_json::json!({ "verdict": "ổn nhưng còn thiếu", "critical_issues": ["Thiếu index"] })).unwrap();
+        let r = Review::from_raw("dba", "DBA", raw);
+        assert_eq!((r.verdict, r.critical_issues.len()), (Verdict::Reject, 1));
+
+        // Verdict chuẩn không bị gắn cảnh báo; verdict rỗng / null vẫn là lỗi (để repair prompt xử lý).
+        let raw: RawReview = serde_json::from_value(serde_json::json!({ "verdict": "approve" })).unwrap();
+        assert!(Review::from_raw("a", "A", raw).policy_override.is_none());
+        assert!(serde_json::from_value::<RawReview>(serde_json::json!({ "verdict": "" })).is_err());
+        assert!(serde_json::from_value::<RawReview>(serde_json::json!({ "verdict": null })).is_err());
     }
 
     #[test]

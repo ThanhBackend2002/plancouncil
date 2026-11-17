@@ -1,9 +1,11 @@
 import { memo, useState } from "react";
+import { Building2 } from "lucide-react";
 import type { RoleId } from "../lib/contracts";
 import type { RoleResolver } from "../lib/agents";
 import { SPRITE_W } from "../lib/pixel";
 import type { ScopeState, Speech } from "../store/session";
 import { PixelCharacter, type Marker } from "./PixelCharacter";
+import { CelebrationBanner, Confetti, NightShade, SkyWindow, useCelebration, useDayPhase, useWalkers, type DayPhase } from "./scene";
 import { cx } from "./ui";
 
 // Cảnh văn phòng pixel: 240×150 pixel logic, scale theo khung.
@@ -13,6 +15,8 @@ const AUTHOR = { x: 62, y: 76 };
 const TABLE = { x: 92, y: 74, w: 140 };
 const TOP_Y = 56; // hàng sau bàn (bị bàn che chân)
 const BOTTOM_Y = 98; // hàng trước bàn
+/** Cửa ra vào trên tường sau: người được mời đi vào từ đây, người rời họp đi ra đây. */
+const DOOR = { x: 146, y: 22 };
 
 interface Seat {
   id: RoleId;
@@ -52,17 +56,26 @@ export const MeetingRoom = memo(function MeetingRoom({
   resolve,
   title,
   idleCaption,
+  onBuilding,
 }: {
   scope: ScopeState;
   resolve: RoleResolver;
   title: string;
   idleCaption?: string;
+  /** Có → hiện nút chuyển sang xem cả toà nhà. */
+  onBuilding?: () => void;
 }) {
   const [hover, setHover] = useState<RoleId | null>(null);
   const seats: Seat[] = [
     ...(scope.authorId ? [{ id: scope.authorId, x: AUTHOR.x, y: AUTHOR.y, row: "author" as const }] : []),
     ...layout(scope.reviewerIds),
   ];
+  const live = scope.status === "running";
+  const walkers = useWalkers(seats, DOOR, live, scope.id);
+  const doorOpen = walkers.some((w) => w.walking);
+  const phase = useDayPhase();
+  const celebrating = useCelebration(scope.status, scope.id);
+  const authorTyping = !!scope.authorId && scope.agents[scope.authorId]?.status === "thinking";
   const round = scope.rounds.find((r) => r.round === scope.currentRound);
   const latestPlan = scope.plans.at(-1);
 
@@ -100,39 +113,53 @@ export const MeetingRoom = memo(function MeetingRoom({
         shapeRendering="crispEdges"
         aria-hidden
       >
-        <Office title={title} version={latestPlan?.version ?? 0} writing={!!latestPlan && !latestPlan.complete} />
-        {/* Hàng sau bàn → bàn → hàng trước bàn → người viết plan (đứng trước bảng) */}
-        {seats
-          .filter((s) => s.row === "top")
-          .map((s) => (
+        <Office title={title} version={latestPlan?.version ?? 0} writing={!!latestPlan && !latestPlan.complete} phase={phase} doorOpen={doorOpen} />
+        {/* Hàng sau bàn → bàn → hàng trước bàn → người viết plan (đứng trước bảng). Người đang đi ra/vào vẽ cùng hàng của chỗ ngồi. */}
+        {walkers
+          .filter((w) => w.seat.row === "top")
+          .map((w) => (
             <PixelCharacter
-              key={s.id}
-              meta={resolve(s.id)}
-              x={s.x}
-              y={s.y}
-              status={scope.agents[s.id]?.status ?? "idle"}
-              speaking={speaker?.id === s.id}
-              marker={markerOf(s.id)}
+              key={`${w.seat.id}${w.leaving ? "-out" : ""}`}
+              meta={resolve(w.seat.id)}
+              x={w.x}
+              y={w.y}
+              status={w.leaving ? "idle" : (scope.agents[w.seat.id]?.status ?? "idle")}
+              speaking={!w.walking && speaker?.id === w.seat.id}
+              marker={markerOf(w.seat.id)}
+              walking={w.walking}
+              celebrating={celebrating && !w.walking}
             />
           ))}
         <Table />
-        {seats
-          .filter((s) => s.row !== "top")
-          .map((s) => (
+        {walkers
+          .filter((w) => w.seat.row !== "top")
+          .map((w) => (
             <PixelCharacter
-              key={s.id}
-              meta={resolve(s.id)}
-              x={s.x}
-              y={s.y}
-              status={scope.agents[s.id]?.status ?? "idle"}
-              speaking={speaker?.id === s.id}
-              marker={markerOf(s.id)}
+              key={`${w.seat.id}${w.leaving ? "-out" : ""}`}
+              meta={resolve(w.seat.id)}
+              x={w.x}
+              y={w.y}
+              status={w.leaving ? "idle" : (scope.agents[w.seat.id]?.status ?? "idle")}
+              speaking={!w.walking && speaker?.id === w.seat.id}
+              marker={markerOf(w.seat.id)}
+              walking={w.walking}
+              celebrating={celebrating && !w.walking}
+              typing={w.seat.row === "author" && authorTyping}
             />
           ))}
+        <NightShade w={W} h={H} phase={phase} />
       </svg>
+      {celebrating && (
+        <>
+          <Confetti />
+          <CelebrationBanner text={scope.kind === "main" ? "HỘI TỤ!" : "PHÒNG BAN THỐNG NHẤT!"} />
+        </>
+      )}
 
       {/* Nhãn tên + vùng hover (HTML để chữ sắc nét) */}
       {seats.map((s) => {
+        // Đang đi từ cửa vào: chưa gắn nhãn / vùng hover ở chỗ ngồi đích.
+        if (walkers.some((w) => w.walking && !w.leaving && w.seat.id === s.id)) return null;
         const m = resolve(s.id);
         // hàng sau: nhãn trên đầu (phía trên dấu ✓/✗); còn lại: dưới chân
         const labelY = s.row === "top" ? s.y - 10 : s.y + 25;
@@ -196,6 +223,16 @@ export const MeetingRoom = memo(function MeetingRoom({
           (idleCaption ?? (scope.status === "running" ? "CHUẨN BỊ…" : "PHÒNG HỌP"))
         )}
       </div>
+      {onBuilding && (
+        <button
+          type="button"
+          onClick={onBuilding}
+          className="px-font absolute right-2 bottom-1.5 z-10 inline-flex items-center gap-1 rounded-sm bg-black/55 px-2 py-0.5 text-[10px] text-neutral-200 hover:bg-black/75 hover:text-white"
+          title="Xem cả toà nhà: mọi phòng họp + sảnh"
+        >
+          <Building2 className="size-3" aria-hidden /> TOÀ NHÀ
+        </button>
+      )}
       {scope.task && (
         <div className="pointer-events-none absolute bottom-1.5 left-2 max-w-[60%] truncate rounded-sm bg-black/55 px-2 py-0.5 text-[10px] text-neutral-300" title={scope.task}>
           Nhiệm vụ: {scope.task}
@@ -228,7 +265,19 @@ const SpeechBubble = memo(function SpeechBubble({ speech, name, x, y }: { speech
 });
 
 /** Tường, sàn, bảng trắng, cửa sổ, cây — vẽ bằng rect. memo: props nguyên thuỷ, khỏi dựng lại ~100 ô sàn. */
-const Office = memo(function Office({ title, version, writing }: { title: string; version: number; writing: boolean }) {
+const Office = memo(function Office({
+  title,
+  version,
+  writing,
+  phase,
+  doorOpen,
+}: {
+  title: string;
+  version: number;
+  writing: boolean;
+  phase: DayPhase;
+  doorOpen: boolean;
+}) {
   const tiles = [];
   for (let y = 48; y < H; y += 12) {
     for (let x = 0; x < W; x += 12) {
@@ -271,14 +320,21 @@ const Office = memo(function Office({ title, version, writing }: { title: string
       ))}
       <rect x={20} y={42} width={24} height={2} fill="#475569" />
 
-      {/* cửa sổ */}
-      <rect x={176} y={6} width={54} height={28} fill="#475569" />
-      <rect x={178} y={8} width={50} height={24} fill="#7dd3fc" />
-      <rect x={178} y={24} width={50} height={8} fill="#bae6fd" />
-      <rect x={190} y={13} width={12} height={4} fill="#f8fafc" />
-      <rect x={186} y={15} width={20} height={3} fill="#f8fafc" />
-      <rect x={202} y={8} width={2} height={24} fill="#475569" />
-      <rect x={178} y={19} width={50} height={2} fill="#475569" />
+      {/* cửa sổ: trời theo giờ máy */}
+      <SkyWindow x={176} y={6} w={54} h={28} phase={phase} />
+
+      {/* cửa ra vào (mở khi có người đi vào / ra) */}
+      <rect x={DOOR.x - 2} y={14} width={20} height={32} fill="#475569" />
+      <rect x={DOOR.x} y={16} width={16} height={30} fill={doorOpen ? "#0b0b12" : "#7a4a26"} />
+      {doorOpen ? (
+        <rect x={DOOR.x} y={16} width={3} height={30} fill="#a86b3c" />
+      ) : (
+        <>
+          <rect x={DOOR.x + 2} y={18} width={12} height={10} fill="#8b5a2b" />
+          <rect x={DOOR.x + 12} y={31} width={2} height={2} fill="#fbbf24" />
+        </>
+      )}
+      <rect x={DOOR.x + 3} y={10} width={10} height={3} fill={doorOpen ? "#22c55e" : "#334155"} />
 
       {/* đồng hồ */}
       <rect x={128} y={10} width={10} height={10} fill="#e2e8f0" />
