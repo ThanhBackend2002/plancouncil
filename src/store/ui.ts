@@ -5,13 +5,24 @@ export type ThemePref = "system" | "dark" | "light";
 export type MotionPref = "system" | "on" | "off";
 /** Cảnh bên trái: 1 phòng họp (nhìn thẳng) hay cả toà nhà (mọi nơi họp + sảnh). */
 export type RoomView = "room" | "building";
+/**
+ * Bố cục màn Phòng họp: "stage" = phòng họp lớn ở giữa, plan theo dõi bằng thẻ version và mở trong
+ * popup khi cần; "split" = bố cục cũ (plan luôn hiện bên phải).
+ */
+export type LayoutPref = "stage" | "split";
 
 interface UiStore {
   tab: Tab;
   setTab: (t: Tab) => void;
   /** Yêu cầu Plan Viewer mở 1 version (từ khung hội thoại). `nonce` để bấm lại cùng version vẫn kích hoạt. */
   planFocus: { version: number; nonce: number } | null;
+  /** Chọn version để xem. Bố cục "stage": đồng thời mở popup plan. */
   focusPlan: (version: number) => void;
+  /** Popup plan (bố cục "stage"). */
+  planOpen: boolean;
+  closePlan: () => void;
+  layout: LayoutPref;
+  setLayout: (l: LayoutPref) => void;
   /** Yêu cầu Cài đặt mở 1 tab cụ thể (vd. "providers" từ màn onboarding). `nonce` như planFocus. */
   settingsFocus: { tab: string; nonce: number } | null;
   openSettings: (tab?: string) => void;
@@ -40,6 +51,7 @@ interface UiStore {
 const THEME_KEY = "plancouncil.theme";
 const MOTION_KEY = "plancouncil.reducedMotion";
 const ROOM_VIEW_KEY = "plancouncil.roomView";
+const LAYOUT_KEY = "plancouncil.layout";
 
 function readPref<T extends string>(key: string, allowed: readonly T[], fallback: T): T {
   try {
@@ -82,7 +94,14 @@ export const useUi = create<UiStore>((set) => ({
   tab: "council",
   setTab: (tab) => set({ tab }),
   planFocus: null,
-  focusPlan: (version) => set({ planFocus: { version, nonce: Date.now() } }),
+  focusPlan: (version) => set((s) => ({ planFocus: { version, nonce: Date.now() }, planOpen: s.layout === "stage" || s.planOpen })),
+  planOpen: false,
+  closePlan: () => set({ planOpen: false }),
+  layout: readPref<LayoutPref>(LAYOUT_KEY, ["stage", "split"], "stage"),
+  setLayout: (layout) => {
+    writePref(LAYOUT_KEY, layout);
+    set({ layout, planOpen: false });
+  },
   settingsFocus: null,
   stopConfirmOpen: false,
   setStopConfirmOpen: (stopConfirmOpen) => set({ stopConfirmOpen }),

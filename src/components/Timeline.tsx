@@ -91,6 +91,9 @@ export const Timeline = memo(function Timeline({ scope, resolve }: { scope: Scop
     return filter ? all.filter((m) => m.kind !== "review" || reviewMentions(m.slot.review, filter)) : all;
   }, [scope, running, filter, session.userNotes, session.fromMcp]);
   const [expanded, setExpanded] = useState(false);
+  // Bấm "Xem vN" trong popup hội thoại → mở popup plan; đóng popup này để không chồng 2 hộp thoại (chung phím Esc).
+  const planFocus = useUi((s) => s.planFocus);
+  useEffect(() => setExpanded(false), [planFocus]);
   const list = (big: boolean) => (
     <MessageList msgs={msgs} scope={scope} resolve={resolve} session={session} running={running} filter={filter} big={big} />
   );

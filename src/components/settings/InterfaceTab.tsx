@@ -2,9 +2,9 @@
 // (không thuộc AppConfig nên không cần bấm "Lưu").
 
 import type { ReactNode } from "react";
-import { Monitor, Moon, Sun, Sparkles, Pause, Play } from "lucide-react";
+import { Columns2, Monitor, Moon, Sun, Sparkles, Pause, Play, Presentation } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
-import { useUi, type MotionPref, type ThemePref } from "../../store/ui";
+import { useUi, type LayoutPref, type MotionPref, type ThemePref } from "../../store/ui";
 import { Panel, cx } from "../ui";
 import { SectionTitle } from "./fields";
 
@@ -19,6 +19,11 @@ const THEMES: Choice<ThemePref>[] = [
   { id: "system", label: "Theo hệ thống", desc: "Tự đổi sáng / tối theo cài đặt của hệ điều hành", icon: <Monitor className="size-4" /> },
   { id: "dark", label: "Tối", desc: "Nền tối, như mặc định trước đây", icon: <Moon className="size-4" /> },
   { id: "light", label: "Sáng", desc: "Nền sáng, dễ đọc dưới ánh sáng mạnh", icon: <Sun className="size-4" /> },
+];
+
+const LAYOUTS: Choice<LayoutPref>[] = [
+  { id: "stage", label: "Phòng họp lớn", desc: "Phòng họp ở giữa, theo dõi plan bằng thẻ version; bấm vN để mở plan trong popup", icon: <Presentation className="size-4" /> },
+  { id: "split", label: "Chia đôi", desc: "Bố cục cũ: plan luôn hiện ở cột bên phải", icon: <Columns2 className="size-4" /> },
 ];
 
 const MOTIONS: Choice<MotionPref>[] = [
@@ -90,6 +95,8 @@ export function InterfaceTab() {
       motionReduced: s.motionReduced,
     })),
   );
+  const layout = useUi((s) => s.layout);
+  const setLayout = useUi((s) => s.setLayout);
 
   return (
     <div className="space-y-4">
@@ -99,6 +106,11 @@ export function InterfaceTab() {
         <p className="mt-2 text-[11px] text-fg-subtle">
           Đang dùng: <b className="text-fg-soft">{resolvedTheme === "dark" ? "Tối" : "Sáng"}</b>. Phòng họp pixel luôn giữ nền tối riêng.
         </p>
+      </Panel>
+
+      <Panel className="p-4">
+        <SectionTitle title="Bố cục màn Phòng họp" desc="Cách sắp xếp phòng họp, hội thoại và plan." />
+        <RadioCards name="layout" legend="Bố cục" choices={LAYOUTS} value={layout} onChange={setLayout} />
       </Panel>
 
       <Panel className="p-4">

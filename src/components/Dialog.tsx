@@ -91,7 +91,9 @@ export function Dialog({
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={cx(
-          "relative w-full max-w-lg rounded-xl border bg-surface p-5 shadow-2xl shadow-black/60 focus:outline-none",
+          "relative w-full rounded-xl border bg-surface p-5 shadow-2xl shadow-black/60 focus:outline-none",
+          // `className` tự đặt max-w-* → bỏ mặc định (2 class max-w cùng lúc thì class nào thắng tuỳ thứ tự CSS).
+          !/(^|\s)max-w-/.test(className ?? "") && "max-w-lg",
           tone === "warning" ? "border-warn-line" : tone === "danger" ? "border-danger-line" : "border-line-strong",
           className,
         )}
