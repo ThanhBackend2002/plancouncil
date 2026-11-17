@@ -226,34 +226,35 @@ export function ContextToolsTab({
             </button>
           ))}
         </div>
-        <div className="mt-3 flex flex-wrap items-end gap-4">
-          <div className="w-60">
-            <Field
-              label="Số lần gọi công cụ tối đa / lần nghiên cứu"
-              error={unlimited ? undefined : errors["context.max_tool_steps"]}
-              hint={unlimited ? "Không giới hạn" : "1–12"}
-            >
-              {unlimited ? (
-                <div className="flex h-8 items-center rounded-control border border-line bg-surface-2/50 px-2.5 text-sm text-fg-muted">∞</div>
+        <div className="mt-3 w-72">
+          <Field
+            label="Số lần gọi công cụ tối đa / lần nghiên cứu"
+            error={errors["context.max_tool_steps"]}
+            hint={draft.max_tool_steps === 0 ? "Không giới hạn — chặn an toàn ở 50 lượt" : "1–12"}
+          >
+            <div className="flex items-center gap-3">
+              {draft.max_tool_steps === 0 ? (
+                <div className="flex-1 rounded-md border border-line px-2.5 py-1.5 text-sm text-fg-muted">Không giới hạn</div>
               ) : (
-                <NumberInput value={draft.max_tool_steps} onChange={(v) => set({ max_tool_steps: v ?? Number.NaN })} />
+                <div className="flex-1">
+                  <NumberInput value={draft.max_tool_steps} onChange={(v) => set({ max_tool_steps: v ?? Number.NaN })} />
+                </div>
               )}
-            </Field>
-          </div>
-          <label className="mb-1.5 inline-flex cursor-pointer items-center gap-2 text-sm text-fg-soft">
-            <input
-              type="checkbox"
-              checked={unlimited}
-              onChange={(e) => set({ max_tool_steps: e.target.checked ? 0 : 6 })}
-              className="accent-[var(--accent)]"
-            />
-            Không giới hạn
-          </label>
+              <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-xs text-fg-muted">
+                <input
+                  type="checkbox"
+                  checked={draft.max_tool_steps === 0}
+                  onChange={(e) => set({ max_tool_steps: e.target.checked ? 0 : 6 })}
+                />
+                Không giới hạn
+              </label>
+            </div>
+          </Field>
         </div>
         {unlimited && (
           <p className="mt-2 rounded-control border border-warn-line bg-warn-subtle px-2.5 py-1.5 text-[11px] text-warn">
             Model nghiên cứu tới khi tự thấy đủ (ghi chú tối đa ~600 từ) — hợp với plan cần tìm hiểu sâu nhưng tốn thêm thời gian và token.
-            Vẫn dừng khi bấm Stop, hết ngân sách token của phiên, hoặc khi phần đã đọc quá dài (~100k token) để không vượt ngữ cảnh của model.
+            Vẫn dừng khi bấm Stop, hết ngân sách token của phiên, chạm chặn an toàn 50 lượt, hoặc khi phần đã đọc quá dài (~100k token) để không vượt ngữ cảnh của model.
           </p>
         )}
         <p className="mt-2 text-[11px] text-fg-subtle">

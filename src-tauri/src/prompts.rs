@@ -53,7 +53,9 @@ Aim for ≤ 900 words. Reuse what already exists; no new infrastructure, service
 A ```mermaid diagram in section 2 is optional. Do NOT invent capacity numbers, SLOs or multi-phase roadmaps; at most 3 milestones.",
         (PlanDepth::Standard, true) => "PLAN DEPTH = STANDARD: concrete enough to start building — name components, interfaces, data model and failure handling \
 that matter for THIS request. Section 2 MUST contain one ```mermaid block (strictly valid syntax: quote labels with spaces/special characters, \
-no HTML, no parentheses in unquoted labels). Give capacity/SLO numbers ONLY where the request depends on them. Prefer extending what exists over adding new systems.",
+no HTML, no parentheses in unquoted labels). Give capacity/SLO numbers ONLY where the request depends on them. Prefer extending what exists over adding new systems. \
+Stay at PLAN level: name files, components, interfaces and key types, but do not write implementation code, exhaustive test-case lists \
+or full UI copy. Aim for ≤ 1800 words excluding the Changelog.",
         (PlanDepth::Enterprise, true) => "PLAN DEPTH = ENTERPRISE: production-grade. Section 2 MUST contain at least one ```mermaid block (strictly valid syntax). \
 Name components, protocols, data stores, schemas (tables/fields/indexes), capacity estimates with numbers (QPS, payload sizes, storage growth), \
 SLOs, failure handling, security and operations. In section 5 list explicit trade-offs (option A vs B, why chosen).",
@@ -76,6 +78,7 @@ const REFINE_ADDENDUM: &str = r#"You are now revising your previous plan based o
 - Rewrite the COMPLETE plan (all sections), not a diff. Keep section numbering, headings and reviewer tags identical so versions stay diffable.
 - Append a final section `## 6. Changelog (vPREV → vNEXT)` containing a Markdown table with columns: | # | Reviewer | Issue | Resolution | Status |. Status is one of: Fixed, Partially fixed, Won't fix, Moved out of scope.
 - Fix every critical issue that is within the request's scope. Decline ("Won't fix") with a concrete justification when a fix would add unjustified complexity.
+- Do NOT let the plan grow round after round: stay within the plan depth's length target; resolve an issue with the minimum detail needed.
 - PREFER SIMPLIFYING OR CUTTING over adding. Do not add new components unless a critical issue requires it. Reviewer ideas that go beyond the request belong in `### Out of scope`, not in the plan."#;
 
 const REVIEW_SCHEMA: &str = r#"{
@@ -263,6 +266,7 @@ OUTPUT FORMAT (mandatory) — for EACH listed section, in the listed order, exac
 - Keep section numbering, headings and reviewer tags identical so versions stay diffable (keep the `<!-- reviewers: … -->` comment directly under each heading).
 - The Changelog section is always listed: rewrite it for this revision, keeping its heading level and number, with the title `Changelog (vPREV → vNEXT)` and a Markdown table with columns: | # | Reviewer | Issue | Resolution | Status |. Status is one of: Fixed, Partially fixed, Won't fix, Moved out of scope.
 - Fix every critical issue that is within the request's scope. Decline ("Won't fix") with a concrete justification when a fix would add unjustified complexity.
+- Do NOT let the plan grow round after round: stay within the plan depth's length target; resolve an issue with the minimum detail needed.
 - PREFER SIMPLIFYING OR CUTTING over adding. Reviewer ideas that go beyond the request belong in `### Out of scope`, not in the plan.
 - If fixing the issues truly requires adding, removing or reordering sections, reply with the single line `<!-- structural-change -->` and nothing else; you will then be asked for the complete plan."#;
 
@@ -416,6 +420,8 @@ pub struct ReviewCtx<'a> {
     pub invited: bool,
     /// Plan đã rút gọn theo section (true) hay nguyên văn.
     pub routed: bool,
+    /// Vòng cuối (round == max_rounds, > 1): chỉ được REJECT vì lỗi cũ chưa sửa.
+    pub final_round: bool,
     /// Chuyên gia có thể mời thêm (rỗng = không cho mời).
     pub available: &'a [&'a RoleDef],
 }
@@ -437,6 +443,11 @@ pub fn reviewer_messages(
         "ROUND 1 POLICY (mandatory): find AT LEAST 1 concrete, substantive weakness within the request's scope from your area of expertise \
 and return \"REJECT\". Courtesy praise is forbidden. If the plan is genuinely outside your expertise, return \"ABSTAIN\" instead."
             .to_owned()
+    } else if rc.final_round && !rc.first_review {
+        format!(
+            "FINAL ROUND {} POLICY (mandatory): this is the last review round — there is no further revision. Check the Changelog against YOUR previous critical issues only. REJECT only if at least one of YOUR previous critical issues is still unresolved AND would plausibly cause a production incident, data loss, a security breach or project failure; list only those in `critical_issues`. Do NOT raise new issues as critical in this round — put them in `suggestions`. Otherwise APPROVE.",
+            rc.round
+        )
     } else if rc.first_review {
         "POLICY: verdict is \"APPROVE\" if and only if nothing in your area would plausibly cause a production incident, data loss, \
 a security breach, a business failure or project failure for what was requested. Minor nits belong in suggestions."
@@ -461,7 +472,7 @@ Minor nits belong in suggestions and are not a reason to REJECT.",
     };
     let depth = match opts.depth {
         PlanDepth::Mvp => "MVP — judge it as a first usable version; do not demand production-grade extras",
-        PlanDepth::Standard => "STANDARD — enough to start building; do not demand enterprise-grade extras the request does not need",
+        PlanDepth::Standard => "STANDARD — enough to start building; do not demand enterprise-grade extras the request does not need, and do not demand implementation-level detail (exact code, every field name, exhaustive test-case lists, UI copy) — that is decided while building",
         PlanDepth::Enterprise => "ENTERPRISE — production-grade detail is expected",
     };
     let routed_note = if rc.routed {
@@ -491,6 +502,8 @@ Minor nits belong in suggestions and are not a reason to REJECT.",
 Plan depth requested: {depth}.\n\
 SCOPE: a critical issue must be (a) within the scope of the user's request and (b) likely to cause failure if left unaddressed. \
 Feature ideas, extra platforms or future scale beyond the request go to `out_of_scope` and are never a reason to REJECT.\n\
+EXPERTISE BOUNDARY: a critical issue must fall within YOUR area of expertise. Concerns that belong to another reviewer's area \
+(e.g. UX wording for a backend reviewer, schema details for a designer) go to `suggestions` and are never a reason to REJECT.\n\
 ABSTAIN: if the plan has essentially nothing in your area of expertise, reply verdict \"ABSTAIN\" with a one-sentence reason in summary_bubble — \
 you will leave the meeting. Do not abstain if you see a real risk in your area.\n\n\
 {policy}{invite_rules}\n\nOutput format: respond with ONLY a single valid JSON object (no markdown fences, no commentary) matching this schema:\n{}\n\n\
@@ -628,8 +641,8 @@ what is missing, verify it in the actual code/config (search_code, read_file). N
     let (budget_rule, words) = match max_steps {
         Some(n) => (format!("at most {n} tool calls in total"), 300),
         None => (
-            "no fixed limit on tool calls — research as thoroughly as this plan needs (follow references, check several files/sources), \
-but stop as soon as you have enough: every call costs time and tokens"
+            "no fixed limit on tool calls — use as many tool calls as you really need to research as thoroughly as this plan needs \
+(follow references, check several files/sources), but stop as soon as you have enough: every call costs time and tokens"
                 .to_owned(),
             600,
         ),
@@ -930,5 +943,22 @@ mod tests {
         let app = open_issues_appendix(&round, |id| id.to_owned());
         assert!(app.contains("### DBA (sections: 3.3, 4.2)\n- Thiếu index"), "{app}");
         assert!(app.contains("### PM\n- Không rõ owner"), "{app}");
+    }
+
+    #[test]
+    fn final_round_only_allows_unresolved_previous_issues() {
+        let (_, reviewers, plan, _) = snapshot_inputs();
+        let r = &reviewers[0];
+        let build = |round: u32, first_review: bool, final_round: bool| {
+            let rc = ReviewCtx { round, first_review, invited: false, routed: true, final_round, available: &[] };
+            let m = reviewer_messages(r, "SA", &PlanContext::Main, &rc, &PromptOpts::default(), "req", plan.version, &plan.markdown, None);
+            m[0].content.clone()
+        };
+        let last = build(3, false, true);
+        assert!(last.contains("FINAL ROUND 3 POLICY") && last.contains("Do NOT raise new issues as critical"), "{last}");
+        assert!(last.contains("EXPERTISE BOUNDARY") && last.contains("never by itself a reason to REJECT"));
+        // Người mới được mời ở vòng cuối vẫn review như lượt đầu.
+        assert!(!build(3, true, true).contains("FINAL ROUND"));
+        assert!(!build(2, false, false).contains("FINAL ROUND"));
     }
 }

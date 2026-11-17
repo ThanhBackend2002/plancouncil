@@ -53,6 +53,8 @@ const MAX_RESEARCH_CONTEXT_CHARS: usize = 300_000;
 
 /// Số lần thử nối tiếp tối đa khi plan bị cắt do `max_tokens`.
 const MAX_CONTINUATIONS: u32 = 2;
+/// Chặn an toàn khi `max_tool_steps = 0` (không giới hạn): tránh model gọi công cụ vô tận.
+pub const UNLIMITED_TOOL_STEPS_CAP: u32 = 50;
 
 /// Ước lượng để giữ chỗ ngân sách: token prompt (×1.1 bù sai số tokenizer) + trần output.
 fn budget_estimate(prompt_tokens: usize, max_tokens: Option<u32>) -> u64 {
@@ -772,8 +774,10 @@ impl Council {
         }
         let tb = &self.extras.toolbox;
         let tools = tb.definitions();
-        // None = không giới hạn số lượt (vẫn dừng theo ngân sách token / Stop / giới hạn ngữ cảnh).
+        // None = không giới hạn: prompt không nêu con số. Vòng lặp vẫn có chặn an toàn: tối đa
+        // `UNLIMITED_TOOL_STEPS_CAP` lượt + giới hạn ngữ cảnh (`MAX_RESEARCH_CONTEXT_CHARS`).
         let max_steps = (self.cfg.max_tool_steps != 0).then(|| self.cfg.max_tool_steps.min(12));
+        let step_cap = max_steps.unwrap_or(UNLIMITED_TOOL_STEPS_CAP);
         let notes_cap = if max_steps.is_some() { 6_000 } else { 12_000 };
         let mut msgs: Vec<Value> = prompts::research_messages(
             role,
@@ -801,7 +805,7 @@ impl Council {
         loop {
             // Hội thoại nghiên cứu quá dài → buộc viết ghi chú ngay (vượt cửa sổ ngữ cảnh = mất trắng phần đã đọc).
             let room = chars(&msgs) < MAX_RESEARCH_CONTEXT_CHARS;
-            let allow = room && max_steps.map_or(true, |m| used < m);
+            let allow = room && used < step_cap;
             // Mỗi lượt gọi công cụ giữ chỗ ngân sách riêng; hết ngân sách → bỏ nghiên cứu.
             let Some(hold) = self.hold(estimate_raw_call(&msgs, ep.max_tokens)) else {
                 log::warn!("{}: hết ngân sách token → dừng bước nghiên cứu", role.name);
@@ -835,7 +839,7 @@ impl Council {
             msgs.push(turn.assistant_message.clone());
             for call in &turn.tool_calls {
                 used += 1;
-                let (result, summary, ok) = if max_steps.map_or(true, |m| used <= m) {
+                let (result, summary, ok) = if used <= step_cap {
                     tb.execute(&call.name, &call.arguments).await
                 } else {
                     ("ERROR: đã hết lượt gọi công cụ, hãy viết ghi chú ngay.".to_owned(), "hết lượt công cụ".to_owned(), false)
@@ -1381,6 +1385,7 @@ impl Council {
                         first_review: !reviewed_once.contains(&r.id),
                         invited: invited.contains(&r.id),
                         routed: false,
+                        final_round: round > 1 && round == spec.max_rounds,
                         available: &available,
                     };
                     self.prepare_review(spec, r, rc, request, &plan, previous.get(&r.id))
@@ -2385,13 +2390,34 @@ mod tests {
         sys.contains("write the plan") || sys.contains("write your department")
     }
 
-    #[test]
-    fn tool_steps_zero_is_valid_and_thirteen_is_not() {
-        let mut c = crate::config::tests::with_default_provider("k", "m");
-        c.max_tool_steps = 0;
-        assert!(c.validate().is_ok());
-        c.max_tool_steps = 13;
-        assert!(c.validate().unwrap_err().contains("max_tool_steps"));
+    #[tokio::test]
+    async fn unlimited_tool_steps_go_past_twelve() {
+        let dir = temp_workspace();
+        let fs = crate::tools::WorkspaceFs::open("game", dir.to_str().unwrap()).unwrap();
+        let extras = SessionExtras {
+            toolbox: Toolbox { workspace: Some(Arc::new(fs)), web: None },
+            ..SessionExtras::default()
+        };
+        let base = standard_router(false);
+        let handler: Handler = Arc::new(move |body: &Value| {
+            let sys = system_of(body);
+            if sys.contains("[RESEARCH]") {
+                assert!(sys.contains("as many tool calls as you really need") && !sys.contains("at most 0"), "{sys}");
+                let used = body["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").count();
+                return if used < 20 {
+                    tool_call("read_file", json!({"path":"src/score.go"}))
+                } else {
+                    completion("- src/score.go: hàm Submit")
+                };
+            }
+            base(body)
+        });
+        let (rec, _) = run_with_extras(handler, |c| c.max_tool_steps = 0, None, extras).await;
+        assert_eq!(rec.status, SessionStatus::Converged, "{:?}", rec.error);
+        assert_eq!(rec.activities.len(), 20, "không giới hạn → vượt mức 12 cũ");
+        assert!(rec.activities.iter().all(|a| a.ok));
+        const { assert!(UNLIMITED_TOOL_STEPS_CAP > 20) };
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

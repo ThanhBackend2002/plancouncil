@@ -446,6 +446,7 @@ export interface AppConfig {
   workspaces: Workspace[];
   web_search: WebSearchConfig;
   tool_policy: ToolPolicy;
+  /** 1–12; 0 = không giới hạn (backend vẫn chặn an toàn ở 50 lượt). */
   max_tool_steps: number;
   /** Giá do người dùng tự nhập, theo tên model (USD / 1M token). Không có giá → chi phí hiển thị "—". */
   pricing?: Record<string, ModelPrice>;
