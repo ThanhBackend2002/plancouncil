@@ -373,6 +373,13 @@ impl WebSearch {
                 .timeout(Duration::from_secs(20))
                 .redirect(redirect)
                 .user_agent("Mozilla/5.0 (compatible; PlanCouncil/0.1; +research)")
+                // Một số trang từ chối request thiếu Accept / Accept-Language (UA vẫn khai thật là PlanCouncil).
+                .default_headers({
+                    let mut h = reqwest::header::HeaderMap::new();
+                    h.insert(reqwest::header::ACCEPT, reqwest::header::HeaderValue::from_static("text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8"));
+                    h.insert(reqwest::header::ACCEPT_LANGUAGE, reqwest::header::HeaderValue::from_static("vi,en;q=0.8"));
+                    h
+                })
                 .build()
                 .map_err(|e| e.to_string())
         };
@@ -475,22 +482,81 @@ impl WebSearch {
     }
 
     /// Tải 1 trang web công khai và trả về text thuần (đã chặn SSRF ở mọi bước redirect).
+    ///
+    /// Trang chặn truy cập tự động / quá tải (401, 403, 429, 5xx) → thử đường dự phòng hợp lệ, KHÔNG giả
+    /// làm trình duyệt: (1) Tavily Extract nếu dịch vụ tìm web là Tavily, (2) bản lưu trên Wayback Machine.
     pub async fn fetch(&self, raw: &str) -> Result<String, String> {
-        let mut url = reqwest::Url::parse(raw.trim()).map_err(|e| format!("URL không hợp lệ: {e}"))?;
+        let status = match self.fetch_direct(raw).await {
+            Ok(text) => return Ok(text),
+            Err(FetchError { status: Some(st), .. }) if blocked_status(st) => st,
+            Err(e) => return Err(e.message),
+        };
+        let mut tried = Vec::new();
+        if self.cfg.provider == WebSearchProvider::Tavily {
+            match self.tavily_extract(raw).await {
+                Ok(text) => return Ok(format!("[Trang chặn truy cập trực tiếp (HTTP {status}) — nội dung trích qua Tavily Extract]\n{text}")),
+                Err(e) => tried.push(format!("Tavily Extract: {e}")),
+            }
+        }
+        match self.wayback(raw).await {
+            Ok(text) => return Ok(text),
+            Err(e) => tried.push(format!("Wayback Machine: {e}")),
+        }
+        Err(format!("{} (đã thử: {})", http_error(status), tried.join("; ")))
+    }
+
+    async fn tavily_extract(&self, url: &str) -> Result<String, String> {
+        let key = self.cfg.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()).ok_or("chưa có API key")?;
+        let v: Value = self
+            .http
+            .post("https://api.tavily.com/extract")
+            .json(&json!({ "api_key": key, "urls": [url.trim()] }))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| format!("dữ liệu lạ: {e}"))?;
+        let text = v["results"][0]["raw_content"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or("không trích được nội dung")?;
+        Ok(truncate_chars(text, 12_000))
+    }
+
+    /// Bản lưu gần nhất trên Wayback Machine (archive.org) — ghi rõ ngày lưu vì có thể đã cũ.
+    async fn wayback(&self, url: &str) -> Result<String, String> {
+        let api = reqwest::Url::parse_with_params("https://archive.org/wayback/available", &[("url", url.trim())]).map_err(|e| e.to_string())?;
+        let v: Value = self
+            .http
+            .get(api)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| format!("dữ liệu lạ: {e}"))?;
+        let (snapshot, date) = wayback_snapshot(&v, url.trim()).ok_or("không có bản lưu")?;
+        let text = self.fetch_direct(&snapshot).await.map_err(|e| e.message)?;
+        Ok(format!("[Trang chặn truy cập trực tiếp — đây là BẢN LƯU trên Wayback Machine ngày {date}, nội dung có thể đã cũ]\n{text}"))
+    }
+
+    async fn fetch_direct(&self, raw: &str) -> Result<String, FetchError> {
+        let mut url = reqwest::Url::parse(raw.trim()).map_err(|e| FetchError::msg(format!("URL không hợp lệ: {e}")))?;
         for _ in 0..5 {
-            ensure_public_url(&url).await?;
-            let resp = self.fetcher.get(url.clone()).send().await.map_err(|e| format!("không tải được: {e}"))?;
+            ensure_public_url(&url).await.map_err(FetchError::msg)?;
+            let resp = self.fetcher.get(url.clone()).send().await.map_err(|e| FetchError::msg(format!("không tải được: {e}")))?;
             if resp.status().is_redirection() {
                 let loc = resp
                     .headers()
                     .get(reqwest::header::LOCATION)
                     .and_then(|v| v.to_str().ok())
-                    .ok_or("redirect không có Location")?;
-                url = url.join(loc).map_err(|e| e.to_string())?;
+                    .ok_or_else(|| FetchError::msg("redirect không có Location".into()))?;
+                url = url.join(loc).map_err(|e| FetchError::msg(e.to_string()))?;
                 continue;
             }
             if !resp.status().is_success() {
-                return Err(format!("HTTP {}", resp.status()));
+                let st = resp.status().as_u16();
+                return Err(FetchError { status: Some(st), message: http_error(st) });
             }
             let ct = resp
                 .headers()
@@ -499,15 +565,69 @@ impl WebSearch {
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if !(ct.is_empty() || ct.contains("text/") || ct.contains("json") || ct.contains("xml")) {
-                return Err(format!("không đọc loại nội dung '{ct}'"));
+                return Err(FetchError::msg(format!("không đọc loại nội dung '{ct}'")));
             }
-            let bytes = read_capped(resp, 2_000_000).await?;
+            let bytes = read_capped(resp, 2_000_000).await.map_err(FetchError::msg)?;
             let body = String::from_utf8_lossy(&bytes);
             let text = if ct.contains("html") || body.trim_start().starts_with('<') { html_to_text(&body) } else { body.to_string() };
             return Ok(truncate_chars(&format!("{url}\n\n{}", text.trim()), 12_000));
         }
-        Err("quá nhiều redirect".into())
+        Err(FetchError::msg("quá nhiều redirect".into()))
     }
+}
+
+/// Lỗi tải trang: kèm mã HTTP (nếu có) để quyết định có thử đường dự phòng không.
+struct FetchError {
+    status: Option<u16>,
+    message: String,
+}
+
+impl FetchError {
+    fn msg(message: String) -> Self {
+        Self { status: None, message }
+    }
+}
+
+/// Trang từ chối / quá tải (khác 404: trang thật sự không có) → đáng thử bản trích / bản lưu.
+fn blocked_status(status: u16) -> bool {
+    matches!(status, 401 | 403 | 429) || (500..=599).contains(&status)
+}
+
+/// Từ JSON của `archive.org/wayback/available` → (URL bản lưu dạng nguyên bản `id_`, ngày "YYYY-MM-DD").
+fn wayback_snapshot(v: &Value, original: &str) -> Option<(String, String)> {
+    let c = &v["archived_snapshots"]["closest"];
+    if c["available"].as_bool() != Some(true) {
+        return None;
+    }
+    let ts = c["timestamp"].as_str().filter(|t| t.len() >= 8 && t.bytes().all(|b| b.is_ascii_digit()))?;
+    // `id_` = trang gốc không kèm thanh công cụ của Wayback.
+    let url = format!("https://web.archive.org/web/{ts}id_/{original}");
+    Some((url, format!("{}-{}-{}", &ts[0..4], &ts[4..6], &ts[6..8])))
+}
+
+/// Lỗi HTTP khi đọc trang: nói rõ nguyên nhân thường gặp + gợi ý cho model (kết quả tool là dữ liệu model đọc).
+fn http_error(status: u16) -> String {
+    let why = match status {
+        401 | 403 => "trang chặn truy cập tự động (bot) hoặc cần đăng nhập — dùng nguồn khác hoặc đoạn trích trong kết quả tìm kiếm",
+        404 | 410 => "trang không tồn tại — kiểm tra lại URL hoặc tìm nguồn khác",
+        429 => "bị giới hạn tần suất — đừng thử lại ngay, dùng nguồn khác",
+        500..=599 => "máy chủ của trang đang lỗi — dùng nguồn khác",
+        _ => "không đọc được — dùng nguồn khác",
+    };
+    format!("HTTP {status}: {why}")
+}
+
+/// URL rút gọn để hiển thị: bỏ scheme + "www.", giữ host và đoạn path cuối ("adjust.com/…/app-trends-2025").
+pub fn short_url(raw: &str) -> String {
+    let Ok(u) = reqwest::Url::parse(raw.trim()) else { return truncate_chars(raw.trim(), 60) };
+    let host = u.host_str().unwrap_or_default().trim_start_matches("www.");
+    let segs: Vec<&str> = u.path_segments().map(|s| s.filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+    let out = match segs.as_slice() {
+        [] => host.to_owned(),
+        [one] => format!("{host}/{one}"),
+        [.., last] => format!("{host}/…/{last}"),
+    };
+    truncate_chars(&out, 60)
 }
 
 async fn read_capped(resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
@@ -797,7 +917,7 @@ impl Toolbox {
                     Some(web) => web.fetch(&args.url).await,
                     None => Err("tìm kiếm web chưa được bật cho phiên này".into()),
                 };
-                (format!("đọc trang {}", truncate_chars(&args.url, 80)), r)
+                (format!("đọc trang {}", short_url(&args.url)), r)
             }
             other => (format!("tool lạ '{other}'"), Err(format!("không có tool '{other}'"))),
         };
@@ -895,5 +1015,29 @@ mod tests {
         assert_eq!(hits.len(), 2, "{hits:?}");
         assert_eq!(hits[0], SearchHit { title: "Example Docs".into(), url: "https://example.com/docs".into(), snippet: "Fast & simple".into() });
         assert_eq!(hits[1].url, "https://rust-lang.org/");
+    }
+
+    #[test]
+    fn fetch_summaries_are_short_and_errors_explain_why() {
+        assert_eq!(short_url("https://www.adjust.com/resources/ebooks/mobile-app-trends-2025/"), "adjust.com/…/mobile-app-trends-2025");
+        assert_eq!(short_url("https://example.com"), "example.com");
+        assert_eq!(short_url("https://example.com/a"), "example.com/a");
+        assert_eq!(short_url("not a url"), "not a url");
+        assert!(http_error(403).starts_with("HTTP 403: trang chặn truy cập tự động"));
+        assert!(http_error(404).contains("không tồn tại"));
+        assert!(http_error(503).contains("máy chủ"));
+    }
+
+    #[test]
+    fn fallback_only_for_blocked_pages_and_wayback_parsing() {
+        assert!(blocked_status(403) && blocked_status(429) && blocked_status(503) && blocked_status(401));
+        assert!(!blocked_status(404) && !blocked_status(410) && !blocked_status(400));
+        let v = json!({"archived_snapshots":{"closest":{"available":true,"status":"200","timestamp":"20250312094512",
+            "url":"http://web.archive.org/web/20250312094512/https://www.adjust.com/x/"}}});
+        let (url, date) = wayback_snapshot(&v, "https://www.adjust.com/x/").unwrap();
+        assert_eq!(url, "https://web.archive.org/web/20250312094512id_/https://www.adjust.com/x/");
+        assert_eq!(date, "2025-03-12");
+        assert!(wayback_snapshot(&json!({"archived_snapshots":{}}), "u").is_none());
+        assert!(wayback_snapshot(&json!({"archived_snapshots":{"closest":{"available":true,"timestamp":"x"}}}), "u").is_none());
     }
 }

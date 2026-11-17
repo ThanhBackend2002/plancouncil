@@ -257,7 +257,8 @@ const SpeechBubble = memo(function SpeechBubble({ speech, name, x, y }: { speech
         <span className="mr-1 font-bold" style={{ color: TONE_BORDER[speech.tone] }}>
           {name}:
         </span>
-        <span className="line-clamp-3">{speech.text}</span>
+        {/* overflow-wrap: anywhere → URL / chuỗi dài không tràn khỏi bong bóng. */}
+        <span className="line-clamp-3 [overflow-wrap:anywhere]">{speech.text}</span>
       </div>
       <div className="mx-auto mt-[2px] h-[6px] w-[6px] bg-[#fdfdf8]" style={{ boxShadow: `0 2px 0 0 ${TONE_BORDER[speech.tone]}` }} />
     </div>
